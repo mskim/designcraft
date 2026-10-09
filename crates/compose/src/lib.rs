@@ -2064,8 +2064,17 @@ fn line_metrics(
     let reference = src.iter().max_by(|a, b| a.size.total_cmp(&b.size));
     for g in src {
         let shift = g.shift + reference.map_or(0.0, |r| cjk_alignment_shift(g, r));
-        asc = asc.max(g.ascent + shift.max(0.0));
-        desc = desc.max(g.descent - shift.min(0.0));
+        // CJK fonts: InDesign's CJK composer fits lines by the ideographic em box, not the
+        // font's (much taller) hhea ascender/descender, so tight folio/heading frames don't overset.
+        let (g_asc, g_desc) = if g.face.get().menu_group().0 != designcraft_fonts::FontGroup::Western {
+            let (t, b) = g.face.get().em_box();
+            let k = g.size / g.face.units_per_em().max(1e-9);
+            (t * k, -b * k)
+        } else {
+            (g.ascent, g.descent)
+        };
+        asc = asc.max(g_asc + shift.max(0.0));
+        desc = desc.max(g_desc - shift.min(0.0));
         lead = lead.max(g.leading);
     }
     (asc, desc, lead)

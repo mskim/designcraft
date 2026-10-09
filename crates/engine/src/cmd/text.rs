@@ -41,6 +41,20 @@ pub fn specs() -> Vec<CommandSpec> {
             st.revision += 1;
             ok()
         }),
+        cmd!(
+            "frame.thread",
+            "Thread Text Frames",
+            [],
+            None,
+            "{from, to} — `to` joins `from`'s story right after `from`, as clicking `from`'s out port then `to` (an empty frame becomes a text frame; text already in `to` is appended)",
+            has_doc,
+            |s, p| {
+                let a = id_param(p, "from").ok_or_else(|| bad("frame.thread", "missing from"))?;
+                let b = id_param(p, "to").ok_or_else(|| bad("frame.thread", "missing to"))?;
+                s.edit(|d, _| Ok(d.thread(a, b)?))?;
+                ok()
+            }
+        ),
         cmd!("text.insert", "Type", [], None, "{text, raw?: bool (no typographer's quotes)} — replaces the selected text", has_text, insert),
         cmd!("text.delete", "Delete Text", [], None, "{forward?: bool, word?: bool}", has_text, delete),
         cmd!(noundo "text.move", "Move Caret", [], None, "{dir: left|right|up|down|lineStart|lineEnd|storyStart|storyEnd, extend?, word?}", has_text, move_caret),
@@ -1718,6 +1732,20 @@ mod korean_breaks_tests {
     use serde_json::json;
 
     use crate::Session;
+
+    #[test]
+    fn frame_thread_joins_two_frames_into_one_story() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let a = s.execute("frame.create", &json!({"rect": [72, 72, 300, 120], "content": "text", "text": "one two three"})).unwrap();
+        let b = s.execute("frame.create", &json!({"rect": [72, 200, 300, 400], "content": "unassigned"})).unwrap();
+        s.execute("frame.thread", &json!({"from": a["id"], "to": b["id"]})).unwrap();
+        let sid = designcraft_doc::StoryId(a["story"].as_u64().unwrap());
+        let frames = s.doc().unwrap().doc.story(sid).unwrap().frames.clone();
+        assert_eq!(frames.len(), 2);
+        assert!(s.execute("frame.thread", &json!({"from": a["id"], "to": a["id"]})).is_err());
+        assert!(s.execute("frame.thread", &json!({"to": b["id"]})).is_err());
+    }
 
     #[test]
     fn korean_character_breaks_are_a_paragraph_attribute() {

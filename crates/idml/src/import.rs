@@ -1357,6 +1357,13 @@ impl<'r> Importer<'r> {
         a.composer = e
             .prop("Composer")
             .map(|c| if c.contains("Single") { designcraft_doc::Composer::SingleLine } else { designcraft_doc::Composer::Paragraph });
+        // InDesign's CJK (Japanese) composers break Hangul between syllables, not at spaces;
+        // a Korean book set with them reflows wrongly under word-based breaking.
+        if let Some(c) = e.prop("Composer")
+            && (c.ends_with(" J") || c.contains("Japanese") || c.contains("CJK"))
+        {
+            a.korean_char_breaks = Some(true);
+        }
         a.hyphenate = e.boolean("Hyphenation");
         a.hyph_min_word = u("HyphenateWordsLongerThan");
         a.hyph_after_first = u("HyphenateAfterFirst");

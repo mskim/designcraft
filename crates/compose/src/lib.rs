@@ -567,6 +567,13 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
         }
         let pf = &story.paras[pi];
         let (pp, base_chars) = doc.styles.resolve_para(pf);
+        // An empty paragraph takes its size and leading from its paragraph mark (as InDesign
+        // does): an empty line set in a character style keeps that style's leading.
+        let base_chars = if prange.is_empty() && story.text.as_bytes().get(prange.end) == Some(&b'\n') {
+            doc.styles.resolve_char(&base_chars, story.char_format_at(prange.end + 1))
+        } else {
+            base_chars
+        };
         // A break character that ends the previous paragraph sends this one on, like a start option.
         let after_break = pi
             .checked_sub(1)
@@ -914,7 +921,7 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
                 let (s, e) = (g0 + b.start, g0 + b.end);
                 let line_glyphs = &glyphs[s..e.max(s)];
                 let (asc, desc, lead) = line_metrics(line_glyphs, &glyphs, s, base_leading, base_chars.size, db, &base_chars);
-                let reference = cjk_line_reference(line_glyphs);
+                let reference = line_reference(line_glyphs, glyphs.get(s), &base_chars, db);
                 let mut baseline = cur.next_baseline(f, col, lead, asc, &pp);
                 if cur.last_baseline.is_some() {
                     baseline += cur.last_reference - reference;
@@ -2044,6 +2051,30 @@ fn cjk_line_reference(line: &[Glyph]) -> f64 {
     }
 }
 
+/// [`cjk_line_reference`] for a line that may be empty: an empty line (only spaces, or an empty
+/// paragraph) is measured from its first glyph, else from the paragraph mark's font, so CJK
+/// leading (e.g. Aki Below) spaces it like a line with text.
+fn line_reference(line: &[Glyph], first: Option<&Glyph>, base: &designcraft_doc::CharProps, db: &ScopedFonts<'_>) -> f64 {
+    use designcraft_doc::cjk::LeadingModel as L;
+    if !line.is_empty() {
+        return cjk_line_reference(line);
+    }
+    if let Some(g) = first {
+        return cjk_line_reference(std::slice::from_ref(g));
+    }
+    let face = db.face(&base.font_family, &base.font_style);
+    let k = base.size / face.upem.max(1e-9);
+    let (a, d) = (face.ascent * k, face.descent * k);
+    let top = -base.size * a / (a + d).max(1e-9);
+    let bottom = top + base.size;
+    match base.leading_model {
+        L::Roman => 0.0,
+        L::AkiBelow => bottom,
+        L::AkiAbove => top,
+        L::Center | L::CenterDown => (top + bottom) / 2.0,
+    }
+}
+
 fn line_metrics(
     line: &[Glyph],
     all: &[Glyph],
@@ -2057,6 +2088,12 @@ fn line_metrics(
     if src.is_empty() {
         let face = db.face(&base.font_family, &base.font_style);
         let k = base_size / face.upem;
+        // An empty line in a CJK font is fitted by the em box too (as lines with glyphs below).
+        if face.menu_group().0 != designcraft_fonts::FontGroup::Western {
+            let (t, b) = face.em_box();
+            let k = base_size / face.units_per_em().max(1e-9);
+            return (t * k, -b * k, base_leading);
+        }
         return (face.ascent * k, face.descent * k, base_leading);
     }
     let mut asc: f64 = 0.0;

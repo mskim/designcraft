@@ -29,7 +29,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use designcraft_doc::{
-    Align, Composer, Document, FirstBaseline, GridAlign, ItemId, ParaProps, SpanColumns, StartParagraph, Story, StoryId, TabAlign, TextFrameOptions,
+    Align, Document, FirstBaseline, GridAlign, ItemId, ParaProps, SpanColumns, StartParagraph, Story, StoryId, TabAlign, TextFrameOptions,
     VerticalJustification, WrapMode, story,
 };
 use designcraft_fonts::{FontDb, ScopedFonts};
@@ -681,7 +681,7 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
                 let mut gl = sp.glyphs.clone();
                 apply_desired_spacing(&mut gl, &pp);
                 let hy = hyphenation_points(&story.text, &gl, &pp, &hyph_exceptions, &foreign_ranges(doc, story, prange.clone(), &base_chars));
-                let breaks = if pp.composer == Composer::SingleLine || gl.iter().any(|g| g.ch == '\t') || gl.len() > 4000 {
+                let breaks = if pp.composer.first_fit() || gl.iter().any(|g| g.ch == '\t') || gl.len() > 4000 {
                     let tab = |j: usize, x: f64, i: usize| {
                         let ind = pp.left_indent + if j == 0 { pp.first_line_indent } else { 0.0 };
                         tab_advance(&pp.tabs, pp.left_indent, ind + x, gl.get(i + 1..).unwrap_or_default()).0
@@ -896,7 +896,7 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
             };
             let rest = &glyphs[g0..];
             let rest_h = &hyph_after[g0..];
-            let breaks: Vec<Break> = if pp.composer == Composer::SingleLine || has_tabs || rest.len() > 4000 {
+            let breaks: Vec<Break> = if pp.composer.first_fit() || has_tabs || rest.len() > 4000 {
                 // Where each line starts relative to the tab origin, as `layout_line` places it.
                 let tab = |j: usize, x: f64, i: usize| {
                     let x0 = slots.get(j).map_or(col.x0, |s| s.0);
@@ -1465,7 +1465,8 @@ pub fn column_rule_rects(columns: &[Rect], lines: &[Line], opts: &TextFrameOptio
 fn spacing_for(pp: &ParaProps, base_size: f64) -> Spacing {
     Spacing {
         justify: pp.align.is_justified(),
-        word_min: pp.word_space_min,
+        // InDesign's CJK composers stretch word spaces but don't shrink them.
+        word_min: if pp.composer.cjk() { pp.word_space_min.max(pp.word_space_desired) } else { pp.word_space_min },
         word_desired: pp.word_space_desired,
         word_max: pp.word_space_max,
         letter_min: pp.letter_space_min.min(pp.letter_space_desired),
@@ -2262,6 +2263,10 @@ fn layout_line(
         let hr = optical_right.max(cjk_right);
         x0 -= hl;
         measure += hl + hr;
+    }
+    // Negative tracking after a justified line's last character is not applied (as the breaker measured it).
+    if !has_tab && let Some(g) = line.iter().rev().find(|g| !g.is_space()) {
+        measure += breaker::trailing_tracking(g, sp);
     }
     let natural: f64 = line.iter().map(|g| g.adv).sum();
     let mut extra = measure - natural;

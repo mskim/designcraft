@@ -257,7 +257,15 @@ fn hang_left(g: &Glyph) -> f64 {
 }
 
 fn right_hang(g: &Glyph, sp: &Spacing) -> f64 {
-    g.cjk_hang.max(if sp.optical { hang_right(g) } else { 0.0 })
+    g.cjk_hang.max(if sp.optical { hang_right(g) } else { 0.0 }) + trailing_tracking(g, sp)
+}
+
+/// Negative tracking after the last character of a justified line is not applied (measured in
+/// InDesign): the line ends at the character's own advance, so the last glyph doesn't run past the
+/// frame edge. Returned as hang (negative: the line needs that much more room). Positive tracking
+/// and ragged lines keep their trailing tracking inside the measure.
+pub fn trailing_tracking(g: &Glyph, sp: &Spacing) -> f64 {
+    if sp.justify && !g.is_space() { g.tracking.min(0.0) } else { 0.0 }
 }
 
 fn hang_right(g: &Glyph) -> f64 {

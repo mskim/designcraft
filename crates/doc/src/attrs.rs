@@ -415,6 +415,23 @@ pub enum Composer {
     Paragraph,
     /// Greedy, line by line.
     SingleLine,
+    /// InDesign's CJK paragraph composer ("HL Composer J" in IDML). Measured against InDesign on
+    /// a Korean book: word spaces stretch but never shrink, and lines fill one at a time (first
+    /// fit matched InDesign's line breaks better than total fit).
+    JParagraph,
+    /// InDesign's CJK single-line composer ("HL Single J"): as [`Composer::JParagraph`].
+    JSingleLine,
+}
+
+impl Composer {
+    /// Lines are filled one at a time (greedy) instead of by total fit.
+    pub fn first_fit(self) -> bool {
+        matches!(self, Composer::SingleLine | Composer::JParagraph | Composer::JSingleLine)
+    }
+    /// A CJK (InDesign "J") composer: justified word spaces don't shrink below the desired width.
+    pub fn cjk(self) -> bool {
+        matches!(self, Composer::JParagraph | Composer::JSingleLine)
+    }
 }
 
 /// What a nested style runs to (Drop Caps and Nested Styles).

@@ -1399,3 +1399,18 @@ fn list_numbering_format_expression_and_bullet_import_and_round_trip() {
     check(&d);
     check(&import_idml(&export_idml(&d)).unwrap());
 }
+
+#[test]
+fn round_trips_cjk_composers() {
+    use designcraft_doc::{Composer, ParaAttrs};
+    for composer in [Composer::Paragraph, Composer::SingleLine, Composer::JParagraph, Composer::JSingleLine] {
+        let mut d = Document::new(&NewDocument::default());
+        let lid = d.default_layer();
+        let para = ParaAttrs { composer: Some(composer), ..Default::default() };
+        d.add_text_frame(SpreadRef::Doc(0), Rect::new(36.0, 36.0, 300.0, 200.0), lid, "한국어 본문", ParaFormat { para, ..Default::default() })
+            .unwrap();
+        let back = import_idml(&export_idml(&d)).unwrap();
+        let s = back.stories.values().next().unwrap();
+        assert_eq!(s.paras[0].para.composer, Some(composer), "{composer:?}");
+    }
+}

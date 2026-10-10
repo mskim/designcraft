@@ -1389,6 +1389,8 @@ impl<'a> Ex<'a> {
                 match c {
                     designcraft_doc::Composer::Paragraph => "HL Composer",
                     designcraft_doc::Composer::SingleLine => "HL Single",
+                    designcraft_doc::Composer::JParagraph => "HL Composer J",
+                    designcraft_doc::Composer::JSingleLine => "HL Single J",
                 },
             );
         }

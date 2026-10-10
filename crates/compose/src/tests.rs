@@ -2817,3 +2817,49 @@ fn cjk_composers_stretch_but_do_not_shrink_word_spaces() {
         }
     }
 }
+
+#[test]
+fn an_empty_paragraph_takes_its_leading_from_its_paragraph_mark() {
+    // As in InDesign: an empty line set in a character style keeps that style's leading.
+    let text = "One\n\nTwo";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, 500.0), ParaAttrs::default());
+    // The empty paragraph's mark (byte 4).
+    d.story_mut(sid).unwrap().format_chars(4..5, |f| f.over.leading = Some(designcraft_doc::Leading::Points(30.0)));
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let lines = all_lines(&cs);
+    assert_eq!(lines.len(), 3);
+    assert!((lines[1].baseline - lines[0].baseline - 30.0).abs() < 1e-6, "{} → {}", lines[0].baseline, lines[1].baseline);
+}
+
+fn cjk_lines(text: &str, height: f64) -> (Vec<f64>, bool) {
+    let chars: Vec<char> = "가나".chars().collect();
+    let font = designcraft_fonts::testing::font_with("DC Test Korean Lines", &chars).unwrap();
+    designcraft_fonts::FontDb::global().add_font(font);
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, height), ParaAttrs::default());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+        f.over.font_family = Some("DC Test Korean Lines".into());
+        f.over.language = Some("Korean".into());
+        f.over.leading = Some(designcraft_doc::Leading::Points(20.0));
+        f.over.leading_model = Some(designcraft_doc::cjk::LeadingModel::AkiBelow);
+    });
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    (all_lines(&cs).iter().map(|l| l.baseline).collect(), cs.is_overset())
+}
+
+#[test]
+fn an_empty_cjk_line_is_spaced_and_fitted_like_a_line_of_text() {
+    // Aki Below leading is measured between em boxes: an empty paragraph sits one leading below
+    // the line before it, like text would.
+    let (text_lines, _) = cjk_lines("가나\n가나\n가나", 500.0);
+    let (with_empty, _) = cjk_lines("가나\n\n가나", 500.0);
+    assert_eq!(with_empty.len(), 3);
+    for (a, b) in text_lines.iter().zip(&with_empty) {
+        assert!((a - b).abs() < 1e-6, "{text_lines:?} vs {with_empty:?}");
+    }
+    // A frame that just fits two lines of text also fits a line of text and an empty line.
+    let (two, _) = cjk_lines("가나\n가나", 500.0);
+    let (_, overset) = cjk_lines("가나\n가나", two[1] + 3.0);
+    let height = if overset { two[1] + 6.0 } else { two[1] + 3.0 };
+    assert!(!cjk_lines("가나\n가나", height).1);
+    assert!(!cjk_lines("가나\n", height).1, "the empty line fits where text fits (height {height})");
+}

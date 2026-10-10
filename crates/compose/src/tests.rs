@@ -2771,3 +2771,32 @@ fn empty_paragraphs_get_no_bullet_or_number() {
         assert_eq!(list_labels(&cs, LABEL_CHARS), ["1.", "", "2.", ""], "list `{name}`");
     }
 }
+
+#[test]
+fn tracking_after_the_last_character_of_a_line_is_not_applied() {
+    // As in InDesign: a justified line ends where its last character's own advance ends, so
+    // negative tracking doesn't let the last character run past the frame edge.
+    let para = ParaAttrs { align: Some(Align::LeftJustified), hyphenate: Some(false), ..Default::default() };
+    let (mut d, sid, _) = doc_with(LOREM, Rect::new(0.0, 0.0, 220.0, 2000.0), para);
+    d.story_mut(sid).unwrap().format_chars(0..LOREM.len(), |f| f.over.tracking = Some(-50.0));
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let lines = all_lines(&cs);
+    let tracking = -50.0 / 1000.0 * 12.0;
+    for l in &lines[..lines.len() - 1] {
+        assert!((l.end_x - tracking - l.x1).abs() < 0.05, "line ends at {} (+{} untracked), frame edge {}", l.end_x, -tracking, l.x1);
+    }
+}
+
+#[test]
+fn cjk_composers_stretch_but_do_not_shrink_word_spaces() {
+    for composer in [designcraft_doc::Composer::JParagraph, designcraft_doc::Composer::JSingleLine] {
+        let para = ParaAttrs { composer: Some(composer), align: Some(Align::LeftJustified), ..Default::default() };
+        let (d, sid, _) = doc_with(LOREM, Rect::new(0.0, 0.0, 180.0, 2000.0), para);
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let lines = all_lines(&cs);
+        assert!(lines.len() > 4);
+        for l in &lines[..lines.len() - 1] {
+            assert!(l.spacing >= 1.0 - 1e-6, "{composer:?}: word spaces shrunk to {}", l.spacing);
+        }
+    }
+}

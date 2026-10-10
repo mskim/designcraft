@@ -1289,9 +1289,15 @@ impl<'r> Importer<'r> {
                 GridAlign::AllLines
             });
         }
-        a.composer = e
-            .prop("Composer")
-            .map(|c| if c.contains("Single") { designcraft_doc::Composer::SingleLine } else { designcraft_doc::Composer::Paragraph });
+        a.composer = e.prop("Composer").map(|c| {
+            let cjk = c.ends_with(" J") || c.contains("Japanese") || c.contains("CJK");
+            match (c.contains("Single"), cjk) {
+                (true, true) => designcraft_doc::Composer::JSingleLine,
+                (true, false) => designcraft_doc::Composer::SingleLine,
+                (false, true) => designcraft_doc::Composer::JParagraph,
+                (false, false) => designcraft_doc::Composer::Paragraph,
+            }
+        });
         // InDesign's CJK (Japanese) composers break Hangul between syllables, not at spaces;
         // a Korean book set with them reflows wrongly under word-based breaking.
         if let Some(c) = e.prop("Composer")

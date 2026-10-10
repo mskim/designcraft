@@ -20,6 +20,9 @@ pub struct Glyph {
     pub ch: char,
     /// Advance in points (tracking and horizontal scale applied).
     pub adv: f64,
+    /// The tracking (and manual kerning) included in `adv`, in points (see
+    /// [`crate::breaker::trailing_tracking`]).
+    pub tracking: f64,
     pub dx: f64,
     pub dy: f64,
     /// Font units → points (incl. horizontal / vertical scale).
@@ -765,6 +768,7 @@ fn control_glyph(face: &Arc<FontFace>, p: &CharProps, auto_leading: TypeEnv, sty
         len: ch.len_utf8(),
         ch,
         adv: 0.0,
+        tracking: 0.0,
         dx: 0.0,
         dy: 0.0,
         sx: k * p.h_scale,
@@ -866,10 +870,12 @@ fn shape_segment(
             (sg.x_offset as f64 * k * hs, -(sg.y_offset as f64) * k * p.v_scale)
         };
         let (ascent, descent) = if up { (em_top * k_v, -em_bottom * k_v) } else { (ascent, descent) };
+        let mut tracked = 0.0;
         if ch == SOFT_HYPHEN {
             adv = 0.0;
         } else if last_in_cluster {
             adv += tracking + manual;
+            tracked = tracking + manual;
         }
         // Only the first glyph of a cluster owns the bytes (so ranges partition the text).
         let first_in_cluster = gi == 0 || shaped[gi - 1].cluster != sg.cluster;
@@ -883,6 +889,7 @@ fn shape_segment(
             len: if first_in_cluster || replacement.is_some() { len } else { 0 },
             ch,
             adv,
+            tracking: tracked,
             dx: dx + mark_x,
             dy: dy - mark_y,
             sx: k * hs,
@@ -943,6 +950,7 @@ pub(crate) fn hyphen_after(g: &Glyph) -> Glyph {
     let mut h = g.clone();
     h.gid = gid;
     h.adv = g.face.advance(gid) * g.sx;
+    h.tracking = 0.0;
     h.dx = 0.0;
     h.dy = 0.0;
     h.byte = g.byte + g.len;

@@ -1480,12 +1480,15 @@ pub fn paragraph_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
     });
     ui.horizontal(|ui| {
         caption(ui, crate::i18n::tr(&app.ui.language, "Composer"));
-        let single = p["composer"].as_str() == Some("singleLine");
+        // A CJK ("J") composer stays CJK when switching between paragraph and single-line.
+        let c = p["composer"].as_str().unwrap_or("paragraph");
+        let single = matches!(c, "singleLine" | "jSingleLine");
+        let (para_id, single_id) = if c.starts_with('j') { ("jParagraph", "jSingleLine") } else { ("paragraph", "singleLine") };
         if ui.selectable_label(!single, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Paragraph"))).clicked() {
-            let _ = app.run("type.para", json!({"attrs": {"composer": "paragraph"}}));
+            let _ = app.run("type.para", json!({"attrs": {"composer": para_id}}));
         }
         if ui.selectable_label(single, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Single-line"))).clicked() {
-            let _ = app.run("type.para", json!({"attrs": {"composer": "singleLine"}}));
+            let _ = app.run("type.para", json!({"attrs": {"composer": single_id}}));
         }
     });
     // Paragraph Border and Shading.

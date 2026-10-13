@@ -1525,11 +1525,12 @@ fn labels_and_alt_text_round_trip() {
 
 #[test]
 fn placed_pdf_keeps_its_page() {
-    let bytes = export_idml(&graphic_doc("application/pdf", b"%PDF-1.5\n", 2));
+    // Asset::page is 0-based, as file.place {pdfPage: 2} stores it; IDML's PageNumber is 1-based.
+    let bytes = export_idml(&graphic_doc("application/pdf", b"%PDF-1.5\n", 1));
     assert!(idml_xml(&bytes).contains(r#"<PDFAttribute PageNumber="2""#), "no PDFAttribute");
     let back = import_idml(&bytes).unwrap();
     let (_, asset) = first_graphic(&back);
-    assert_eq!((asset.mime.as_str(), asset.page), ("application/pdf", 2));
+    assert_eq!((asset.mime.as_str(), asset.page), ("application/pdf", 1));
 }
 
 #[test]
@@ -1567,12 +1568,12 @@ fn text_variables_round_trip() {
 
 #[test]
 fn pages_of_one_linked_pdf_stay_apart() {
-    // Two frames placing pages 1 and 3 of the same linked (not embedded) PDF.
+    // Two frames placing pages 1 and 3 (0-based 0 and 2) of the same linked (not embedded) PDF.
     use designcraft_doc::{Asset, AssetId, Content, Graphic, Item, ItemId};
     use std::sync::Arc;
     let mut d = Document::new(&NewDocument::default());
     let lid = d.default_layer();
-    for (k, page) in [(0.0, 1), (60.0, 3)] {
+    for (k, page) in [(0.0, 0), (60.0, 2)] {
         let aid = AssetId(d.alloc());
         d.assets.insert(aid, Arc::new(Asset { page, id: aid, name: "book.pdf".into(), mime: "application/pdf".into(), link: Some("/tmp/book.pdf".into()), data: Arc::new(Vec::new()), pixels: None }));
         let mut it = Item::new(ItemId(d.alloc()), lid, Shape::Rectangle, shapes::rectangle(Rect::new(40.0 + k, 40.0, 90.0 + k, 90.0)));
@@ -1589,5 +1590,5 @@ fn pages_of_one_linked_pdf_stay_apart() {
         })
         .collect();
     pages.sort();
-    assert_eq!(pages, [1, 3]);
+    assert_eq!(pages, [0, 2]);
 }

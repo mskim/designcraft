@@ -1805,8 +1805,9 @@ impl<'a> Ex<'a> {
         props.push(El::new("GraphicBounds").attr("Left", "0").attr("Top", "0").attr("Right", num(g.size.0)).attr("Bottom", num(g.size.1)));
         let mut el = with_props(el, props);
         if is_pdf {
-            // Which page of the PDF is placed (1-based; 0 means the first).
-            el.push(El::new("PDFAttribute").attr("PageNumber", asset.page.max(1)).attr("PDFCrop", "CropContentVisibleLayers").attr("TransparentBackground", "true"));
+            // Which page of the PDF is placed: Asset::page is 0-based (file.place {pdfPage: n} stores
+            // n - 1), IDML's PageNumber 1-based.
+            el.push(El::new("PDFAttribute").attr("PageNumber", asset.page + 1).attr("PDFCrop", "CropContentVisibleLayers").attr("TransparentBackground", "true"));
         }
         let uri = match &asset.link {
             Some(l) => path_to_uri(l),

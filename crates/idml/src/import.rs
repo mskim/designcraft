@@ -2344,8 +2344,8 @@ impl<'r> Importer<'r> {
                 crop: [0.0; 4],
             })
         };
-        // A placed PDF's page (1-based; 0 for anything else).
-        let page = g.find("PDFAttribute").and_then(|a| a.num("PageNumber")).map_or(0, |n| n.max(0.0) as u32);
+        // A placed PDF's page: IDML's PageNumber is 1-based, Asset::page 0-based.
+        let page = g.find("PDFAttribute").and_then(|a| a.num("PageNumber")).map_or(0, |n| (n.max(1.0) - 1.0) as u32);
         let mut data = g.prop_el("Contents").map(|c| base64_decode(&c.text_content())).unwrap_or_default();
         let mut read_from = None;
         if data.is_empty()

@@ -1469,3 +1469,125 @@ fn round_trips_cjk_composers() {
         assert_eq!(s.paras[0].para.composer, Some(composer), "{composer:?}");
     }
 }
+
+/// A document with one graphic frame holding `data` as `mime` (PDF page `page`).
+fn graphic_doc(mime: &str, data: &[u8], page: u32) -> Document {
+    use designcraft_doc::{Asset, AssetId, Content, Graphic, Item, ItemId};
+    use std::sync::Arc;
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let aid = AssetId(d.alloc());
+    d.assets.insert(aid, Arc::new(Asset { page, id: aid, name: "art".into(), mime: mime.into(), link: None, data: Arc::new(data.to_vec()), pixels: Some((100, 50)) }));
+    let mut it = Item::new(ItemId(d.alloc()), lid, Shape::Rectangle, shapes::rectangle(Rect::new(40.0, 40.0, 140.0, 90.0)));
+    it.content = Content::Graphic(Graphic {
+        asset: aid,
+        size: (100.0, 50.0),
+        xf: designcraft_geom::Affine::IDENTITY,
+        auto_fit: Default::default(),
+        fit_align: 4,
+        crop: [0.0; 4],
+    });
+    it.label = "formula:x^2".into();
+    it.alt_text = "이차식 그림".into();
+    d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
+    d
+}
+
+fn idml_xml(bytes: &[u8]) -> String {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut out = String::new();
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).unwrap();
+        if f.name().ends_with(".xml") {
+            std::io::Read::read_to_string(&mut f, &mut out).unwrap();
+        }
+    }
+    out
+}
+
+fn first_graphic(d: &Document) -> (&designcraft_doc::Item, &designcraft_doc::Asset) {
+    let it = d.spreads.iter().flat_map(|s| s.items.iter()).find(|i| matches!(i.content, designcraft_doc::Content::Graphic(_))).unwrap();
+    let designcraft_doc::Content::Graphic(g) = &it.content else { unreachable!() };
+    (it, d.assets.get(&g.asset).unwrap())
+}
+
+#[test]
+fn labels_and_alt_text_round_trip() {
+    let bytes = export_idml(&graphic_doc("image/png", b"\x89PNG\r\n\x1a\n", 0));
+    let xml = idml_xml(&bytes);
+    // As InDesign writes them: a Label key in the item's properties, alt text in its export options.
+    assert!(xml.contains(r#"<KeyValuePair Key="Label" Value="formula:x^2""#), "no label");
+    assert!(xml.contains(r#"AltTextSourceType="SourceCustom""#) && xml.contains(r#"CustomAltText="이차식 그림""#), "no alt text");
+    let back = import_idml(&bytes).unwrap();
+    let (it, _) = first_graphic(&back);
+    assert_eq!((it.label.as_str(), it.alt_text.as_str()), ("formula:x^2", "이차식 그림"));
+}
+
+#[test]
+fn placed_pdf_keeps_its_page() {
+    let bytes = export_idml(&graphic_doc("application/pdf", b"%PDF-1.5\n", 2));
+    assert!(idml_xml(&bytes).contains(r#"<PDFAttribute PageNumber="2""#), "no PDFAttribute");
+    let back = import_idml(&bytes).unwrap();
+    let (_, asset) = first_graphic(&back);
+    assert_eq!((asset.mime.as_str(), asset.page), ("application/pdf", 2));
+}
+
+#[test]
+fn svg_is_exported_as_svg() {
+    let bytes = export_idml(&graphic_doc("image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#, 0));
+    let xml = idml_xml(&bytes);
+    assert!(xml.contains("<SVG ") && xml.contains("$ID/Scalable Vector Graphics (SVG)"), "SVG labelled as something else");
+    let back = import_idml(&bytes).unwrap();
+    assert_eq!(first_graphic(&back).1.mime, "image/svg+xml");
+}
+
+#[test]
+fn text_variables_round_trip() {
+    use designcraft_doc::vars::{TextVariable, VarKind, var_char};
+    let mut d = Document::new(&NewDocument::default());
+    d.text_variables.push(TextVariable { name: "Edition".into(), kind: VarKind::Custom { text: "2판".into() }, before: String::new(), after: String::new() });
+    let edition = d.text_variables.len() - 1;
+    let last = d.text_variables.iter().position(|v| matches!(v.kind, VarKind::LastPageNumber { .. })).unwrap();
+    let lid = d.default_layer();
+    let text = format!("판: {} 끝 {}", var_char(edition).unwrap(), var_char(last).unwrap());
+    d.add_text_frame(SpreadRef::Doc(0), Rect::new(40.0, 40.0, 300.0, 200.0), lid, &text, ParaFormat::default()).unwrap();
+    let bytes = export_idml(&d);
+    let xml = idml_xml(&bytes);
+    assert!(xml.contains(r#"<TextVariable Self="dTextVariablenEdition" Name="Edition" VariableType="CustomTextType">"#), "no definition");
+    assert!(xml.contains("<CustomTextVariablePreference ") && xml.contains(r#"Contents="2판""#), "no custom text");
+    assert!(xml.contains(r#"VariableType="LastPageNumberType""#) && xml.contains("<PageNumberVariablePreference "), "no last page number");
+    assert!(xml.contains(r#"<TextVariableInstance "#) && xml.contains(r#"ResultText="2판" AssociatedTextVariable="dTextVariablenEdition""#), "no instance");
+    let back = import_idml(&bytes).unwrap();
+    let v = back.text_variables.iter().position(|v| v.name == "Edition").expect("definition imported");
+    assert!(matches!(&back.text_variables[v].kind, VarKind::Custom { text } if text == "2판"));
+    let story = back.stories.values().find(|s| s.text.starts_with("판:")).unwrap();
+    let l = back.text_variables.iter().position(|v| matches!(v.kind, VarKind::LastPageNumber { .. })).unwrap();
+    assert_eq!(story.text, format!("판: {} 끝 {}", var_char(v).unwrap(), var_char(l).unwrap()));
+}
+
+#[test]
+fn pages_of_one_linked_pdf_stay_apart() {
+    // Two frames placing pages 1 and 3 of the same linked (not embedded) PDF.
+    use designcraft_doc::{Asset, AssetId, Content, Graphic, Item, ItemId};
+    use std::sync::Arc;
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    for (k, page) in [(0.0, 1), (60.0, 3)] {
+        let aid = AssetId(d.alloc());
+        d.assets.insert(aid, Arc::new(Asset { page, id: aid, name: "book.pdf".into(), mime: "application/pdf".into(), link: Some("/tmp/book.pdf".into()), data: Arc::new(Vec::new()), pixels: None }));
+        let mut it = Item::new(ItemId(d.alloc()), lid, Shape::Rectangle, shapes::rectangle(Rect::new(40.0 + k, 40.0, 90.0 + k, 90.0)));
+        it.content = Content::Graphic(Graphic { asset: aid, size: (50.0, 50.0), xf: designcraft_geom::Affine::IDENTITY, auto_fit: Default::default(), fit_align: 4, crop: [0.0; 4] });
+        d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
+    }
+    let back = import_idml_with(&export_idml(&d), &|_| Some(b"%PDF-1.5\n".to_vec())).unwrap();
+    let mut pages: Vec<u32> = back.spreads[0]
+        .items
+        .iter()
+        .filter_map(|i| match &i.content {
+            Content::Graphic(g) => back.assets.get(&g.asset).map(|a| a.page),
+            _ => None,
+        })
+        .collect();
+    pages.sort();
+    assert_eq!(pages, [1, 3]);
+}

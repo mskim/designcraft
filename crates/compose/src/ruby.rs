@@ -71,10 +71,12 @@ fn kenten(db: &ScopedFonts<'_>, b: &PlacedGlyph, size: f64, character: &str, fal
     dot
 }
 
-/// Add the ruby and kenten of a laid-out line's glyphs. `glyph_fallback`: the document draws
-/// missing glyphs from fallback fonts (a missing font's substitute always does).
-pub(crate) fn annotate(db: &ScopedFonts<'_>, styles: &[RunStyle], line: &mut Vec<PlacedGlyph>, glyph_fallback: bool) {
+/// Add the ruby and kenten of a laid-out line's glyphs (`text`: the story's). `glyph_fallback`: the
+/// document draws missing glyphs from fallback fonts (a missing font's substitute always does).
+pub(crate) fn annotate(db: &ScopedFonts<'_>, styles: &[RunStyle], text: &str, line: &mut Vec<PlacedGlyph>, glyph_fallback: bool) {
     let style = |g: &PlacedGlyph| styles.get(g.style as usize);
+    // Emphasis marks go over characters, not over the spaces between words.
+    let marked = |g: &PlacedGlyph| g.len > 0 && g.adv > 0.0 && !text.get(g.byte..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace);
     if !line.iter().any(|g| style(g).is_some_and(|s| s.ruby.is_some() || s.kenten)) {
         return;
     }
@@ -86,22 +88,22 @@ pub(crate) fn annotate(db: &ScopedFonts<'_>, styles: &[RunStyle], line: &mut Vec
             i += 1;
             continue;
         };
-        if st.kenten && g.adv > 0.0 {
+        if st.kenten && marked(g) {
             extra.extend(kenten(db, g, st.size, &st.kenten_character, glyph_fallback || st.missing_font));
         }
-        let Some(text) = &st.ruby else {
+        let Some(reading) = &st.ruby else {
             i += 1;
             continue;
         };
         // The group: following glyphs with the same ruby.
         let mut j = i + 1;
-        while j < line.len() && (line[j].len == 0 || style(&line[j]).is_some_and(|s| s.ruby.as_ref() == Some(text))) {
+        while j < line.len() && (line[j].len == 0 || style(&line[j]).is_some_and(|s| s.ruby.as_ref() == Some(reading))) {
             j += 1;
         }
         let base: Vec<&PlacedGlyph> = line[i..j].iter().filter(|b| b.len > 0).collect();
         let x0 = base.iter().map(|b| b.x).fold(f64::MAX, f64::min);
         let x1 = base.iter().map(|b| b.x + b.adv).fold(f64::MIN, f64::max);
-        let (mut glyphs, w) = set(g, text, st.size * SCALE, st.size);
+        let (mut glyphs, w) = set(g, reading, st.size * SCALE, st.size);
         let n = glyphs.len().max(1) as f64;
         if w < x1 - x0 {
             // Shorter than the base: spread out, half a gap at each end (the 1-2-1 rule).
@@ -118,7 +120,7 @@ pub(crate) fn annotate(db: &ScopedFonts<'_>, styles: &[RunStyle], line: &mut Vec
         }
         extra.extend(glyphs);
         // Kenten on the rest of the group.
-        for b in line[i + 1..j].iter().filter(|b| st.kenten && b.len > 0 && b.adv > 0.0) {
+        for b in line[i + 1..j].iter().filter(|b| st.kenten && marked(b)) {
             extra.extend(kenten(db, b, st.size, &st.kenten_character, glyph_fallback || st.missing_font));
         }
         i = j;

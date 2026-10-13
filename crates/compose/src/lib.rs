@@ -1046,7 +1046,7 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
                     layout_line(&glyphs, s, e, b.hyphen, lx0, lx1, col.x0, &pp, &spacing, ends_para, forced_mid, f.left_page, &bidi_info);
                 // Warichu runs before ruby so a reading is placed over the stacked note.
                 let end_x = end_x + warichu::place(&styles_tab, &mut placed);
-                ruby::annotate(db, &styles_tab, &mut placed, doc.settings.glyph_fallback);
+                ruby::annotate(db, &styles_tab, &story.text, &mut placed, doc.settings.glyph_fallback);
                 let range_end = if last { prange.end } else { glyphs.get(g0 + b.next).map(|g| g.byte).unwrap_or(prange.end) };
                 let range_start = glyphs.get(s).map(|g| g.byte).unwrap_or(prange.start).min(range_end);
                 let range_start = if line_no == 0 { prange.start } else { range_start };

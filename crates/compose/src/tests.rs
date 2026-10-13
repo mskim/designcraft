@@ -1066,6 +1066,22 @@ fn ruby_and_kenten_sit_over_their_text() {
 }
 
 #[test]
+fn kenten_skip_spaces() {
+    // Emphasis marks go over characters, not over the spaces between words (ASCII or ideographic).
+    let text = "가 나\u{3000}다";
+    let (mut d, sid, _) = doc_with(text, Rect::new(36.0, 36.0, 300.0, 100.0), ParaAttrs::default());
+    let plain = compose_story(&d, sid, &ComposeOptions::default()).frames[0].lines[0].glyphs.len();
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.kenten = Some(true));
+    let l = compose_story(&d, sid, &ComposeOptions::default()).frames[0].lines[0].clone();
+    let marks = &l.glyphs[plain..];
+    assert_eq!(marks.len(), 3, "one per syllable: {:?}", marks.iter().map(|g| g.x).collect::<Vec<_>>());
+    let syllables: Vec<_> = l.glyphs[..plain].iter().filter(|g| !text[g.byte..].starts_with([' ', '\u{3000}'])).collect();
+    for (mark, base) in marks.iter().zip(syllables) {
+        assert!((mark.x + mark.adv / 2.0 - (base.x + base.adv / 2.0)).abs() < 1.0, "{} over {}", mark.x, base.x);
+    }
+}
+
+#[test]
 fn warichu_stacks_the_run_inside_the_line_and_closes_up() {
     let text = "ABCDEFGHZ";
     let mut d = Document::new(&designcraft_doc::build::NewDocument::default());

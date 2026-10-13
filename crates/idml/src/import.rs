@@ -135,6 +135,8 @@ struct Importer<'r> {
     ctx: ItemCtx,
     sections: Vec<Section>,
     footnote_options: designcraft_doc::FootnoteOptions,
+    /// The document's text variables (InDesign's defaults, replaced by name by the designmap's).
+    text_variables: Vec<designcraft_doc::vars::TextVariable>,
     /// Text destination Self → anchor id.
     anchor_ids: HashMap<String, u64>,
     /// Cross-reference source Self → (story, index in its cross-references).
@@ -220,6 +222,7 @@ impl<'r> Importer<'r> {
             ctx: ItemCtx { threads: Vec::new() },
             sections: Vec::new(),
             footnote_options: Default::default(),
+            text_variables: designcraft_doc::vars::defaults(),
             anchor_ids: HashMap::new(),
             xref_srcs: HashMap::new(),
             xref_format_names: HashMap::new(),
@@ -239,6 +242,7 @@ impl<'r> Importer<'r> {
         for e in top {
             match e.local() {
                 "DocumentPreference" => self.doc_prefs(e),
+                "TextVariable" => self.text_variable(e),
                 "TransparencyPreference" => {
                     if let Some(v) = e.get("BlendingSpace") {
                         self.settings.blend_space = if v == "RGB" { designcraft_doc::BlendSpace::Rgb } else { designcraft_doc::BlendSpace::Cmyk };
@@ -1823,7 +1827,15 @@ impl<'r> Importer<'r> {
                             b.push(&designcraft_doc::OBJECT_MARK.to_string(), cf);
                         }
                     }
-                    "Properties" | "Note" | "TextFrame" | "StoryPreference" | "InCopyExportOption" | "TextVariableInstance" => {}
+                    "TextVariableInstance" => {
+                        // The variable's character, or its text when the variable is unknown.
+                        let name = c.get("Name").unwrap_or("");
+                        match self.text_variables.iter().position(|v| v.name == name).and_then(designcraft_doc::vars::var_char) {
+                            Some(ch) => b.push(&ch.to_string(), cf),
+                            None => b.push(c.get("ResultText").unwrap_or(""), cf),
+                        }
+                    }
+                    "Properties" | "Note" | "TextFrame" | "StoryPreference" | "InCopyExportOption" => {}
                     _ => self.walk_story(c, b, pf, pchars, cf, brk),
                 },
                 Node::Pi(t, v) if t == "ACE" => {
@@ -1833,6 +1845,38 @@ impl<'r> Importer<'r> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// `<TextVariable>`: replaces the default of the same name, or adds one. InDesign's own
+    /// cross-reference variables (`<?AID …?>` names) and types we don't have are skipped.
+    fn text_variable(&mut self, e: &El) {
+        use designcraft_doc::vars::{TextVariable, Use, VarKind};
+        let Some(name) = e.get("Name").filter(|n| !n.starts_with("<?AID")) else { return };
+        let pref = e.elements().next();
+        let a = |k: &str| pref.and_then(|p| p.get(k)).unwrap_or("").to_string();
+        let kind = match e.get("VariableType").unwrap_or("") {
+            "CustomTextType" => VarKind::Custom { text: a("Contents") },
+            "LastPageNumberType" => VarKind::LastPageNumber { section: a("Scope") == "SectionScope" },
+            "ChapterNumberType" => VarKind::ChapterNumber,
+            "FileNameType" => VarKind::FileName { extension: a("IncludeExtension") == "true" },
+            "CreationDateType" => VarKind::CreationDate { format: a("Format") },
+            "ModificationDateType" => VarKind::ModificationDate { format: a("Format") },
+            "OutputDateType" => VarKind::OutputDate { format: a("Format") },
+            t @ ("MatchParagraphStyleType" | "MatchCharacterStyleType") => {
+                let character = t == "MatchCharacterStyleType";
+                let (key, kind, builtins) =
+                    if character { ("AppliedCharacterStyle", "CharacterStyle/", CHAR_BUILTINS) } else { ("AppliedParagraphStyle", "ParagraphStyle/", PARA_BUILTINS) };
+                let style = names::style_name_in(builtins, &unescape_id(a(key).trim_start_matches(kind)));
+                let use_ = if a("SearchStrategy") == "LastOnPage" { Use::LastOnPage } else { Use::FirstOnPage };
+                VarKind::RunningHeader { style, use_, character }
+            }
+            _ => return,
+        };
+        let v = TextVariable { name: name.to_string(), kind, before: a("TextBefore"), after: a("TextAfter") };
+        match self.text_variables.iter_mut().find(|x| x.name == v.name) {
+            Some(x) => *x = v,
+            None => self.text_variables.push(v),
         }
     }
 
@@ -2020,6 +2064,13 @@ impl<'r> Importer<'r> {
         let mut it = Item::new(id, layer, shape, path);
         it.xf = parent * parse_affine(e.get("ItemTransform"));
         it.name = e.get("Name").filter(|n| *n != "$ID/").unwrap_or("").to_string();
+        // Script Label and custom alt text.
+        if let Some(kv) = e.prop_el("Label").and_then(|l| l.elements().find(|k| k.get("Key") == Some("Label"))) {
+            it.label = kv.get("Value").unwrap_or("").to_string();
+        }
+        if let Some(o) = e.elements().find(|c| c.local() == "ObjectExportOption" && c.get("AltTextSourceType") == Some("SourceCustom")) {
+            it.alt_text = o.get("CustomAltText").filter(|t| *t != "$ID/").unwrap_or("").to_string();
+        }
         it.locked = e.get("Locked") == Some("true");
         it.hidden = e.get("Visible") == Some("false");
         it.nonprinting = e.get("Nonprinting") == Some("true");
@@ -2230,6 +2281,7 @@ impl<'r> Importer<'r> {
             f if f.contains("JPEG") => "image/jpeg".into(),
             f if f.contains("TIFF") => "image/tiff".into(),
             f if f.contains("PDF") || g.local() == "PDF" => "application/pdf".into(),
+            f if f.contains("SVG") || g.local() == "SVG" => "image/svg+xml".into(),
             f if f.contains("GIF") => "image/gif".into(),
             _ => "image/png".into(),
         });
@@ -2241,7 +2293,9 @@ impl<'r> Importer<'r> {
             uri.as_deref().and_then(|p| p.rsplit(['/', '\\']).next()).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| "image".into());
         let id = AssetId(self.alloc());
         let link_path = uri.filter(|p| p.contains('/') || p.contains('\\'));
-        self.assets.insert(id, Arc::new(Asset { page: 0, id, name, mime, link: link_path, data: Arc::new(data), pixels }));
+        // A placed PDF's page (1-based).
+        let page = g.find("PDFAttribute").and_then(|a| a.num("PageNumber")).map_or(0, |n| n.max(0.0) as u32);
+        self.assets.insert(id, Arc::new(Asset { page, id, name, mime, link: link_path, data: Arc::new(data), pixels }));
         Content::Graphic(designcraft_doc::Graphic {
             asset: id,
             size,
@@ -2345,7 +2399,7 @@ impl<'r> Importer<'r> {
             user_words: vec![],
             hyphenation_exceptions: vec![],
             toc: None,
-            text_variables: designcraft_doc::vars::defaults(),
+            text_variables: std::mem::take(&mut self.text_variables),
             footnote_options: std::mem::take(&mut self.footnote_options),
             xref_formats: std::mem::take(&mut self.xref_formats),
             index: None,

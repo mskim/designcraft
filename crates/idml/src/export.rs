@@ -341,6 +341,10 @@ impl<'a> Ex<'a> {
                     .attr("Visible", bool_s(c.visible)),
             );
         }
+        // The document's text variables.
+        for v in &d.text_variables {
+            root.push(text_variable_el(v));
+        }
         // Variables InDesign's cross-reference page/chapter blocks rely on.
         for (name, ty) in [("XRefChapterNumber", "XrefChapterNumberType"), ("XRefPageNumber", "XrefPageNumberType")] {
             let n = format!("<?AID 001b?>TV {name}");
@@ -1679,6 +1683,10 @@ impl<'a> Ex<'a> {
             }
         }
         let mut props = Vec::new();
+        if !it.label.is_empty() {
+            // Script Label, as InDesign stores it.
+            props.push(El::new("Label").child(El::new("KeyValuePair").attr("Key", "Label").attr("Value", &it.label)));
+        }
         if tag != "Group" && !it.path.is_empty() {
             props.push(path_geometry(&it.path));
         }
@@ -1732,6 +1740,16 @@ impl<'a> Ex<'a> {
                     .attr("Right", num(w.offsets[3])),
             ],
         ));
+        if !it.alt_text.is_empty() {
+            el.push(
+                El::new("ObjectExportOption")
+                    .attr("AltTextSourceType", "SourceCustom")
+                    .attr("ActualTextSourceType", "SourceXMLStructure")
+                    .attr("CustomAltText", &it.alt_text)
+                    .attr("CustomActualText", "$ID/")
+                    .attr("ApplyTagType", "TagFromStructure"),
+            );
+        }
         match &it.content {
             Content::Group { items } => {
                 for c in items {
@@ -1764,7 +1782,12 @@ impl<'a> Ex<'a> {
 
     fn image_el(&mut self, asset: &designcraft_doc::Asset, g: &designcraft_doc::Graphic) -> El {
         let is_pdf = asset.mime == "application/pdf";
-        let mut el = El::new(if is_pdf { "PDF" } else { "Image" }).attr("Self", self.fresh());
+        let tag = match asset.mime.as_str() {
+            "application/pdf" => "PDF",
+            "image/svg+xml" => "SVG",
+            _ => "Image",
+        };
+        let mut el = El::new(tag).attr("Self", self.fresh());
         if let Some((pw, ph)) = asset.pixels
             && g.size.0 > 0.0
             && g.size.1 > 0.0
@@ -1781,6 +1804,10 @@ impl<'a> Ex<'a> {
         }
         props.push(El::new("GraphicBounds").attr("Left", "0").attr("Top", "0").attr("Right", num(g.size.0)).attr("Bottom", num(g.size.1)));
         let mut el = with_props(el, props);
+        if is_pdf {
+            // Which page of the PDF is placed (1-based; 0 means the first).
+            el.push(El::new("PDFAttribute").attr("PageNumber", asset.page.max(1)).attr("PDFCrop", "CropContentVisibleLayers").attr("TransparentBackground", "true"));
+        }
         let uri = match &asset.link {
             Some(l) => path_to_uri(l),
             None => format!("file:{}", asset.name),
@@ -1999,6 +2026,18 @@ impl<'a> Ex<'a> {
                     if let Some(code) = ace {
                         flush_text(&mut cur, &mut pending);
                         pending.push(Node::Pi("ACE".into(), code.into()));
+                    } else if let Some(v) = designcraft_doc::vars::var_index(ch).and_then(|i| self.d.text_variables.get(i).map(|v| (i, v))) {
+                        // A text variable instance: its definition and its current value.
+                        flush_text(&mut cur, &mut pending);
+                        flush_content(&mut pending, &mut out);
+                        let (i, var) = v;
+                        out.push(Node::El(
+                            El::new("TextVariableInstance")
+                                .attr("Self", self.fresh())
+                                .attr("Name", &var.name)
+                                .attr("ResultText", self.d.variable_value(i, None).unwrap_or_default())
+                                .attr("AssociatedTextVariable", text_variable_self(&var.name)),
+                        ));
                     } else if ch == st::TABLE_ANCHOR {
                         flush_text(&mut cur, &mut pending);
                         flush_content(&mut pending, &mut out);
@@ -2555,6 +2594,42 @@ pub(crate) fn corner_names(path: &PathData) -> [&'static str; 4] {
     out
 }
 
+fn text_variable_self(name: &str) -> String {
+    format!("dTextVariablen{name}")
+}
+
+/// `<TextVariable>` with its type's preference, as InDesign writes them.
+fn text_variable_el(v: &designcraft_doc::vars::TextVariable) -> El {
+    use designcraft_doc::vars::{Use, VarKind};
+    let (ty, pref) = match &v.kind {
+        VarKind::Custom { text } => ("CustomTextType", El::new("CustomTextVariablePreference").attr("Contents", text)),
+        VarKind::LastPageNumber { section } => (
+            "LastPageNumberType",
+            El::new("PageNumberVariablePreference").attr("Format", "Current").attr("Scope", if *section { "SectionScope" } else { "DocumentScope" }),
+        ),
+        VarKind::ChapterNumber => ("ChapterNumberType", El::new("ChapterNumberVariablePreference").attr("Format", "Current")),
+        VarKind::FileName { extension } => {
+            ("FileNameType", El::new("FileNameVariablePreference").attr("IncludePath", "false").attr("IncludeExtension", bool_s(*extension)))
+        }
+        VarKind::CreationDate { format } => ("CreationDateType", El::new("DateVariablePreference").attr("Format", format)),
+        VarKind::ModificationDate { format } => ("ModificationDateType", El::new("DateVariablePreference").attr("Format", format)),
+        VarKind::OutputDate { format } => ("OutputDateType", El::new("DateVariablePreference").attr("Format", format)),
+        VarKind::RunningHeader { style, use_, character } => {
+            let search = if *use_ == Use::LastOnPage { "LastOnPage" } else { "FirstOnPage" };
+            let (ty, el) = if *character {
+                ("MatchCharacterStyleType", El::new("MatchCharacterStylePreference").attr("AppliedCharacterStyle", names::style_self("CharacterStyle", CHAR_BUILTINS, style)))
+            } else {
+                ("MatchParagraphStyleType", El::new("MatchParagraphStylePreference").attr("AppliedParagraphStyle", names::style_self("ParagraphStyle", PARA_BUILTINS, style)))
+            };
+            (ty, el.attr("SearchStrategy", search).attr("ChangeCase", "None").attr("DeleteEndPunctuation", "false"))
+        }
+    };
+    let mut pref_el = El::new(&pref.name).attr("TextBefore", &v.before);
+    pref_el.attrs.extend(pref.attrs);
+    let pref = pref_el.attr("TextAfter", &v.after);
+    El::new("TextVariable").attr("Self", text_variable_self(&v.name)).attr("Name", &v.name).attr("VariableType", ty).child(pref)
+}
+
 fn format_name(mime: &str) -> &'static str {
     match mime {
         "image/png" => "Portable Network Graphics (PNG)",
@@ -2562,6 +2637,7 @@ fn format_name(mime: &str) -> &'static str {
         "image/gif" => "GIF",
         "image/tiff" => "TIFF",
         "application/pdf" => "Adobe Portable Document Format (PDF)",
+        "image/svg+xml" => "Scalable Vector Graphics (SVG)",
         _ => "Portable Network Graphics (PNG)",
     }
 }

@@ -25,7 +25,49 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             replace
         ),
+        cmd!(
+            noundo "font.addFolder",
+            "Add Fonts from Folder",
+            [],
+            None,
+            "{path} — loads the font files (.ttf .otf .ttc .otc) in a folder into the fonts every document can use, for this session (not saved with a document) → {faces: added, files, skipped: [notes]}",
+            super::always,
+            add_folder
+        ),
     ]
+}
+
+/// A folder of font files into the shared fonts: what an app ships for its documents.
+#[cfg(not(target_arch = "wasm32"))]
+fn add_folder(_: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_param(p, "path").ok_or_else(|| bad("font.addFolder", "missing path"))?;
+    let entries = std::fs::read_dir(path).map_err(|e| bad("font.addFolder", format!("{path}: {e}")))?;
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|f| {
+            let ext = f.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+            matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc" | "otc")) && f.is_file()
+        })
+        .collect();
+    files.sort();
+    let (mut faces, mut skipped) = (0, Vec::new());
+    for file in &files {
+        let name = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        match std::fs::read(file) {
+            Ok(bytes) => match designcraft_fonts::FontDb::global().add_font(bytes) {
+                0 => skipped.push(format!("{name}: not a font, or its faces are loaded already")),
+                n => faces += n,
+            },
+            Err(e) => skipped.push(format!("{name}: {e}")),
+        }
+    }
+    Ok(json!({"faces": faces, "files": files.len(), "skipped": skipped}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn add_folder(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(bad("font.addFolder", "not available in the browser"))
 }
 
 /// Every story's text, including table cells and footnotes.
@@ -165,6 +207,30 @@ fn replace(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_folder_loads_its_fonts_for_new_documents() {
+        let dir = std::env::temp_dir().join(format!("dc-font-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ttf"), designcraft_fonts::testing::font_with("DC Test Folder Font", &['a', 'b']).unwrap()).unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a font").unwrap();
+        std::fs::write(dir.join("broken.otf"), "not a font either").unwrap();
+        let mut s = Session::new();
+
+        let r = s.execute("font.addFolder", &json!({"path": dir.to_str().unwrap()})).unwrap();
+        assert_eq!((&r["faces"], &r["files"]), (&json!(1), &json!(2)), "{r}");
+        assert!(r["skipped"][0].as_str().unwrap().starts_with("broken.otf"), "{r}");
+        s.execute("file.new", &json!({})).unwrap();
+        let f = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "ab"})).unwrap();
+        let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(f["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 2})).unwrap();
+        s.execute("type.char", &json!({"fontFamily": "DC Test Folder Font"})).unwrap();
+        let l = s.execute("font.list", &json!({})).unwrap();
+        let entry = l.as_array().unwrap().iter().find(|f| f["family"] == "DC Test Folder Font").unwrap();
+        assert_eq!((&entry["missing"], &entry["source"]), (&json!(false), &json!("added")), "{l}");
+        assert!(s.execute("font.addFolder", &json!({"path": dir.join("nope").to_str().unwrap()})).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn find_and_replace_font() {

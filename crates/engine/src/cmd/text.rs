@@ -31,13 +31,23 @@ pub fn specs() -> Vec<CommandSpec> {
             st.selection.text = Some(TextSel { anchor: a, focus: b, ..t });
             ok()
         }),
-        cmd!(noundo "text.select", "Select Text", [], None, "{story, anchor, focus} (UTF-8 byte offsets into the story text, as find.find reports them: á or — counts 2 or 3)", has_doc, |s, p| {
+        cmd!(noundo "text.select", "Select Text", [], None, "{story, anchor, focus, cell?: {table, row, col}} (UTF-8 byte offsets into the story text, as find.find reports them: á or — counts 2 or 3; with `cell`, into that table cell's text)", has_doc, |s, p| {
             let sid = StoryId(p.get("story").and_then(Value::as_u64).unwrap_or(0));
+            let cell = match p.get("cell") {
+                Some(c) => {
+                    let n = |k: &str| c.get(k).and_then(Value::as_u64).ok_or_else(|| bad("text.select", format!("cell needs {k}")));
+                    Some(CellAddr { table: n("table")?, row: n("row")? as usize, col: n("col")? as usize })
+                }
+                None => None,
+            };
             let st = s.doc_mut()?;
-            let text = &st.doc.story(sid).ok_or_else(|| bad("text.select", "no such story"))?.text;
+            if st.doc.story(sid).is_none() {
+                return Err(bad("text.select", "no such story"));
+            }
+            let text = &st.doc.text_story(sid, cell).ok_or_else(|| bad("text.select", "no such table cell"))?.text;
             let a = floor_char_boundary(text, p.get("anchor").and_then(Value::as_u64).unwrap_or(0) as usize);
             let f = floor_char_boundary(text, p.get("focus").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(a));
-            st.selection = Selection::text(TextSel { story: sid, anchor: a, focus: f, frame: None, cell: None });
+            st.selection = Selection::text(TextSel { story: sid, anchor: a, focus: f, frame: None, cell });
             st.revision += 1;
             ok()
         }),

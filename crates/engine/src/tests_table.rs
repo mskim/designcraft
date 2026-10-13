@@ -126,6 +126,29 @@ fn convert_text_to_table_and_back() {
 }
 
 #[test]
+fn text_select_reaches_into_cells() {
+    let (mut s, sid, _) = session_with_frame();
+    s.execute("story.setText", &json!({"story": sid, "text": "Ink\tCoverage\nPlum\t80 percent\nAfter"})).unwrap();
+    s.execute("text.select", &json!({"story": sid, "anchor": 0, "focus": 27})).unwrap();
+    let tid = s.execute("table.convertFromText", &json!({})).unwrap()["table"].as_u64().unwrap();
+    s.execute("style.character.create", &json!({"name": "strong", "chars": {"fontStyle": "Bold"}})).unwrap();
+    // Bytes 0..2 of cell (1, 1)'s own text: "80".
+    let cell = json!({"table": tid, "row": 1, "col": 1});
+    s.execute("text.select", &json!({"story": sid, "cell": cell, "anchor": 0, "focus": 2})).unwrap();
+    s.execute("style.character.apply", &json!({"name": "strong"})).unwrap();
+    check(&s);
+    let addr = designcraft_doc::CellAddr { table: tid, row: 1, col: 1 };
+    let text = s.doc().unwrap().doc.text_story(designcraft_doc::StoryId(sid), Some(addr)).unwrap().clone();
+    assert_eq!(text.text, "80 percent");
+    assert_eq!(text.chars[0].format.style, "strong");
+    assert_eq!(text.chars[0].len, 2);
+    assert_ne!(text.chars.get(1).map(|c| c.format.style.as_str()), Some("strong"));
+    // A cell that doesn't exist is an error, not a selection in the story.
+    let bad = json!({"story": sid, "cell": {"table": tid, "row": 5, "col": 0}, "anchor": 0, "focus": 1});
+    assert!(s.execute("text.select", &bad).is_err());
+}
+
+#[test]
 fn caret_placement_in_cells_and_cell_formatting() {
     let (mut s, sid, fid) = session_with_frame();
     let r = s.execute("table.insert", &json!({"rows": 2, "cols": 2})).unwrap();

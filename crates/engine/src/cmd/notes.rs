@@ -1,6 +1,9 @@
 //! Type › Insert Footnote, Document Footnote Options, footnote inspection and editing.
 
+use std::collections::HashMap;
+
 use designcraft_doc::{CellAddr, FootnoteOptions, ParaFormat, StoryId, TextSel};
+use designcraft_geom::Rect;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, cmd, has_doc, str_param};
@@ -26,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             options
         ),
-        cmd!(query "footnote.list", "Footnotes", [], None, "{story?} → [{story, id, index, anchor, text}] in story order", has_doc, list),
+        cmd!(query "footnote.list", "Footnotes", [], None, "{story?} → [{story, id, index, anchor, text, pageIndex?, rect?: [x0, y0, x1, y1]}] in story order; pageIndex (0-based) and rect (page coordinates) where the footnote is laid out on a document page", has_doc, list),
         cmd!("footnote.setText", "Set Footnote Text", [], None, "{story, id, text} — replaces the footnote's text", has_doc, set_text),
         cmd!("footnote.delete", "Delete Footnote", [], None, "{story, id} — deletes the reference (and so the footnote)", has_doc, delete),
         cmd!(
@@ -120,11 +123,36 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let only = p.get("story").and_then(Value::as_u64).map(StoryId);
     let mut out = Vec::new();
     for st in d.stories.values().filter(|st| only.is_none_or(|o| o == st.id)) {
+        let laid = if st.notes.is_empty() { HashMap::new() } else { laid_out(s, d, st.id) };
         for (k, n) in st.notes.iter().enumerate() {
-            out.push(json!({"story": st.id.0, "id": n.id, "index": k, "anchor": st.note_anchor(n.id), "text": n.text.text}));
+            let mut v = json!({"story": st.id.0, "id": n.id, "index": k, "anchor": st.note_anchor(n.id), "text": n.text.text});
+            if let Some((page, r)) = laid.get(&n.id) {
+                v["pageIndex"] = json!(page);
+                v["rect"] = json!([r.x0, r.y0, r.x1, r.y1]);
+            }
+            out.push(v);
         }
     }
     Ok(Value::Array(out))
+}
+
+/// Footnote id → (0-based page, area in that page's coordinates) for the footnotes of a story
+/// laid out on document pages.
+fn laid_out(s: &Session, d: &designcraft_doc::Document, sid: StoryId) -> HashMap<u64, (usize, Rect)> {
+    let cs = s.cache.get(d, sid, None);
+    let mut out = HashMap::new();
+    for ft in &cs.frames {
+        let Some(page) = d.page_of_item(ft.frame) else { continue };
+        let (Some((si, pi)), Some(loc), Some(item)) = (d.page_loc(page), d.find(ft.frame), d.item(ft.frame)) else { continue };
+        // Frame inner space → spread (as the PDF writer draws it) → page.
+        let m = d.parent_xf(&loc) * d.text_xf(item);
+        let page_x = d.spreads[si].pages[pi].x;
+        for n in &ft.notes {
+            let r = m.transform_rect_bbox(n.rect);
+            out.insert(n.id, (page, Rect::new(r.x0 - page_x, r.y0, r.x1 - page_x, r.y1)));
+        }
+    }
+    out
 }
 
 fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
@@ -211,6 +239,31 @@ mod tests {
         assert!(s.doc().unwrap().doc.story(sid).unwrap().notes.is_empty());
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(s.doc().unwrap().doc.story(sid).unwrap().notes.len(), 1);
+    }
+
+    /// footnote.list says where each footnote is laid out: the page and its area in page coordinates.
+    #[test]
+    fn list_gives_page_and_area() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true})).unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let (si, pi) = d.page_loc(2).unwrap();
+        let page_x = d.spreads[si].pages[pi].x;
+        let r = s
+            .execute(
+                "frame.create",
+                &json!({"spread": si, "rect": [page_x + 72.0, 72, page_x + 300.0, 400], "content": "text", "text": "Body text."}),
+            )
+            .unwrap();
+        let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 4, "focus": 4})).unwrap();
+        s.execute("footnote.insert", &json!({"text": "A note."})).unwrap();
+        let l = s.execute("footnote.list", &json!({})).unwrap();
+        assert_eq!(l[0]["pageIndex"], 2, "the third page (0-based)");
+        let rect: Vec<f64> = l[0]["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert!(rect[0] >= 72.0 - 0.01 && rect[2] <= 300.0 + 0.01, "x in page coordinates: {rect:?}");
+        assert!((rect[3] - 400.0).abs() < 0.01, "stacked against the frame bottom: {rect:?}");
+        assert!(rect[1] > 300.0 && rect[1] < rect[3], "a few lines tall: {rect:?}");
     }
 
     #[test]

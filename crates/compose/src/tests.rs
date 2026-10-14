@@ -2017,6 +2017,27 @@ fn korean_character_breaks_on_request() {
     assert!(!lines_starting_mid_word(&d, sid, KO_WORDS).is_empty(), "breaks between syllables");
 }
 
+/// Words shorter than korean_break_min_chars move to the next line whole; longer ones still break
+/// between syllables (doc_processor_rb's KoreanLineBreaker splits only words of 4+ characters).
+#[test]
+fn short_korean_words_stay_whole() {
+    for composer in [designcraft_doc::Composer::SingleLine, designcraft_doc::Composer::JParagraph] {
+        let para =
+            |min| ParaAttrs { korean_char_breaks: Some(true), korean_break_min_chars: Some(min), composer: Some(composer), ..Default::default() };
+        let (d, sid) = korean_doc(KO_WORDS, "Korean", para(4));
+        let mid = lines_starting_mid_word(&d, sid, KO_WORDS);
+        // The rest of the word a line starts in ends a word of 4+ characters.
+        let in_long_word = |line: &String| {
+            let rest = line.split(' ').next().unwrap_or("");
+            KO_WORDS.split(' ').any(|word| word.chars().count() >= 4 && word.ends_with(rest) && word != rest)
+        };
+        assert!(!mid.is_empty(), "{composer:?}: long words still break");
+        assert!(mid.iter().all(in_long_word), "{composer:?}: only words of 4+ split: {mid:?}");
+        let (d, sid) = korean_doc(KO_WORDS, "Korean", para(99));
+        assert!(lines_starting_mid_word(&d, sid, KO_WORDS).is_empty(), "{composer:?}: no word is long enough");
+    }
+}
+
 #[test]
 fn korean_by_its_locale_code_breaks_at_spaces() {
     let para = ParaAttrs { composer: Some(designcraft_doc::Composer::SingleLine), ..Default::default() };

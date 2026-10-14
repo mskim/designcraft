@@ -869,6 +869,9 @@ attr_set! {
         /// Korean text breaks between any two syllables (character-based breaking); otherwise
         /// it breaks at spaces, word by word.
         korean_char_breaks: bool = false,
+        /// With `korean_char_breaks`, only words (space to space) of at least this many characters
+        /// break between syllables; shorter ones move whole (0: any word).
+        korean_break_min_chars: u32 = 0,
         // Keeps
         keep_with_next: u32 = 0,
         keep_lines_together: bool = false,

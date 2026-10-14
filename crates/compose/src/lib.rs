@@ -1491,6 +1491,25 @@ fn spacing_for(pp: &ParaProps, base_size: f64) -> Spacing {
     }
 }
 
+/// No break inside a word (space to space) shorter than `min` characters: it moves to the next line
+/// whole, as Korean composers that break between syllables only for longer words set it.
+fn keep_short_korean_words(glyphs: &mut [Glyph], min: usize) {
+    let mut start = 0;
+    while start < glyphs.len() {
+        if glyphs[start].is_space() {
+            start += 1;
+            continue;
+        }
+        let end = glyphs[start..].iter().position(Glyph::is_space).map_or(glyphs.len(), |n| start + n);
+        if end - start < min {
+            for g in &mut glyphs[start..end - 1] {
+                g.break_after = Some(false);
+            }
+        }
+        start = end;
+    }
+}
+
 /// Desired word spacing, letter spacing and glyph scaling apply to every line (any alignment).
 fn apply_desired_spacing(glyphs: &mut [Glyph], pp: &ParaProps) {
     for i in 0..glyphs.len() {
@@ -1522,6 +1541,9 @@ fn apply_desired_spacing(glyphs: &mut [Glyph], pp: &ParaProps) {
                 }
             }
         }
+    }
+    if pp.korean_char_breaks && pp.korean_break_min_chars > 1 {
+        keep_short_korean_words(glyphs, pp.korean_break_min_chars as usize);
     }
     let ws = pp.word_space_desired;
     let ls = pp.letter_space_desired;

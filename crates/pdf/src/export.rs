@@ -35,6 +35,8 @@ pub(crate) struct Sheet {
     pub media: Rect,
     /// Page name(s) for the page-information mark.
     pub label: String,
+    /// x of each edge where two of the sheet's pages meet (a spread sheet's folds).
+    pub folds: Vec<f64>,
 }
 
 pub(crate) const MARK_LEN: f64 = 18.0;
@@ -67,7 +69,7 @@ fn sheets(doc: &Document, opts: &PdfOptions) -> Result<Vec<Sheet>> {
     for abs in pages {
         let (si, pi) = doc.page_loc(abs).ok_or(PdfError::BadPage(abs + 1))?;
         let sp: &Spread = &doc.spreads[si];
-        let (trim, l, r, label) = if opts.spreads {
+        let (trim, l, r, label, folds) = if opts.spreads {
             if seen_spreads.contains(&si) {
                 continue;
             }
@@ -76,11 +78,11 @@ fn sheets(doc: &Document, opts: &PdfOptions) -> Result<Vec<Sheet>> {
             let (l, _) = sp.pages.first().map(|p| bleed_lr(p.side, b)).unwrap_or((b[2], b[3]));
             let (_, r) = sp.pages.last().map(|p| bleed_lr(p.side, b)).unwrap_or((b[2], b[3]));
             let names: Vec<String> = (0..sp.pages.len()).map(|i| doc.page_name(first + i)).collect();
-            (sp.bounds(), l, r, names.join("–"))
+            (sp.bounds(), l, r, names.join("–"), sp.pages.iter().skip(1).map(|p| p.bounds().x0).collect())
         } else {
             let p = &sp.pages[pi];
             let (l, r) = bleed_lr(p.side, b);
-            (p.bounds(), l, r, doc.page_name(abs))
+            (p.bounds(), l, r, doc.page_name(abs), Vec::new())
         };
         let bleed = Rect::new(trim.x0 - l, trim.y0 - b[0], trim.x1 + r, trim.y1 + b[1]);
         let media = if opts.marks.any() {
@@ -89,7 +91,7 @@ fn sheets(doc: &Document, opts: &PdfOptions) -> Result<Vec<Sheet>> {
         } else {
             bleed
         };
-        out.push(Sheet { spread: si, trim, bleed, media, label });
+        out.push(Sheet { spread: si, trim, bleed, media, label, folds });
     }
     Ok(out)
 }

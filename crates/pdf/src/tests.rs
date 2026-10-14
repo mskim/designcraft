@@ -145,6 +145,33 @@ fn boxes_bleed_and_marks() {
 }
 
 #[test]
+fn cover_spread_marks_folds_registration_and_colour_bars() {
+    // A cover as one spread: back, spine, front pages side by side.
+    let mut d = Document::new(&NewDocument { pages: 3, facing_pages: false, ..NewDocument::default() });
+    d.page_to_spread(1, 0).unwrap();
+    d.page_to_spread(2, 0).unwrap();
+    assert_eq!(d.spreads[0].pages.len(), 3);
+    d.settings.bleed = [9.0; 4];
+    let only = |m: Marks| uncompressed(&d, PdfOptions { spreads: true, bleed: true, marks: m, ..Default::default() });
+
+    let folds = only(Marks { folds: true, ..Marks::NONE });
+    // Dashed, at x 612 and 1224 (where the pages meet), above and below the trim.
+    assert!(folds.contains("[3 2]0 d 612 -9 m 612 -27 l 612 801 m 612 819 l 1224 -9 m"), "{folds}");
+    assert!(!only(Marks { crop: true, ..Marks::NONE }).contains("[3 2]0 d"), "no folds unless asked");
+
+    let bars = only(Marks { color_bars: true, ..Marks::NONE });
+    for patch in ["1 0 0 0 k", "0 1 0 0 k", "0 0 1 0 k", "0 0 0 1 k", "1 1 1 0 k", "0 0 0 0.2 k", "0 0 0 0.6 k"] {
+        assert!(bars.contains(patch), "colour bar {patch}");
+    }
+    let targets = only(Marks { registration: true, ..Marks::NONE });
+    assert!(targets.contains("/All") && targets.contains(" c "), "circles in [Registration]: {targets}");
+
+    // A single page has no folds; its sheet is the same size with every mark on.
+    let page = uncompressed(&d, PdfOptions { bleed: true, marks: Marks::ALL, pages: Some(vec![0]), ..Default::default() });
+    assert!(!page.contains("[3 2]0 d"));
+}
+
+#[test]
 fn spreads_and_ranges() {
     let mut d = Document::new(&NewDocument { pages: 4, facing_pages: true, ..NewDocument::default() });
     let _ = &mut d;

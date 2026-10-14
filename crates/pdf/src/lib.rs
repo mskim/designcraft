@@ -73,6 +73,14 @@ pub struct Marks {
     pub bleed: bool,
     /// Document title, page name, date — in the slug area under the page.
     pub page_info: bool,
+    /// Registration targets centred beside each edge of the sheet's trim.
+    pub registration: bool,
+    /// Colour bars above the trim: solid C, M, Y, K and their overprints on the left, a black tint
+    /// ramp (10–100 %) on the right.
+    pub color_bars: bool,
+    /// Fold marks (dashed) above and below each edge where two pages of a spread meet: the spine
+    /// and flap folds of a cover laid out as one spread.
+    pub folds: bool,
     /// Line weight in points (0.25 default).
     pub weight: f64,
     /// Distance of the marks from the trim edge in points (6 default). Marks never start inside
@@ -81,10 +89,12 @@ pub struct Marks {
 }
 
 impl Marks {
-    pub const NONE: Marks = Marks { crop: false, bleed: false, page_info: false, weight: 0.25, offset: 6.0 };
-    pub const ALL: Marks = Marks { crop: true, bleed: true, page_info: true, weight: 0.25, offset: 6.0 };
+    pub const NONE: Marks =
+        Marks { crop: false, bleed: false, page_info: false, registration: false, color_bars: false, folds: false, weight: 0.25, offset: 6.0 };
+    pub const ALL: Marks =
+        Marks { crop: true, bleed: true, page_info: true, registration: true, color_bars: true, folds: true, weight: 0.25, offset: 6.0 };
     pub fn any(&self) -> bool {
-        self.crop || self.bleed || self.page_info
+        self.crop || self.bleed || self.page_info || self.registration || self.color_bars || self.folds
     }
 }
 

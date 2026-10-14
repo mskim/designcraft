@@ -144,6 +144,15 @@ pub fn specs() -> Vec<CommandSpec> {
             v["lines"] = json!(cs.line_count());
             Ok(v)
         }),
+        cmd!(
+            query "story.lines",
+            "Story Lines",
+            [],
+            None,
+            "{story? | frame?} → [{range: [start, end] (bytes, without the paragraph separator), para, pageIndex (0-based), rect: [x0, y0, x1, y1] (page coordinates: the line's slot, ascent to descent), baseline, leading}] for the composed lines in order; overset lines are left out",
+            has_doc,
+            story_lines
+        ),
         cmd!("type.fillWithPlaceholder", "Fill with Placeholder Text", ["Type"], None, "{frame?}", has_text_or_frames, fill_placeholder),
         cmd!(
             "type.char",
@@ -279,6 +288,36 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(query "type.selectionAttrs", "Selection Attributes", [], None, "{} → resolved character/paragraph attributes at the text selection", has_doc, selection_attrs),
     ]
+}
+
+/// Where each composed line of a story is: its page and its slot in page coordinates (as the PDF
+/// writer draws it: frame inner space → spread → page).
+fn story_lines(s: &mut Session, p: &Value) -> Result<Value> {
+    let sid = story_of(s, p).ok_or_else(|| bad("story.lines", "no story"))?;
+    let st = s.doc()?;
+    let d = &st.doc;
+    d.story(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
+    let cs = s.cache.get(d, sid, None);
+    let mut out = Vec::new();
+    for ft in &cs.frames {
+        let Some(page) = d.page_of_item(ft.frame) else { continue };
+        let (Some((si, pi)), Some(loc), Some(item)) = (d.page_loc(page), d.find(ft.frame), d.item(ft.frame)) else { continue };
+        let m = d.parent_xf(&loc) * d.text_xf(item);
+        let page_x = d.spreads[si].pages[pi].x;
+        for l in &ft.lines {
+            let r = m.transform_rect_bbox(designcraft_geom::Rect::new(l.x0, l.baseline - l.ascent, l.x1, l.baseline + l.descent));
+            let baseline = m.transform_rect_bbox(designcraft_geom::Rect::new(l.x0, l.baseline, l.x1, l.baseline)).y0;
+            out.push(json!({
+                "range": [l.range.start, l.range.end],
+                "para": l.para,
+                "pageIndex": page,
+                "rect": [r.x0 - page_x, r.y0, r.x1 - page_x, r.y1],
+                "baseline": baseline,
+                "leading": l.leading,
+            }));
+        }
+    }
+    Ok(Value::Array(out))
 }
 
 pub(crate) fn story_of(s: &Session, p: &Value) -> Option<StoryId> {
@@ -1932,5 +1971,37 @@ mod story_query_contract_tests {
         assert_eq!(s.execute("story.get", &json!({"frame":f["id"]})).unwrap()["text"], "");
         s.execute("text.select", &json!({"story":f["story"],"anchor":0})).unwrap();
         assert_eq!(s.execute("story.get", &json!({})).unwrap()["text"], "");
+    }
+}
+
+#[cfg(test)]
+mod story_lines_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn lines_give_their_page_and_place() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2})).unwrap();
+        // Two threaded frames, one per page, too small for the text: lines on both pages.
+        let a = s.execute("frame.create", &json!({"spread": 0, "rect": [72, 72, 300, 120], "content": "text", "text": "one two three four five six seven eight nine ten ".repeat(8)})).unwrap();
+        let b = s.execute("frame.create", &json!({"spread": 1, "rect": [72, 72, 300, 400], "content": "text"})).unwrap();
+        s.execute("frame.thread", &json!({"from": a["id"], "to": b["id"]})).unwrap();
+        let lines = s.execute("story.lines", &json!({"story": a["story"]})).unwrap();
+        let lines = lines.as_array().unwrap();
+
+        assert!(lines.len() > 4, "{lines:?}");
+        let pages: Vec<u64> = lines.iter().map(|l| l["pageIndex"].as_u64().unwrap()).collect();
+        assert_eq!(pages.first(), Some(&0));
+        assert_eq!(pages.last(), Some(&1), "the text continues on page 2");
+        for l in lines {
+            let r: Vec<f64> = l["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            assert!(r[0] >= 71.9 && r[2] <= 300.1 && r[1] < r[3], "inside its frame, in page coordinates: {l}");
+            assert!(l["baseline"].as_f64().unwrap() > r[1] && l["baseline"].as_f64().unwrap() <= r[3], "{l}");
+        }
+        let ranges: Vec<(u64, u64)> = lines.iter().map(|l| (l["range"][0].as_u64().unwrap(), l["range"][1].as_u64().unwrap())).collect();
+        assert!(ranges.windows(2).all(|w| w[0].1 <= w[1].0), "in story order: {ranges:?}");
+        assert!(s.execute("story.lines", &json!({"story": 9999})).is_err());
     }
 }

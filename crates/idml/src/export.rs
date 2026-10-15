@@ -2595,8 +2595,11 @@ pub(crate) fn corner_names(path: &PathData) -> [&'static str; 4] {
     out
 }
 
+/// A variable's `Self`, as InDesign writes it: a colon (in "Running Head: h2") becomes a hyphen.
+/// InDesign can't resolve an instance whose `AssociatedTextVariable` holds a colon (it shows
+/// `<?>`); the variable keeps its name.
 fn text_variable_self(name: &str) -> String {
-    format!("dTextVariablen{name}")
+    format!("dTextVariablen{}", name.replace(':', "-"))
 }
 
 /// `<TextVariable>` with its type's preference, as InDesign writes them.

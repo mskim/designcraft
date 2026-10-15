@@ -1566,6 +1566,29 @@ fn text_variables_round_trip() {
     assert_eq!(story.text, format!("판: {} 끝 {}", var_char(v).unwrap(), var_char(l).unwrap()));
 }
 
+// InDesign can't resolve an instance whose AssociatedTextVariable holds a colon (it prints "<?>"),
+// and every running head is named "Running Head: <style>"; its Self has a hyphen, as InDesign writes.
+#[test]
+fn a_variable_named_with_a_colon_gets_a_self_indesign_resolves() {
+    use designcraft_doc::vars::{TextVariable, Use, VarKind, var_char};
+    let mut d = Document::new(&NewDocument::default());
+    let kind = VarKind::RunningHeader { style: "h2".into(), use_: Use::FirstOnPage, character: false };
+    d.text_variables.push(TextVariable { name: "Running Head: h2".into(), kind, before: String::new(), after: String::new() });
+    let head = d.text_variables.len() - 1;
+    let lid = d.default_layer();
+    let text = format!("쪽 {}", var_char(head).unwrap());
+    d.add_text_frame(SpreadRef::Doc(0), Rect::new(40.0, 40.0, 300.0, 200.0), lid, &text, ParaFormat::default()).unwrap();
+    let bytes = export_idml(&d);
+    let xml = idml_xml(&bytes);
+    assert!(xml.contains(r#"<TextVariable Self="dTextVariablenRunning Head- h2" Name="Running Head: h2" VariableType="MatchParagraphStyleType">"#), "definition");
+    assert!(xml.contains(r#"AssociatedTextVariable="dTextVariablenRunning Head- h2""#), "instance");
+    assert!(!xml.contains(r#"Self="dTextVariablenRunning Head: h2""#), "no colon in a Self");
+    let back = import_idml(&bytes).unwrap();
+    let v = back.text_variables.iter().position(|v| v.name == "Running Head: h2").expect("the name round-trips");
+    let story = back.stories.values().find(|s| s.text.starts_with("쪽 ")).unwrap();
+    assert_eq!(story.text, format!("쪽 {}", var_char(v).unwrap()));
+}
+
 #[test]
 fn pages_of_one_linked_pdf_stay_apart() {
     // Two frames placing pages 1 and 3 (0-based 0 and 2) of the same linked (not embedded) PDF.

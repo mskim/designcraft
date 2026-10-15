@@ -92,6 +92,20 @@ fn text_is_real_text() {
 }
 
 #[test]
+fn to_unicode_cmaps_name_themselves_in_their_dictionary() {
+    // A CMap stream's dictionary needs /CMapName and /CIDSystemInfo (PDF 32000-1 9.7.5.3): HexaPDF
+    // refuses to write a file without them (vendor/krilla/PATCHES.md).
+    let d = doc_with_text("Hello DesignCraft — 한글");
+    let s = uncompressed(&d, PdfOptions::default());
+    let s = uncompressed(&d, PdfOptions::default());
+    let dicts: Vec<&str> = s.match_indices("/Type/CMap").map(|(i, _)| &s[i..i + s[i..].find("stream").unwrap()]).collect();
+    assert!(!dicts.is_empty(), "a ToUnicode CMap");
+    for dict in dicts {
+        assert!(dict.contains("/CMapName") && dict.contains("/CIDSystemInfo"), "{dict}");
+    }
+}
+
+#[test]
 fn colours_keep_their_space() {
     let mut d = doc_with_text("x");
     add_box(&mut d, Rect::new(36.0, 400.0, 136.0, 500.0), "C=100 M=0 Y=0 K=0");

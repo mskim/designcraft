@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
+# vendor/: patched copies of dependencies, used through [patch.crates-io], not workspace members.
+exclude = ["vendor"]
 default-members = ["crates/*", "apps/designcraft", "apps/designcraft-cli", "xtask"]
 
 [workspace.package]
@@ -97,3 +99,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# krilla 0.8.2 with the ToUnicode CMap streams' required /CMapName and /CIDSystemInfo written
+# (vendor/krilla/PATCHES.md). Drop this and vendor/krilla once a krilla release writes them.
+[patch.crates-io]
+krilla = { path = "vendor/krilla" }

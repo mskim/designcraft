@@ -223,6 +223,77 @@ fn wrap_around_a_second_anchored_object_follows_where_the_first_moved_its_anchor
     }
 }
 
+/// A figure (80 × 60, wrap 8 left and 6 below) anchored at the start of `paragraph`, as
+/// story_with_anchored_figure places it.
+fn anchor_figure(d: &mut Document, sid: StoryId, at: usize) {
+    let lid = d.default_layer();
+    let mut it = designcraft_doc::Item::new(
+        ItemId(d.alloc()),
+        lid,
+        designcraft_doc::Shape::Rectangle,
+        designcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 80.0, 60.0)),
+    );
+    it.wrap.mode = WrapMode::BoundingBox;
+    it.wrap.offsets = [0.0, 8.0, 6.0, 0.0];
+    let position = designcraft_doc::AnchorPosition::Custom {
+        x_relative: designcraft_doc::anchored::AnchorRelative::ColumnEdge,
+        y_relative: designcraft_doc::anchored::AnchorRelative::Anchor,
+        x_offset: 0.0,
+        y_offset: 0.0,
+        object_point: 2,
+        ref_point: 2,
+        keep_within_column: false,
+    };
+    d.story_mut(sid).unwrap().insert_object(at, designcraft_doc::AnchoredObject::new(it, position));
+}
+
+/// No line after a figure's anchor line, in its column and beside it, runs under it.
+fn assert_wrapped(cs: &ComposedStory, case: &str) {
+    for ft in &cs.frames {
+        for o in &ft.objects {
+            let anchor = &ft.lines[o.line];
+            let (top, bottom, left) = (o.origin.y, o.origin.y + 66.0, o.origin.x - 8.0);
+            for l in ft.lines[o.line + 1..].iter().filter(|l| l.column == anchor.column) {
+                let beside = l.baseline - l.ascent < bottom && l.baseline + l.descent > top;
+                assert!(!beside || l.x1 <= left + 1e-6, "{case}: figure {}: a line runs under it ({} > {left})", o.index, l.x1);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_kept_paragraph_moved_by_its_wrap_is_wrapped_where_it_lands() {
+    // A paragraph kept together, its figure anchored in it, near a column's foot: unwrapped it
+    // fits, wrapped it doesn't and moves to the next column. The passes must not settle on the
+    // layout of one pass with the exclusions of another (text running under the figure).
+    for before in 8..24 {
+        let short: Vec<String> = (0..before).map(|i| format!("Line {i}")).collect();
+        let text = format!("{}\nStem {LOREM}\nAfter", short.join("\n"));
+        let para = ParaAttrs { keep_lines_together: Some(true), ..Default::default() };
+        let (mut d, sid, fid) = doc_with(&text, Rect::new(0.0, 0.0, 400.0, 330.0), para);
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 2;
+        anchor_figure(&mut d, sid, text.find("Stem").unwrap());
+        assert_wrapped(&compose_story(&d, sid, &ComposeOptions::default()), &format!("{before} lines before"));
+    }
+}
+
+#[test]
+fn a_cascade_of_wraps_settles() {
+    // Each figure's wrap lengthens its paragraph and moves the next figure's anchor: one pass per
+    // figure, more than the fixed minimum.
+    for lead in 0..6 {
+        let stems: Vec<String> = (0..8).map(|i| format!("Stem{i} {}", &LOREM[..120 + 20 * ((i + lead) % 4)])).collect();
+        let text = format!("{}\n{}", (0..lead).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n"), stems.join("\n"));
+        let para = ParaAttrs { keep_lines_together: Some(true), ..Default::default() };
+        let (mut d, sid, fid) = doc_with(&text, Rect::new(0.0, 0.0, 400.0, 600.0), para);
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 2;
+        for i in (0..8).rev() {
+            anchor_figure(&mut d, sid, text.find(&format!("Stem{i} ")).unwrap());
+        }
+        assert_wrapped(&compose_story(&d, sid, &ComposeOptions::default()), &format!("{lead} lines first"));
+    }
+}
+
 #[test]
 fn an_inline_object_sets_auto_leading_as_indesign_does() {
     // InDesign 2026, measured on five formulas at 8.5, 10 and 12 pt: a line holding an inline

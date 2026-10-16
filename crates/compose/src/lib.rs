@@ -23,7 +23,7 @@ pub mod vars;
 mod warichu;
 pub mod xref;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -463,45 +463,84 @@ pub fn compose(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Compo
     compose_with_db(doc, story, frames, opts, FontDb::global())
 }
 
-/// Passes a story with wrapping anchored objects gets at most (it usually settles in two).
+/// Passes a story with wrapping anchored objects gets: at least this many, and two per such object
+/// up to the most. A pass settles at least the first object that moved, and a cascade (each wrap
+/// moving the next object's anchor) takes about one pass per object.
 const ANCHORED_WRAP_PASSES: usize = 4;
+const ANCHORED_WRAP_PASSES_MAX: usize = 64;
+
+/// Where a wrapping anchored object was: its frame, and its exclusion there.
+type Placed = (usize, Exclusion);
 
 /// Text wraps around custom anchored objects that have text wrap. Where such an object goes
 /// depends on where its anchor's line falls, and the lines after it depend on the object, so the
-/// story is composed again with each object's last place as an exclusion until nothing moves.
-/// Stories without one compose once.
+/// story is composed again with each object's last place as an exclusion until every object is
+/// where the layout was composed with it. Stories without one compose once.
+///
+/// A wrap can move its own anchor: a paragraph kept together that fits at a column's foot unwrapped
+/// but not wrapped goes to the next column, where, unwrapped, it would fit back. An object found
+/// back in a place it has been keeps the exclusions it was last composed with as well: its
+/// paragraph is wrapped wherever it lands, and the stale exclusion covers only the room it left.
 fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &ComposeOptions, db: &FontDb) -> ComposedStory {
     let mut out = compose_pass(doc, story, frames, opts, db);
-    if !story.objects.iter().any(|o| wraps_text(o)) {
+    let wrapping = story.objects.iter().filter(|o| wraps_text(o)).count();
+    if wrapping == 0 {
         return out;
     }
-    let mut last: Vec<Vec<Exclusion>> = vec![Vec::new(); frames.len()];
-    for _ in 0..ANCHORED_WRAP_PASSES {
-        let found = anchored_exclusions(story, &out, frames.len());
-        if same_exclusions(&found, &last) {
+    // By the object's index in the story: what the last pass was composed with, and where it has been.
+    let mut applied: BTreeMap<usize, Vec<Placed>> = BTreeMap::new();
+    let mut seen: BTreeMap<usize, Vec<Placed>> = BTreeMap::new();
+    for _ in 0..(2 * wrapping).clamp(ANCHORED_WRAP_PASSES, ANCHORED_WRAP_PASSES_MAX) {
+        let found = anchored_exclusions(story, &out);
+        if found.iter().all(|(k, p)| applied.get(k).is_some_and(|a| a.iter().any(|q| same_place(p, q)))) {
             break;
+        }
+        let mut next: BTreeMap<usize, Vec<Placed>> = BTreeMap::new();
+        for (k, p) in found {
+            let back = seen.get(&k).is_some_and(|s| s.iter().any(|q| same_place(&p, q)));
+            let mut places = if back { applied.remove(&k).unwrap_or_default() } else { Vec::new() };
+            if !places.iter().any(|q| same_place(&p, q)) {
+                places.push(p.clone());
+            }
+            seen.entry(k).or_default().push(p);
+            next.insert(k, places);
+        }
+        let mut per_frame: Vec<Vec<Exclusion>> = vec![Vec::new(); frames.len()];
+        for (fi, ex) in next.values().flatten() {
+            if let Some(list) = per_frame.get_mut(*fi) {
+                list.push(ex.clone());
+            }
         }
         let specs: Vec<FrameSpec> = frames
             .iter()
-            .zip(&found)
+            .zip(&per_frame)
             .map(|(f, ex)| FrameSpec { exclusions: f.exclusions.iter().chain(ex).cloned().collect(), ..f.clone() })
             .collect();
         out = compose_pass(doc, story, &specs, opts, db);
-        last = found;
+        applied = next;
     }
     out
+}
+
+fn same_place((fa, a): &Placed, (fb, b): &Placed) -> bool {
+    const EPS: f64 = 0.01;
+    fa == fb
+        && a.mode == b.mode
+        && [(a.rect.x0, b.rect.x0), (a.rect.y0, b.rect.y0), (a.rect.x1, b.rect.x1), (a.rect.y1, b.rect.y1)]
+            .iter()
+            .all(|(p, q)| (p - q).abs() < EPS)
 }
 
 fn wraps_text(o: &designcraft_doc::AnchoredObject) -> bool {
     matches!(o.position, designcraft_doc::AnchorPosition::Custom { .. }) && o.item.wrap.mode != WrapMode::None && !o.item.hidden
 }
 
-/// Each frame's wrapping anchored objects, as exclusions (with their wrap offsets) that start
-/// below the anchor's line: as in InDesign, the wrap pushes aside the lines after the anchor's
-/// line, not that line itself nor anything above it.
-fn anchored_exclusions(story: &Story, out: &ComposedStory, frames: usize) -> Vec<Vec<Exclusion>> {
-    let mut found = vec![Vec::new(); frames];
-    for (ft, ex) in out.frames.iter().zip(found.iter_mut()) {
+/// Each wrapping anchored object (by its index in the story) and its exclusion (with its wrap
+/// offsets), which starts below the anchor's line: as in InDesign, the wrap pushes aside the lines
+/// after the anchor's line, not that line itself nor anything above it.
+fn anchored_exclusions(story: &Story, out: &ComposedStory) -> Vec<(usize, Placed)> {
+    let mut found = Vec::new();
+    for (fi, ft) in out.frames.iter().enumerate() {
         for o in &ft.objects {
             let (Some(obj), Some(line)) = (story.objects.get(o.index), ft.lines.get(o.line)) else { continue };
             if !wraps_text(obj) {
@@ -512,22 +551,11 @@ fn anchored_exclusions(story: &Story, out: &ComposedStory, frames: usize) -> Vec
             let below_anchor = line.baseline + line.descent;
             let rect = Rect::new(o.origin.x - left, (o.origin.y - top).max(below_anchor), o.origin.x + w + right, o.origin.y + h + bottom);
             if rect.y1 > rect.y0 {
-                ex.push(Exclusion { rect, mode: obj.item.wrap.mode });
+                found.push((o.index, (fi, Exclusion { rect, mode: obj.item.wrap.mode })));
             }
         }
     }
     found
-}
-
-fn same_exclusions(a: &[Vec<Exclusion>], b: &[Vec<Exclusion>]) -> bool {
-    const EPS: f64 = 0.01;
-    let near = |x: &Exclusion, y: &Exclusion| {
-        x.mode == y.mode
-            && [(x.rect.x0, y.rect.x0), (x.rect.y0, y.rect.y0), (x.rect.x1, y.rect.x1), (x.rect.y1, y.rect.y1)]
-                .iter()
-                .all(|(p, q)| (p - q).abs() < EPS)
-    };
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| near(p, q)))
 }
 
 fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &ComposeOptions, db: &FontDb) -> ComposedStory {

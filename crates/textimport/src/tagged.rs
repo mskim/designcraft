@@ -99,6 +99,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
     let chars: Vec<char> = text.chars().collect();
     // Paragraphs: (style, runs of (text, format)).
     let mut paras: Vec<(String, Vec<(String, CharFormat)>)> = vec![(String::new(), Vec::new())];
+    let mut started = false;
     let mut fmt = CharFormat::default();
     let mut para_styles: Vec<String> = Vec::new();
     let mut char_styles: Vec<String> = Vec::new();
@@ -151,6 +152,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
                         }
                     }
                     "ParaStyle" => {
+                        started = true;
                         let v = value.trim().to_string();
                         if !v.is_empty() && !para_styles.contains(&v) {
                             para_styles.push(v.clone());
@@ -187,7 +189,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
                 }
                 let style = paras.last().map(|p| p.0.clone()).unwrap_or_default();
                 // Header lines before any text don't start paragraphs.
-                if paras.len() == 1 && paras[0].1.is_empty() {
+                if !started && paras.len() == 1 && paras.first().is_some_and(|p| p.1.is_empty()) {
                     i += 1;
                     continue;
                 }
@@ -241,6 +243,18 @@ mod tests {
         assert_eq!(back.story.text, i.story.text);
         // Half a pair is not a character: it is still left out.
         assert_eq!(import("<ASCII-WIN>\r\n<ParaStyle:Body>A<0xD83D>B<0xDE00>C".as_bytes()).unwrap().story.text, "ABC");
+    }
+
+    #[test]
+    fn tagged_text_keeps_a_leading_empty_paragraph() {
+        let doc = Document::new(&designcraft_doc::build::NewDocument::default());
+        let mut story = Story::new(StoryId(0));
+        story.insert(0, "\nText");
+        story.paras[0].style = "Head".into();
+        story.paras[1].style = "Body".into();
+        let back = import(tagged_text(&doc, &story).as_bytes()).unwrap();
+        assert_eq!(back.story.text, story.text);
+        assert_eq!(back.story.paras, story.paras);
     }
 
     #[test]

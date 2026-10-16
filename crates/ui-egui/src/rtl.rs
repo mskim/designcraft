@@ -76,6 +76,14 @@ pub fn plain(ctx: &egui::Context, text: &str, font: FontId, color: Color32) -> A
     layout(ctx, LayoutJob::simple_singleline(text.to_owned(), font, color))
 }
 
+/// One line no wider than `max_width`: longer text ends in an ellipsis, cut at a grapheme
+/// boundary in logical order (`Galley::elided` tells whether it was cut).
+pub fn truncated(ctx: &egui::Context, text: &str, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = TextWrapping::truncate_at_width(max_width.max(0.0));
+    layout(ctx, job)
+}
+
 pub fn paint(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, font: FontId, color: Color32) {
     let galley = plain(p.ctx(), text, font, color);
     let rect = anchor.anchor_rect(Rect::from_min_size(pos, galley.size()));

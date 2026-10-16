@@ -6,7 +6,7 @@ exclude = ["vendor"]
 default-members = ["crates/*", "apps/designcraft", "apps/designcraft-cli", "xtask"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -102,5 +102,12 @@ debug = 0
 
 # krilla 0.8.2 with the ToUnicode CMap streams' required /CMapName and /CIDSystemInfo written
 # (vendor/krilla/PATCHES.md). Drop this and vendor/krilla once a krilla release writes them.
+# Opt-in cancelable macOS termination on the pinned winit 0.30 line.
 [patch.crates-io]
 krilla = { path = "vendor/krilla" }
+winit = { git = "https://github.com/skylartaylor/winit.git", rev = "3d51077fd1a966f84df9ef287839dc84fd5b4ca7" }
+# The hayro crates from pdfcraft's vendor/ directory, with the patches its README lists.
+hayro = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }
+hayro-interpret = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }
+hayro-syntax = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }
+hayro-jbig2 = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }

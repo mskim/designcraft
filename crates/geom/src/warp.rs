@@ -47,6 +47,22 @@ impl PathWarp {
         None
     }
 
+    /// The arc length (as `at` measures it, so flipped paths count from their end) of the point
+    /// of the path nearest `p`.
+    pub fn nearest(&self, p: Point) -> f64 {
+        use kurbo::ParamCurveNearest;
+        let mut best = (f64::INFINITY, 0.0);
+        let mut before = 0.0;
+        for (seg, len) in &self.segs {
+            let n = seg.nearest(p, 1e-6);
+            if n.distance_sq < best.0 {
+                best = (n.distance_sq, before + seg.subsegment(0.0..n.t).arclen(1e-4));
+            }
+            before += len;
+        }
+        if self.flip { self.total - best.1 } else { best.1 }
+    }
+
     /// Transform for something laid out on a straight line (x along the line, y down from the
     /// line) whose horizontal centre is `mid`: it lands centred at arc length `mid`, turned with
     /// the path, its line at `baseline` on the path.
@@ -76,5 +92,10 @@ mod tests {
         assert!((g * Point::new(50.0, 10.0) - Point::new(50.0, 0.0)).hypot() < 1e-9);
         let flipped = PathWarp::new(&bp, true);
         assert!((flipped.at(0.0).unwrap().0 - Point::new(100.0, 100.0)).hypot() < 1e-9);
+        // The nearest point by arc length, off the path and on it; flipped counts from the end.
+        assert!((w.nearest(Point::new(120.0, 50.0)) - 150.0).abs() < 1e-6);
+        assert!((w.nearest(Point::new(120.0, 150.0)) - 200.0).abs() < 1e-6, "past the end: the end");
+        assert!((w.nearest(Point::new(30.0, -8.0)) - 30.0).abs() < 1e-6);
+        assert!((flipped.nearest(Point::new(30.0, -8.0)) - 170.0).abs() < 1e-6);
     }
 }

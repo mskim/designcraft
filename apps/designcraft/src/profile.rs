@@ -22,7 +22,19 @@ fn config_dir_with(os: &str, env: impl Fn(&str) -> Option<OsString>) -> Option<P
 }
 
 pub fn recovery_dir() -> Option<PathBuf> {
-    recovery_dir_with(std::env::var_os("DESIGNCRAFT_CONFIG_DIR"), designcraft_engine::recovery::default_dir)
+    recovery_dir_with(std::env::var_os("DESIGNCRAFT_CONFIG_DIR"), designcraft_engine::recovery::default_dir).and_then(own_run)
+}
+
+/// This run's folder in the recovery folder `root`. A second running DesignCraft has its own, so
+/// neither writes over the other's documents nor takes them for a crash's.
+fn own_run(root: PathBuf) -> Option<PathBuf> {
+    match designcraft_engine::recovery::run_dir(&root) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            log::warn!("recovery is unavailable because this run cannot be isolated: {e}");
+            None
+        }
+    }
 }
 
 fn recovery_dir_with(root: Option<OsString>, default: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
@@ -67,5 +79,30 @@ mod tests {
         assert_eq!(config_dir_with("linux", environment), Some("/xdg-config/designcraft".into()));
         assert_eq!(config_dir_with("linux", |key| if key == "HOME" { environment(key) } else { None }), Some("/user/.config/designcraft".into()));
         assert_eq!(recovery_dir_with(None, || Some("/existing/recovery".into())), Some("/existing/recovery".into()));
+    }
+
+    #[test]
+    fn a_run_has_its_own_recovery_folder_when_one_can_be_made() {
+        let dir = std::env::temp_dir().join(format!("designcraft-profile-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("Recovery");
+        assert_eq!(own_run(root.clone()).as_deref().and_then(|dir| dir.parent()), Some(root.as_path()));
+        // Failure must not fall back to the shared root.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "a file where the folder should be").unwrap();
+        assert_eq!(own_run(blocked.join("Recovery")), None, "isolation failure must not select the shared root");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exhausted_run_namespace_never_falls_back_to_shared_recovery() {
+        let root = std::env::temp_dir().join(format!("designcraft-profile-exhausted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for n in 0..64 {
+            std::fs::create_dir(root.join(format!("run-{}-{n}", std::process::id()))).unwrap();
+        }
+        assert_eq!(own_run(root.clone()), None, "a shared root would restore inter-process UID collisions");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

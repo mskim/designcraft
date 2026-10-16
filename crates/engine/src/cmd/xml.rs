@@ -305,7 +305,7 @@ pub fn specs() -> Vec<CommandSpec> {
             match str_param(p, "path") {
                 Some(path) => {
                     #[cfg(not(target_arch = "wasm32"))]
-                    std::fs::write(path, text.as_bytes()).map_err(|e| crate::EngineError::Other(format!("{path}: {e}")))?;
+                    crate::atomic::write_file(path, text.as_bytes())?;
                     Ok(json!({"path": path, "bytes": text.len()}))
                 }
                 None => Ok(json!({"text": text, "bytes": text.len()})),

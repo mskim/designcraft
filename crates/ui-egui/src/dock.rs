@@ -90,7 +90,19 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                     x += w;
                 }
                 let menu_r = egui::Rect::from_min_size(egui::pos2(strip.max.x - 24.0, strip.min.y + 4.0), vec2(18.0, 18.0));
+                let menu = ui.interact(menu_r, ui.id().with("dock-menu"), Sense::click());
+                if menu.hovered() {
+                    ui.painter().rect_filled(menu_r, 3.0, t.hover);
+                }
                 icons::paint(ui.painter(), menu_r, "menu", t.icon);
+                let tab = app.ui.dock_tab.clone();
+                egui::Popup::menu(&menu).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    if tab == "pages" {
+                        panels::pages::panel_menu(app, ui);
+                        ui.separator();
+                    }
+                    crate::panel_docking::panel_menu(app, ui, &tab);
+                });
                 egui::Frame::NONE.inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 6 }).show(ui, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match app.ui.dock_tab.as_str() {
                         "pages" => panels::pages::show(app, ui),

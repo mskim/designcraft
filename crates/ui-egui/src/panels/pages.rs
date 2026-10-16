@@ -216,6 +216,15 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     }
 }
 
+/// The panel menu's page commands, acting on the current page and its spread.
+pub fn panel_menu(app: &mut DesignApp, ui: &mut egui::Ui) {
+    let Some(st) = app.session.active() else { return };
+    let doc = st.doc.clone();
+    let cur = crate::canvas::current_page(app).unwrap_or(0);
+    let Some((si, _)) = doc.page_loc(cur) else { return };
+    page_menu(app, ui, &doc, cur, si);
+}
+
 fn page_menu(app: &mut DesignApp, ui: &mut egui::Ui, doc: &designcraft_doc::Document, abs: usize, si: usize) {
     if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Insert Page After"))).clicked() {
         let _ = app.run("layout.pages.insert", json!({"after": abs, "count": 1}));

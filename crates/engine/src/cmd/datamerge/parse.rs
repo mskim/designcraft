@@ -367,10 +367,16 @@ fn sniff(name: &str, text: &str) -> Delimiter {
     if ext == "csv" {
         return Delimiter::Comma;
     }
-    let header = first_physical_line(text);
-    if header.contains('\t') {
+    let tab = header_delimiter_candidate(text, '\t');
+    let semicolon = header_delimiter_candidate(text, ';');
+    let comma = header_delimiter_candidate(text, ',');
+    // Prefer formats with coherent quoted-field boundaries. If none separates fields,
+    // retain the legacy permissive choice; this is detection, not record validation.
+    let prefer_coherent = [&tab, &semicolon, &comma].iter().any(|c| c.found && c.coherent);
+    let eligible = |c: &HeaderDelimiterCandidate| c.found && (!prefer_coherent || c.coherent);
+    if eligible(&tab) {
         Delimiter::Tab
-    } else if header.contains(';') && !header.contains(',') {
+    } else if eligible(&semicolon) && !eligible(&comma) {
         Delimiter::Semicolon
     } else {
         Delimiter::Comma
@@ -381,8 +387,66 @@ pub fn extension(name: &str) -> String {
     Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
 }
 
-fn first_physical_line(text: &str) -> &str {
-    text.split('\n').next().unwrap_or("").trim_end_matches('\r')
+struct HeaderDelimiterCandidate {
+    found: bool,
+    coherent: bool,
+}
+
+/// A candidate separator outside quotes in its first nonempty logical record.
+/// Only that candidate starts a new field. Quotes in an unquoted field stay literal;
+/// Non-whitespace text after a quoted field closes lowers coherence, not validity.
+fn header_delimiter_candidate(text: &str, delimiter: char) -> HeaderDelimiterCandidate {
+    let mut found = false;
+    let mut coherent = true;
+    let mut quoted = false;
+    let mut after_quote = false;
+    let mut field_start = true;
+    let mut nonempty = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    nonempty = true;
+                } else {
+                    quoted = false;
+                    after_quote = true;
+                }
+            } else if !c.is_whitespace() {
+                nonempty = true;
+            }
+            continue;
+        }
+        match c {
+            '"' if field_start => {
+                quoted = true;
+                field_start = false;
+            }
+            separator if separator == delimiter => {
+                found = true;
+                field_start = true;
+                after_quote = false;
+            }
+            '\r' | '\n' => {
+                if nonempty {
+                    break;
+                }
+                found = false;
+                coherent = true;
+                field_start = true;
+                after_quote = false;
+            }
+            _ => {
+                // Whitespace may follow a closing quote, but does not start a new field
+                // or allow a later non-whitespace suffix to regain coherence.
+                coherent &= !after_quote || c.is_whitespace();
+                nonempty |= !c.is_whitespace();
+                field_start = false;
+            }
+        }
+    }
+    HeaderDelimiterCandidate { found, coherent: coherent && !quoted }
 }
 
 /// Header cell: trim, drop one leading apostrophe, then `@` is image and `#` is qr.
@@ -452,6 +516,7 @@ fn parse_delimited(s: &str, delim: char) -> Result<Vec<RawRow>, String> {
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
+    let mut field_start = true;
     let mut line = 1usize;
     let mut row_line = 1usize;
     let mut data_rows = 0usize;
@@ -501,21 +566,25 @@ fn parse_delimited(s: &str, delim: char) -> Result<Vec<RawRow>, String> {
     };
 
     while let Some(c) = chars.next() {
-        if c == '\n' {
+        if c == '\n' || (c == '\r' && chars.peek() != Some(&'\n')) {
             line = line.saturating_add(1);
         }
         if quoted {
             match c {
                 '"' if chars.peek() == Some(&'"') => {
-                    field.push('"');
+                    if !discarding {
+                        field.push('"');
+                    }
                     chars.next();
                 }
                 '"' => quoted = false,
-                _ => field.push(c),
+                _ if !discarding => field.push(c),
+                _ => {}
             }
             continue;
         }
         if c == delim {
+            field_start = true;
             if discarding {
                 field.clear();
                 continue;
@@ -531,14 +600,25 @@ fn parse_delimited(s: &str, delim: char) -> Result<Vec<RawRow>, String> {
             continue;
         }
         match c {
-            '"' if field.is_empty() && !discarding => quoted = true,
-            '\r' => {}
-            '\n' => {
+            '"' if field_start => {
+                quoted = true;
+                field_start = false;
+            }
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                    line = line.saturating_add(1);
+                }
                 finish(&mut row, &mut field, &mut rows, &mut data_rows, &mut header_width, row_line, &mut discarding)?;
                 row_line = line;
+                field_start = true;
             }
-            _ if discarding => {}
-            _ => field.push(c),
+            _ => {
+                field_start = false;
+                if !discarding {
+                    field.push(c);
+                }
+            }
         }
     }
     if !field.is_empty() || !row.is_empty() || discarding {

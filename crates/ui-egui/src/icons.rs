@@ -178,6 +178,29 @@ pub fn paint(p: &Painter, r: Rect, name: &str, c: Color32) {
             pen.line(&pts);
             pen.line(&[(13.0, 4.0), (15.5, 6.0), (16.5, 2.8)]);
         }
+        // Properties › Transform: rotate a quarter turn (an arc over a square), flip (a shape and its
+        // mirror image across a dashed axis).
+        "rotate-cw" | "rotate-ccw" => {
+            let m = |x: f32| if name == "rotate-ccw" { 20.0 - x } else { x };
+            pen.rect(m(3.0).min(m(11.0)), 9.0, m(3.0).max(m(11.0)), 17.0);
+            let pts: Vec<(f32, f32)> = (0..12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 - i as f32 / 11.0);
+                    (m(11.0 + 5.0 * a.cos()), 9.0 - 5.0 * a.sin())
+                })
+                .collect();
+            pen.line(&pts);
+            pen.line(&[(m(14.0), 7.0), (m(16.0), 9.5), (m(18.0), 7.0)]);
+        }
+        "flip-h" | "flip-v" => {
+            let t = |x: f32, y: f32| if name == "flip-v" { (y, x) } else { (x, y) };
+            pen.fill(&[t(3.0, 16.0), t(8.5, 4.0), t(8.5, 16.0)]);
+            pen.closed(&[t(11.5, 16.0), t(11.5, 4.0), t(17.0, 16.0)]);
+            for k in 0..4 {
+                let y0 = 2.5 + k as f32 * 4.0;
+                pen.line(&[t(10.0, y0), t(10.0, y0 + 2.0)]);
+            }
+        }
         "tool-gradient" | "tool-gradient-feather" => {
             for i in 0..6 {
                 let a = 30 + i * 35;
@@ -493,6 +516,38 @@ pub fn paint(p: &Painter, r: Rect, name: &str, c: Color32) {
                     pen.line(&[(14.5, 10.0), (17.0, 10.0)]);
                 }
                 _ => {}
+            }
+        }
+        // Pathfinder: a back square (top left) and a front one (bottom right), the result filled.
+        "pf-add" | "pf-subtract" | "pf-intersect" | "pf-exclude" | "pf-minus-back" => {
+            let (back, front) = ((3.0, 3.0, 13.0, 13.0), (7.0, 7.0, 17.0, 17.0));
+            match name {
+                "pf-add" => {
+                    pen.frect(back.0, back.1, back.2, back.3);
+                    pen.frect(front.0, front.1, front.2, front.3);
+                }
+                "pf-subtract" => {
+                    pen.frect(3.0, 3.0, 13.0, 7.0);
+                    pen.frect(3.0, 7.0, 7.0, 13.0);
+                    pen.rect(front.0, front.1, front.2, front.3);
+                }
+                "pf-intersect" => {
+                    pen.rect(back.0, back.1, back.2, back.3);
+                    pen.rect(front.0, front.1, front.2, front.3);
+                    pen.frect(7.0, 7.0, 13.0, 13.0);
+                }
+                "pf-exclude" => {
+                    pen.frect(3.0, 3.0, 13.0, 7.0);
+                    pen.frect(3.0, 7.0, 7.0, 13.0);
+                    pen.frect(13.0, 7.0, 17.0, 17.0);
+                    pen.frect(7.0, 13.0, 13.0, 17.0);
+                    pen.rect(7.0, 7.0, 13.0, 13.0);
+                }
+                _ => {
+                    pen.rect(back.0, back.1, back.2, back.3);
+                    pen.frect(13.0, 7.0, 17.0, 17.0);
+                    pen.frect(7.0, 13.0, 13.0, 17.0);
+                }
             }
         }
         // ---- Properties panel glyphs (original drawings)

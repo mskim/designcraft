@@ -194,14 +194,12 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
 /// utility button and the Screen Mode well.
 fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
     let t = Tokens::get(ui.ctx());
-    let info = crate::panels::sel_info(app);
+    let target = crate::panels::color_target(app);
     let doc = app.session.active().map(|d| d.doc.clone());
-    let stroke_front_id = egui::Id::new("proxy_stroke_front");
-    let text_id = egui::Id::new("proxy_text");
-    let stroke_front: bool = ui.data(|d| d.get_temp(stroke_front_id)).unwrap_or(false);
-    let text_mode: bool = ui.data(|d| d.get_temp(text_id)).unwrap_or(false);
-    let (fill_sw, stroke_sw) = match &info {
-        Some(i) => (i.fill.clone(), i.stroke.clone()),
+    let stroke_front = app.ui.stroke_front;
+    let text_mode = crate::panels::colors_affect_text(app) || app.ui.formatting_affects_text;
+    let (fill_sw, stroke_sw) = match &target {
+        Some((fill, _, stroke, _)) => (fill.clone(), stroke.clone()),
         None => ("[None]".to_string(), "[Black]".to_string()),
     };
     let x0 = ui.max_rect().min.x + (width - 30.0) / 2.0;
@@ -216,8 +214,7 @@ fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
         })
         .clicked()
     {
-        let _ = app.run("object.fill", json!({"swatch": "[None]"}));
-        let _ = app.run("object.stroke", json!({"swatch": "[Black]"}));
+        let _ = app.run("color.defaultFillStroke", json!({}));
     }
     let swap = egui::Rect::from_min_size(egui::pos2(x0 + 19.0, row.min.y), vec2(11.0, 11.0));
     icons::paint(ui.painter(), swap, "swap", t.icon);
@@ -228,8 +225,7 @@ fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
         })
         .clicked()
     {
-        let _ = app.run("object.fill", json!({"swatch": stroke_sw}));
-        let _ = app.run("object.stroke", json!({"swatch": fill_sw}));
+        let _ = app.run("color.swapFillStroke", json!({}));
     }
     ui.add_space(2.0);
     // Proxy: 19.5 pt squares, fill top-left, stroke bottom-right.
@@ -272,16 +268,34 @@ fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
         crate::rtl::label(ui, fill_tip);
     });
     fresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, fill_tip));
+    let stroke_tip = crate::i18n::tr(&app.ui.language, "Stroke (X)");
     let sresp = ui.interact(stroke_r.translate(vec2(0.0, 0.0)), ui.id().with("proxy_stroke"), Sense::click()).on_hover_ui(|ui| {
-        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Stroke (X)"));
+        crate::rtl::label(ui, stroke_tip);
     });
+    sresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, stroke_tip));
     if fresp.clicked() || sresp.clicked() {
         let front =
             if stroke_front { !fresp.clicked() } else { sresp.clicked() && !fill_r.contains(sresp.interact_pointer_pos().unwrap_or_default()) };
-        ui.data_mut(|d| d.insert_temp(stroke_front_id, front));
+        app.ui.stroke_front = front;
     }
+    // A double-click opens the Color Picker for that box (as InDesign's), with the selection's
+    // colour: the selected text's when text is selected.
     if fresp.double_clicked() || sresp.double_clicked() {
-        let _ = app.run("window.panel", json!({"panel": "swatches"}));
+        let on_fill = fresp.double_clicked() && (!stroke_front || !sresp.double_clicked());
+        let stroke = !on_fill;
+        let text = crate::panels::text_attrs(app).filter(|_| app.session.active().is_some_and(|d| d.selection.text.is_some()));
+        let current = match text {
+            Some(a) => a["chars"][if stroke { "stroke" } else { "fill" }].as_str().unwrap_or("[None]").to_string(),
+            None if stroke => stroke_sw.clone(),
+            None => fill_sw.clone(),
+        };
+        let rgb = doc.as_ref().and_then(|d| d.resolve_color(&current, 1.0)).map_or([0.0; 3], |c| c.to_rgb());
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let hex = format!("#{:02x}{:02x}{:02x}", byte(rgb[0]), byte(rgb[1]), byte(rgb[2]));
+        app.ui.dialog = Some(crate::dialogs::Dialog::new(
+            "colorPicker",
+            json!({"target": if stroke { "stroke" } else { "fill" }, "hex": hex, "text": crate::panels::colors_affect_text(app)}),
+        ));
     }
     ui.add_space(3.0);
     // Formatting affects container / text.
@@ -302,7 +316,7 @@ fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
             })
             .clicked()
         {
-            ui.data_mut(|d| d.insert_temp(text_id, k == 1));
+            let _ = app.run("app.formattingAffectsText", json!({"on": k == 1}));
         }
     }
     ui.add_space(5.0);
@@ -316,14 +330,13 @@ fn fill_stroke_proxy(app: &mut DesignApp, ui: &mut egui::Ui, width: f32) {
     let chip = egui::Rect::from_center_size(well.center(), vec2(14.0, 14.0));
     crate::widgets::paint_chip(ui.painter(), chip, None, None);
     flyout_triangle(ui.painter(), well, t.icon);
-    let target = if stroke_front { "object.stroke" } else { "object.fill" };
     if resp.clicked() {
-        let _ = app.run(target, json!({"swatch": "[None]"}));
+        let _ = app.run("color.applyNone", json!({}));
     }
     egui::Popup::context_menu(&resp).show(|ui| {
         for (label, sw) in [("Apply Color", "[Black]"), ("Apply None", "[None]")] {
             if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).clicked() {
-                let _ = app.run(target, json!({"swatch": sw}));
+                let _ = crate::panels::apply_swatch(app, stroke_front, sw, None);
                 ui.close();
             }
         }
@@ -411,6 +424,31 @@ fn tool_button(ui: &mut egui::Ui, icon: &str, active: bool, tip: &str) -> egui::
     })
 }
 
+/// Default Fill and Stroke (D): no fill, a black stroke.
+pub(crate) fn default_fill_stroke(app: &mut DesignApp) -> Result<Value, String> {
+    if crate::panels::colors_affect_text(app) {
+        app.run("type.char", json!({"fill": "[Black]", "fillTint": 1.0, "stroke": "[None]", "strokeTint": 1.0}))
+    } else {
+        app.run("object.defaultFillStroke", json!({}))
+    }
+}
+
+/// Swap Fill and Stroke (Shift+X): each selected object's fill and stroke trade places.
+pub(crate) fn swap_fill_stroke(app: &mut DesignApp) -> Result<Value, String> {
+    if crate::panels::colors_affect_text(app) { app.run("type.swapFillStroke", json!({})) } else { app.run("object.swapFillStroke", json!({})) }
+}
+
+/// Fill/Stroke toggle (X): brings the other of fill and stroke to the front of the proxy.
+pub(crate) fn toggle_fill_stroke(app: &mut DesignApp) -> Result<Value, String> {
+    app.ui.stroke_front = !app.ui.stroke_front;
+    Ok(json!({"strokeFront": app.ui.stroke_front}))
+}
+
+/// Apply None (/): to the fill or the stroke, whichever is in front of the proxy.
+pub(crate) fn apply_none(app: &mut DesignApp) -> Result<Value, String> {
+    crate::panels::apply_swatch(app, app.ui.stroke_front, "[None]", None)
+}
+
 #[cfg(test)]
 mod tests {
     use egui::{pos2, vec2};
@@ -473,6 +511,36 @@ mod tests {
     }
 
     #[test]
+    fn double_clicking_the_fill_box_opens_the_color_picker_with_the_selections_colour() {
+        let mut app = app(false);
+        app.run("file.new", serde_json::json!({})).unwrap();
+        let id = app.run("frame.create", serde_json::json!({"rect": [72, 72, 200, 200]})).unwrap()["id"].clone();
+        app.run("object.color", serde_json::json!({"color": "#456daf", "ids": [id]})).unwrap();
+        app.run("selection.set", serde_json::json!({"ids": [id]})).unwrap();
+        // Frames 1 ms apart, so two clicks make a double-click.
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).with_step_dt(0.001).build_ui_state(
+            |ui, app: &mut crate::DesignApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let at = h.get_by_label(FILL).rect().center();
+        h.hover_at(at);
+        h.step();
+        for pressed in [true, false, true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            h.step();
+        }
+        h.run_steps(3);
+        let d = h.state().ui.dialog.clone().expect("the Color Picker opened");
+        assert_eq!(d.id, "colorPicker");
+        assert_eq!((d.fields["target"].as_str(), d.fields["hex"].as_str()), (Some("fill"), Some("#456daf")), "{:?}", d.fields);
+    }
+
+    #[test]
     fn a_tall_window_keeps_one_column_and_does_not_scroll() {
         let mut h = test_window::open(app(false), vec2(1400.0, 900.0));
         let panel = test_window::panel_rect(&h, "tools");
@@ -481,5 +549,123 @@ mod tests {
         assert!(panel.contains_rect(before.0) && panel.contains_rect(before.1), "{before:?} outside {panel:?}");
         wheel(&mut h, panel.center(), vec2(0.0, -2000.0));
         assert_eq!((rect(&h, LAST_TOOL), rect(&h, FILL)), before);
+    }
+    /// The Fill/Stroke proxy's keys run on the selection and stay out of text being typed.
+    #[test]
+    fn fill_stroke_proxy_keys() {
+        use egui::{Event, Key, Modifiers};
+        use serde_json::json;
+        fn press(app: &mut crate::DesignApp, ctx: &egui::Context, key: Key, modifiers: Modifiers) {
+            let events = [true, false].map(|pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).to_vec();
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| crate::menus::shortcuts(app, ui.ctx())).textures_delta.clear();
+        }
+        fn colors(app: &crate::DesignApp) -> (String, f32, String, f32) {
+            let st = app.session.active().unwrap();
+            let it = st.doc.item(st.selection.items[0]).unwrap();
+            (it.fill.swatch.clone(), it.fill.tint, it.stroke.swatch.clone(), it.stroke.tint)
+        }
+        let mut app = app(false);
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({})).unwrap();
+        let f = app.run("frame.create", json!({"rect": [72, 72, 300, 200], "content": "text", "text": "Hello"})).unwrap();
+        app.run("selection.set", json!({"ids": [f["id"]]})).unwrap();
+        app.run("object.fill", json!({"swatch": "[Paper]", "tint": 0.5})).unwrap();
+        app.run("object.stroke", json!({"swatch": "[Black]", "tint": 1.0})).unwrap();
+
+        press(&mut app, &ctx, Key::X, Modifiers::SHIFT);
+        assert_eq!(colors(&app), ("[Black]".into(), 1.0, "[Paper]".into(), 0.5), "Shift+X swaps, tints included");
+        press(&mut app, &ctx, Key::D, Modifiers::NONE);
+        assert_eq!(colors(&app), ("[None]".into(), 1.0, "[Black]".into(), 1.0), "D: no fill, black stroke");
+        press(&mut app, &ctx, Key::X, Modifiers::NONE);
+        assert!(app.ui.stroke_front, "X brings the stroke to the front");
+        press(&mut app, &ctx, Key::Slash, Modifiers::NONE);
+        assert_eq!(colors(&app).2, "[None]", "/ applies None to the stroke in front");
+
+        // Typing in a story: the keys are text, not shortcuts.
+        app.session.execute("text.select", &json!({"story": f["story"], "anchor": 5})).unwrap();
+        app.select_tool("type");
+        assert!(app.session.wants_text());
+        press(&mut app, &ctx, Key::X, Modifiers::NONE);
+        assert!(app.ui.stroke_front, "X while typing leaves the proxy alone");
+    }
+}
+
+#[cfg(test)]
+mod text_color_tests {
+    use super::*;
+    use designcraft_doc::{ItemId, StoryId};
+
+    #[test]
+    fn integration_color_swap_preserves_each_run_and_frame() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let mut frames = vec![];
+        let mut stories = vec![];
+        for text in ["abcd", "efgh"] {
+            let f = app.run("frame.create", json!({"rect":[36,36,300,200],"content":"text","text":text})).unwrap();
+            frames.push(f["id"].clone());
+            stories.push(f["story"].as_u64().unwrap());
+        }
+        let pairs = [("[Paper]", "[Black]", 0.2, 0.8), ("[Black]", "[Paper]", 0.4, 0.6)];
+        for (i, sid) in stories.iter().enumerate() {
+            for j in 0..2 {
+                let (fill, stroke, ft, st) = pairs[(i + j) % 2];
+                app.run("text.select", json!({"story":sid,"anchor":j*2,"focus":j*2+2})).unwrap();
+                app.run("type.char", json!({"fill":fill,"stroke":stroke,"fillTint":ft,"strokeTint":st})).unwrap();
+            }
+        }
+        app.run("selection.set", json!({"ids":frames})).unwrap();
+        app.run("app.formattingAffectsText", json!({"on":true})).unwrap();
+        let before = serde_json::to_value(app.session.doc().unwrap().doc.as_ref()).unwrap();
+        let n = app.session.doc().unwrap().history.undo.len();
+        swap_fill_stroke(&mut app).unwrap();
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), n + 1);
+        for (i, sid) in stories.iter().enumerate() {
+            let story = app.session.doc().unwrap().doc.story(StoryId(*sid)).unwrap();
+            for j in 0..2 {
+                let (fill, stroke, ft, st) = pairs[(i + j) % 2];
+                let a = &story.format_after(j * 2).over;
+                assert_eq!((a.fill.as_deref(), a.stroke.as_deref(), a.fill_tint, a.stroke_tint), (Some(stroke), Some(fill), Some(st), Some(ft)));
+            }
+        }
+        let swapped = serde_json::to_value(app.session.doc().unwrap().doc.as_ref()).unwrap();
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(serde_json::to_value(app.session.doc().unwrap().doc.as_ref()).unwrap(), before);
+        app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(serde_json::to_value(app.session.doc().unwrap().doc.as_ref()).unwrap(), swapped);
+    }
+
+    #[test]
+    fn integration_color_toolbar_picker_targets_selected_frame_text() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let f = app.run("frame.create", json!({"rect":[36,36,300,200],"content":"text","text":"hello"})).unwrap();
+        app.run("selection.set", json!({"ids":[f["id"]]})).unwrap();
+        app.run("app.formattingAffectsText", json!({"on":true})).unwrap();
+        let before = app.session.doc().unwrap().doc.item(ItemId(f["id"].as_u64().unwrap())).unwrap().fill.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.001).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                app.logic(&ui.ctx().clone());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let at = h.get_by_label("Fill (X)").rect().center();
+        h.hover_at(at);
+        h.step();
+        for pressed in [true, false, true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            h.step();
+        }
+        h.run_steps(3);
+        let d = h.state().ui.dialog.clone().unwrap();
+        assert_eq!(d.id, "colorPicker");
+        assert_eq!(d.fields["text"], true);
+        h.state_mut().run("object.color", json!({"color":"#123456","target":"fill","text":d.fields["text"]})).unwrap();
+        let doc = &h.state().session.doc().unwrap().doc;
+        assert_eq!(doc.item(ItemId(f["id"].as_u64().unwrap())).unwrap().fill, before);
+        assert!(doc.story(StoryId(f["story"].as_u64().unwrap())).unwrap().format_after(0).over.fill.is_some());
     }
 }

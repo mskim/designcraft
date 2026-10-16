@@ -50,7 +50,7 @@ basics of editing fail for too many users on Windows and Linux.
 | Workspaces | Essentials, Advanced, Book, Digital Publishing, Interactive for PDF, Printing and Proofing, Typography, Touch | ✓ named workspaces + custom | ~ | tab bar overlaps menus in Book/Advanced (#182) |
 | Story Editor | ✓ | ✓ | ~ | style-name column, depth ruler missing |
 | Undo granularity (a drag = one step) | ✓ | ✓ (Begin/Preview/Commit) | ✓ | |
-| Closing with unsaved changes asks | ✓ | ✓ (#146) | ✓ | |
+| Closing with unsaved changes asks | ✓ | ✓ File › Close and window/menu quit (#146, #545) | ✓ | macOS Dock Quit still bypasses the prompt (#544) |
 | UI scaling, System appearance | ✓ | scaling ✓ (#281); follows macOS light/dark ✗ (#237) | ~ | |
 | Window controls, full screen | ✓ | ~ | ~ | misaligned on macOS (#333) |
 

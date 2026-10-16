@@ -168,7 +168,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!("guide.liquid", "Convert to Liquid Guide", [], None, "{spread?, page, index, on?: bool (default true)}", has_doc, |s, p| {
-            let sr = super::spread_param(p, "spread");
+            let sr = super::spread_param(p, "guide.liquid")?;
             let pi = p.get("page").and_then(Value::as_u64).unwrap_or(0) as usize;
             let gi = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("guide.liquid", "`index` required"))? as usize;
             let on = p.get("on").and_then(Value::as_bool).unwrap_or(true);

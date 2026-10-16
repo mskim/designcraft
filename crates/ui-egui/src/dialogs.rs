@@ -1656,6 +1656,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     ui.end_row();
                 });
             }
+            STEP_AND_REPEAT => step_and_repeat_dialog(app, ui, &mut d),
             id if id.starts_with("cmd:") => command_form(app, ui, &mut d),
             "goToPage" => {
                 ui.horizontal(|ui| {
@@ -1733,12 +1734,18 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         Some(true) => {
             let _ = confirm(app);
         }
-        Some(false) => {
-            app.ui.dialog = None;
-            app.cancel_pdf_import();
-        }
+        Some(false) => cancel(app),
         None => {}
     }
+}
+
+/// Close the open dialog without applying it (Cancel, Esc, the control channel): a previewing
+/// dialog puts the document back as it was.
+pub fn cancel(app: &mut DesignApp) {
+    if app.ui.dialog.take().is_some_and(|d| d.fields.contains_key(PREVIEWED)) {
+        app.session.cancel_interaction();
+    }
+    app.cancel_pdf_import();
 }
 
 /// Apply the open dialog.
@@ -1901,7 +1908,7 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
         }
         "colorPicker" => {
             let hex = d.s("hex");
-            app.run("object.color", json!({"color": hex, "target": d.s("target")}))
+            app.run("object.color", json!({"color": hex, "target": d.s("target"), "text": d.b("text")}))
         }
         "layerOptions" => {
             let hidden: Vec<Value> = d.fields.get("layers").and_then(Value::as_array).map(|a| a.iter().filter(|l| l["visible"] == false).map(|l| l["name"].clone()).collect()).unwrap_or_default();
@@ -2002,7 +2009,10 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
                 let words: Vec<String> = d.s("userWords").lines().map(str::to_string).collect();
                 app.run("spelling.setWords", json!({"words": words}))?;
             }
-            app.ui.story_editor_size = d.n("storyEditorSize").unwrap_or(14.0) as f32;
+            // The slider's range. A size that isn't finite is saved as `null`, and ui.json then fails to load.
+            if let Some(size) = d.n("storyEditorSize").filter(|v| v.is_finite()) {
+                app.ui.story_editor_size = size.clamp(8.0, 36.0) as f32;
+            }
             // Highlight options change the screen view only.
             app.canvas.shown = None;
             let view = match d.s("displayQuality").as_str() {
@@ -2078,6 +2088,9 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
         "closeDocument" => {
             // The document may have moved in the tab row (or gone) while the dialog was open.
             let uid = d.fields.get("uid").and_then(Value::as_u64);
+            if d.b("quitting") {
+                return app.confirm_quit_document(uid.ok_or("Missing document in quit confirmation")?, d.b("discard"));
+            }
             let index = |app: &DesignApp| app.session.documents().iter().position(|doc| Some(doc.uid) == uid);
             let Some(i) = index(app) else { return Ok(Value::Null) };
             if !d.b("discard") {
@@ -2164,6 +2177,20 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
         "alert" => Ok(Value::Null),
         "findChange" if d.b("objectMode") => Ok(Value::Null),
         "findChange" => app.run("find.change", json!({"find": d.s("find"), "change": d.s("change"), "grep": d.b("grep"), "caseSensitive": d.b("caseSensitive"), "wholeWord": d.b("wholeWord"), "scope": d.s("scope")})),
+        STEP_AND_REPEAT => {
+            // The preview goes; the copies are made once, as one undo step.
+            if d.fields.contains_key(PREVIEWED) {
+                app.session.cancel_interaction();
+            }
+            let r = step_and_repeat_params(app, &d).and_then(|p| app.run("edit.stepAndRepeat", p));
+            if let Err(e) = &r {
+                let mut d = d.clone();
+                d.fields.remove(PREVIEWED);
+                d.fields.insert("status".into(), json!(e));
+                app.ui.dialog = Some(d);
+            }
+            r
+        }
         id if id.starts_with("cmd:") => {
             let cid = &id[4..];
             let doc = designcraft_engine::find_command(cid).map_or("", |c| c.params);
@@ -2288,6 +2315,41 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
                 });
             }
             "nested" => {
+                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "Drop Caps")).font(semibold(12.0)));
+                egui::Grid::new("psdc").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    for (label, key, max) in [
+                        ("Lines:", "dropCapLines", designcraft_compose::MAX_DROP_CAP_LINES),
+                        ("Characters:", "dropCapChars", designcraft_compose::MAX_DROP_CAP_CHARS),
+                    ] {
+                        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, label));
+                        let v = cur(d, &format!("p.{key}"), &pv[key]).as_f64();
+                        if let Some(n) = crate::widgets::number(ui, &format!("ps{key}"), v, "", 60.0, 0) {
+                            d.fields.insert(format!("p.{key}"), json!((n.max(0.0) as u64).min(max as u64)));
+                        }
+                        ui.end_row();
+                    }
+                    crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Character Style:"));
+                    let style = cur(d, "p.dropCapStyle", &pv["dropCapStyle"]).as_str().unwrap_or("").to_string();
+                    let style = if style.is_empty() { designcraft_doc::NO_CHAR_STYLE.to_string() } else { style };
+                    egui::ComboBox::from_id_salt("ps_dropcap_style")
+                        .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, &style)))
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for c in &cnames {
+                                if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, c))).clicked() {
+                                    d.fields.insert("p.dropCapStyle".into(), json!(c));
+                                }
+                            }
+                        });
+                    ui.end_row();
+                });
+                for (label, key) in [("Align Left Edge", "dropCapAlignLeft"), ("Scale for Descenders", "dropCapScaleDescenders")] {
+                    let mut on = cur(d, &format!("p.{key}"), &pv[key]).as_bool().unwrap_or(false);
+                    if ui.checkbox(&mut on, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).changed() {
+                        d.fields.insert(format!("p.{key}"), json!(on));
+                    }
+                }
+                ui.add_space(8.0);
                 crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "Nested Styles")).font(semibold(12.0)));
                 let mut list: Vec<Value> = cur(d, "p.nestedStyles", &pv["nestedStyles"]).as_array().cloned().unwrap_or_default();
                 let mut changed = false;
@@ -2343,9 +2405,19 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
                             ))
                             .width(100.0)
                             .show_ui(ui, |ui| {
-                                for k in
-                                    ["sentences", "words", "characters", "letters", "digits", "tab", "forcedLineBreak", "emSpace", "enSpace", "chars"]
-                                {
+                                for k in [
+                                    "sentences",
+                                    "words",
+                                    "characters",
+                                    "letters",
+                                    "digits",
+                                    "tab",
+                                    "forcedLineBreak",
+                                    "emSpace",
+                                    "enSpace",
+                                    "dropcap",
+                                    "chars",
+                                ] {
                                     if ui.selectable_label(k == kind, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, k))).clicked() {
                                         ns["until"] = if k == "chars" { json!({"kind": "chars", "chars": ":"}) } else { json!({"kind": k}) };
                                         changed = true;
@@ -3330,7 +3402,14 @@ fn footnote_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
                 ui,
                 d,
                 "firstBaseline",
-                &[("ascent", "Ascent"), ("capHeight", "Cap Height"), ("leading", "Leading"), ("xHeight", "x Height"), ("fixed", "Fixed")],
+                &[
+                    ("ascent", "Ascent"),
+                    ("capHeight", "Cap Height"),
+                    ("leading", "Leading"),
+                    ("xHeight", "x Height"),
+                    ("emboxHeight", "Em Box Height"),
+                    ("fixed", "Fixed"),
+                ],
             );
             ui.end_row();
             crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Min:"));
@@ -3557,6 +3636,120 @@ fn command_form(app: &crate::DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
     }
 }
 
+const STEP_AND_REPEAT: &str = "cmd:edit.stepAndRepeat";
+/// The params a previewing dialog shows on the page (its interaction is open while it is set).
+const PREVIEWED: &str = "_previewed";
+
+/// Edit › Step and Repeat, as in InDesign: Repeat (Count, or Rows and Columns with Create as a
+/// grid), Offset (Vertical, Horizontal, in the document's ruler units) and Preview, which shows
+/// the copies on the page while the dialog is open.
+fn step_and_repeat_dialog(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
+    let (hu, vu) = app.session.active().map_or((Unit::Picas, Unit::Picas), |s| (s.doc.settings.horizontal_units, s.doc.settings.vertical_units));
+    for (k, v) in [
+        ("count", json!("1")),
+        ("rows", json!("1")),
+        ("columns", json!("1")),
+        ("vertical", json!(format_measure(12.0, vu))),
+        ("horizontal", json!(format_measure(12.0, hu))),
+    ] {
+        d.fields.entry(k).or_insert(v);
+    }
+    let lang = app.ui.language.clone();
+    let tr = |s: &str| crate::i18n::tr(&lang, s).to_string();
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            crate::rtl::label(ui, egui::RichText::new(tr("Repeat")).font(semibold(12.0)));
+            egui::Grid::new("sr_repeat").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                let grid = d.b("grid");
+                let fields: &[(&str, &str)] = if grid { &[("rows", "Rows:"), ("columns", "Columns:")] } else { &[("count", "Count:")] };
+                for (k, l) in fields {
+                    crate::rtl::label(ui, tr(l));
+                    text_field(ui, d, k, 70.0);
+                    ui.end_row();
+                }
+                crate::rtl::label(ui, "");
+                check(ui, d, "grid", &tr("Create as a grid"));
+                ui.end_row();
+            });
+            ui.add_space(10.0);
+            crate::rtl::label(ui, egui::RichText::new(tr("Offset")).font(semibold(12.0)));
+            ui.horizontal(|ui| {
+                for (k, l) in [("vertical", "Vertical:"), ("horizontal", "Horizontal:")] {
+                    crate::rtl::label(ui, tr(l));
+                    text_field(ui, d, k, 80.0);
+                    ui.add_space(12.0);
+                }
+            });
+        });
+        ui.add_space(32.0);
+        check(ui, d, "preview", &tr("Preview"));
+    });
+    step_and_repeat_preview(app, d);
+    if let Some(st) = d.fields.get("status").and_then(Value::as_str) {
+        ui.add_space(6.0);
+        crate::rtl::label(ui, egui::RichText::new(st).color(crate::theme::Tokens::get(ui.ctx()).text_dim));
+    }
+}
+
+/// `edit.stepAndRepeat`'s params from the dialog: whole counts, offsets in the ruler units
+/// (or any unit typed: "-0.75 in", "3p"). Empty fields are 1 copy and 1p0.
+fn step_and_repeat_params(app: &DesignApp, d: &Dialog) -> Result<Value, String> {
+    let (hu, vu) = app.session.active().map_or((Unit::Picas, Unit::Picas), |s| (s.doc.settings.horizontal_units, s.doc.settings.vertical_units));
+    let invalid = |s: &str| format!("{}: {}", crate::i18n::tr(&app.ui.language, "Invalid value"), s.trim());
+    // Fields not shown yet (a dialog confirmed over the control channel) take the defaults.
+    let whole = |k: &str| {
+        let s = d.s(k);
+        if s.trim().is_empty() { Ok(1) } else { s.trim().parse::<u64>().map_err(|_| invalid(&s)) }
+    };
+    let measure = |k: &str, u: Unit| {
+        let s = d.s(k);
+        if s.trim().is_empty() {
+            return Ok(12.0);
+        }
+        parse_measure(&s, u).ok().filter(|v| v.is_finite()).ok_or_else(|| invalid(&s))
+    };
+    let (dx, dy) = (measure("horizontal", hu)?, measure("vertical", vu)?);
+    Ok(if d.b("grid") {
+        json!({"rows": whole("rows")?, "columns": whole("columns")?, "dx": dx, "dy": dy})
+    } else {
+        json!({"count": whole("count")?, "dx": dx, "dy": dy})
+    })
+}
+
+/// Preview on: the copies show on the page (redone when a field changes); off: they go.
+fn step_and_repeat_preview(app: &mut DesignApp, d: &mut Dialog) {
+    let shown = d.fields.get(PREVIEWED).cloned();
+    if !d.b("preview") {
+        if shown.is_some() {
+            app.session.cancel_interaction();
+            d.fields.remove(PREVIEWED);
+            d.fields.remove("status");
+        }
+        return;
+    }
+    let params = match step_and_repeat_params(app, d) {
+        Ok(p) => p,
+        Err(e) => {
+            d.fields.insert("status".into(), json!(e));
+            return;
+        }
+    };
+    if shown.as_ref() == Some(&params) {
+        return;
+    }
+    if shown.is_none()
+        && let Err(e) = app.session.begin_interaction("Step and Repeat")
+    {
+        d.fields.insert("status".into(), json!(e.to_string()));
+        return;
+    }
+    match app.session.preview("edit.stepAndRepeat", params.clone()) {
+        Ok(()) => d.fields.remove("status"),
+        Err(e) => d.fields.insert("status".into(), json!(e.to_string())),
+    };
+    d.fields.insert(PREVIEWED.into(), params);
+}
+
 /// New Cross-Reference: link to a paragraph (paragraph styles on the left, their paragraphs on
 /// the right) or a text anchor, with a cross-reference format.
 fn insert_xref(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
@@ -3743,6 +3936,81 @@ fn find_font(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn step_and_repeat_dialog_previews_and_makes_the_copies_as_one_undo_step() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let id = app.run("frame.create", json!({"rect": [72, 600, 540, 640]})).unwrap()["id"].as_u64().unwrap();
+        app.run("selection.set", json!({"ids": [id]})).unwrap();
+        let open = |app: &mut DesignApp| {
+            crate::menus::activate(app, "edit.stepAndRepeat", &Value::Null);
+            assert_eq!(app.ui.dialog.as_ref().map(|d| d.id.as_str()), Some(STEP_AND_REPEAT));
+        };
+        let set = |app: &mut DesignApp, k: &str, v: Value| {
+            app.ui.dialog.as_mut().unwrap().fields.insert(k.into(), v);
+        };
+        let items = |app: &DesignApp| app.session.doc().unwrap().doc.spreads[0].items.len();
+        let undo = |app: &DesignApp| app.session.doc().unwrap().history.undo.len();
+        let (n0, u0) = (items(&app), undo(&app));
+        let ctx = dialog_context("en");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        open(&mut app);
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        for expected in ["Step and Repeat", "Repeat", "Count:", "Create as a grid", "Offset", "Vertical:", "Horizontal:", "Preview", "OK", "Cancel"] {
+            visible_label(&labels, screen, expected);
+        }
+        // Preview: the copies show, and change with the fields, without an undo step.
+        set(&mut app, "count", json!("5"));
+        set(&mut app, "vertical", json!("-0.75 in"));
+        set(&mut app, "horizontal", json!("0"));
+        set(&mut app, "preview", json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert_eq!((items(&app), undo(&app)), (n0 + 5, u0));
+        set(&mut app, "count", json!("3"));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert_eq!(items(&app), n0 + 3);
+        set(&mut app, "preview", json!(false));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert_eq!(items(&app), n0, "Preview off takes them away");
+        set(&mut app, "preview", json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert_eq!(items(&app), n0 + 3);
+        // Cancel puts the document back.
+        cancel(&mut app);
+        assert!(app.ui.dialog.is_none());
+        assert_eq!((items(&app), undo(&app)), (n0, u0));
+        // OK after a preview makes the copies once, as one undo step, 0.75 in apart.
+        app.run("selection.set", json!({"ids": [id]})).unwrap();
+        open(&mut app);
+        set(&mut app, "count", json!("2"));
+        set(&mut app, "vertical", json!("-0.75 in"));
+        set(&mut app, "horizontal", json!("0"));
+        set(&mut app, "preview", json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        let r = confirm(&mut app).unwrap();
+        assert_eq!((items(&app), undo(&app)), (n0 + 2, u0 + 1));
+        let last = r["ids"][1].as_u64().unwrap();
+        let top = app.session.doc().unwrap().doc.item(designcraft_doc::ItemId(last)).unwrap().bounds().min_y();
+        assert!((top - (600.0 - 108.0)).abs() < 1e-6, "{top}");
+        // Create as a grid: Rows × Columns cells, the original being one.
+        app.run("selection.set", json!({"ids": [id]})).unwrap();
+        open(&mut app);
+        set(&mut app, "grid", json!(true));
+        set(&mut app, "rows", json!("2"));
+        set(&mut app, "columns", json!("3"));
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        visible_label(&labels, screen, "Rows:");
+        visible_label(&labels, screen, "Columns:");
+        assert_eq!(confirm(&mut app).unwrap()["created"], 5);
+        // A value that isn't a measure keeps the dialog open and says so.
+        open(&mut app);
+        set(&mut app, "vertical", json!("up"));
+        assert!(confirm(&mut app).is_err());
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert_eq!(d.s("status"), "Invalid value: up");
+    }
+
     fn dialog_context(language: &str) -> egui::Context {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx, language);
@@ -3882,6 +4150,22 @@ mod tests {
         }
         click_dialog(&mut app, &ctx, screen, visible_label(&labels, screen, option).center());
         assert!(app.ui.dialog.as_ref().unwrap().b("absolutePageNumbers"));
+    }
+
+    #[test]
+    fn preferences_ok_saves_a_story_editor_size_that_loads_back() {
+        // `ui.dialog.set` takes any value; a size that isn't finite is saved as `null`.
+        let sizes = [(json!("nan"), 20.0), (json!("inf"), 20.0), (json!(null), 20.0), (json!(1e39), 36.0), (json!(3), 8.0), (json!(11), 11.0)];
+        for (size, want) in sizes {
+            let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+            app.run("file.new", json!({})).unwrap();
+            app.ui.story_editor_size = 20.0;
+            app.run("app.preferences", json!({})).unwrap();
+            app.ui.dialog.as_mut().unwrap().fields.insert("storyEditorSize".into(), size);
+            confirm(&mut app).unwrap();
+            let saved = serde_json::to_vec(&app.ui).unwrap();
+            assert_eq!(crate::UiState::from_preferences_json(&saved).unwrap().story_editor_size, want);
+        }
     }
 
     #[test]

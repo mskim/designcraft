@@ -705,3 +705,457 @@ fn pen_click_snaps_to_a_guide() {
     let x = p["anchors"][0]["p"][0].as_f64().unwrap();
     assert!((x - 100.0).abs() < 1e-6, "anchor x {x}");
 }
+
+/// A text frame with overset text (selected), an empty frame and a threaded pair x → y, on page 1.
+struct ThreadDoc {
+    d: Document,
+    l: CanvasLayout,
+    s: Selection,
+    c: Cache,
+    /// The selected text frame.
+    a: ItemId,
+    /// An empty (unassigned) frame.
+    e: ItemId,
+    x: ItemId,
+    y: ItemId,
+}
+
+fn thread_doc() -> ThreadDoc {
+    let mut d = Document::new(&NewDocument { pages: 2, ..Default::default() });
+    let lid = d.default_layer();
+    let (a, _) = d
+        .add_text_frame(SpreadRef::Doc(0), Rect::new(100.0, 100.0, 250.0, 160.0), lid, &"Words flow on. ".repeat(40), ParaFormat::default())
+        .unwrap();
+    let e = ItemId(d.alloc());
+    d.insert_item(SpreadRef::Doc(0), Item::new(e, lid, Shape::Rectangle, shapes::rectangle(Rect::new(100.0, 400.0, 250.0, 500.0))), None).unwrap();
+    let (x, _) = d.add_text_frame(SpreadRef::Doc(0), Rect::new(300.0, 100.0, 450.0, 160.0), lid, "x", ParaFormat::default()).unwrap();
+    let (y, _) = d.add_text_frame(SpreadRef::Doc(0), Rect::new(300.0, 400.0, 450.0, 500.0), lid, "", ParaFormat::default()).unwrap();
+    d.thread(x, y).unwrap();
+    let l = CanvasLayout::new(&d, false);
+    ThreadDoc { s: Selection::items(vec![a]), c: Cache::new(), l, d, a, e, x, y }
+}
+
+impl ThreadDoc {
+    fn cx(&self) -> ToolContext<'_> {
+        ctx(&self.d, &self.s, &self.c, &self.l)
+    }
+    /// Canvas point of a spread-0 point.
+    fn at(&self, x: f64, y: f64) -> Point {
+        self.l.to_canvas(SpreadRef::Doc(0), Point::new(x, y))
+    }
+    fn port(&self, id: ItemId, out: bool) -> Point {
+        thread::port_center(&self.d, &self.l, id, out, 1.0).unwrap()
+    }
+}
+
+fn click(t: &mut Box<dyn Tool>, cx: &ToolContext, p: Point, mods: Mods) -> Vec<Action> {
+    let mut v = t.pointer(cx, &PointerEvent::new(PointerKind::Down, p.x, p.y).with_mods(mods));
+    v.extend(t.pointer(cx, &PointerEvent::new(PointerKind::Up, p.x, p.y).with_mods(mods)));
+    v
+}
+
+fn thread_exec(p: serde_json::Value) -> Vec<Action> {
+    vec![Action::Exec("text.thread".into(), p)]
+}
+
+#[test]
+fn out_port_loads_text_and_a_click_threads_an_empty_frame() {
+    let td = thread_doc();
+    let cx = td.cx();
+    let mut t = create("selection");
+    let port = td.port(td.a, true);
+    // The out port sits on the right edge, 12 px above the bottom-right corner.
+    assert!((port - td.at(250.0, 148.0)).hypot() < 1e-9, "{port:?}");
+    // A press just off the port's centre still loads (any zoom: tolerance is in pixels).
+    assert!(click(&mut t, &cx, port + designcraft_geom::Vec2::new(3.0, -3.0), Mods::default()).is_empty());
+    assert_eq!(t.cursor(&cx, td.at(500.0, 700.0), Mods::default()), Cursor::LoadedText);
+    let over_e = td.at(175.0, 450.0);
+    assert_eq!(t.cursor(&cx, over_e, Mods::default()), Cursor::ThreadLink);
+    // A frame something already threads into can't join; neither can the loaded frame itself.
+    assert_eq!(t.cursor(&cx, td.at(375.0, 450.0), Mods::default()), Cursor::NotAllowed);
+    assert_eq!(t.cursor(&cx, td.at(175.0, 130.0), Mods::default()), Cursor::LoadedText);
+    assert_eq!(click(&mut t, &cx, over_e, Mods::default()), thread_exec(serde_json::json!({"from": td.a.0, "to": td.e.0})));
+    // Unloaded again: the cursor and clicks are back to normal.
+    assert_eq!(t.cursor(&cx, over_e, Mods::default()), Cursor::Arrow);
+}
+
+#[test]
+fn ports_hit_at_any_zoom() {
+    let td = thread_doc();
+    let mut cx = td.cx();
+    cx.zoom = 4.0;
+    let port = thread::port_center(&td.d, &td.l, td.a, false, 4.0).unwrap();
+    assert!((port - td.at(100.0, 100.0 + 14.5 / 4.0)).hypot() < 1e-9);
+    assert_eq!(thread::port_at(&cx, port + designcraft_geom::Vec2::new(1.5, 1.5)), Some((td.a, false)));
+    assert_eq!(thread::port_at(&cx, port + designcraft_geom::Vec2::new(4.0, 0.0)), None, "8 screen px away at 4×");
+}
+
+#[test]
+fn loaded_click_on_empty_page_makes_a_column_frame() {
+    let td = thread_doc();
+    let cx = td.cx();
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.a, true), Mods::default());
+    let col = td.d.spreads[0].pages[0].column_rects()[0];
+    let a = click(&mut t, &cx, td.at(200.0, 600.0), Mods::default());
+    assert_eq!(a, thread_exec(serde_json::json!({"from": td.a.0, "rect": [col.x0, 600.0, col.x1, col.y1], "spread": {"kind": "doc", "index": 0}})));
+}
+
+#[test]
+fn loaded_drag_makes_a_frame_of_that_size_and_shift_autoflows() {
+    let td = thread_doc();
+    let cx = td.cx();
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.a, true), Mods::default());
+    let (p0, p1) = (td.at(320.0, 560.0), td.at(470.0, 700.0));
+    let shift = Mods { shift: true, ..Default::default() };
+    assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Down, p0.x, p0.y).with_mods(shift)).is_empty());
+    assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, p1.x, p1.y).with_mods(shift)).is_empty());
+    assert_eq!(t.overlays(&cx), vec![Overlay::Marquee(Rect::from_points(p0, p1))]);
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, p1.x, p1.y).with_mods(shift));
+    assert_eq!(
+        a,
+        thread_exec(
+            serde_json::json!({"from": td.a.0, "rect": [320.0, 560.0, 470.0, 700.0], "spread": {"kind": "doc", "index": 0}, "autoflow": true})
+        )
+    );
+    assert_eq!(t.cursor(&cx, td.at(500.0, 700.0), Mods::default()), Cursor::Arrow, "autoflow unloads");
+}
+
+#[test]
+fn loaded_drag_snaps_like_frame_drawing() {
+    let td = thread_doc();
+    let cx = ToolContext { snap: SnapView::FACTORY, ..td.cx() };
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.a, true), Mods::default());
+    let col = td.d.spreads[0].pages[0].column_rects()[0];
+    // Press and release a point or two inside the column's edges: both sides snap to them.
+    let (p0, p1) = (td.at(col.x0 + 1.5, 560.0), td.at(col.x1 - 2.0, 650.0));
+    t.pointer(&cx, &PointerEvent::new(PointerKind::Down, p0.x, p0.y));
+    t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, p1.x, p1.y));
+    let Some(Overlay::Marquee(m)) = t.overlays(&cx).first().cloned() else { panic!("no marquee") };
+    assert!((m.x0 - td.at(col.x0, 0.0).x).abs() < 1e-9 && (m.x1 - td.at(col.x1, 0.0).x).abs() < 1e-9, "{m:?}");
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, p1.x, p1.y));
+    let [Action::Exec(id, p)] = a.as_slice() else { panic!("{a:?}") };
+    assert_eq!(id, "text.thread");
+    let r: Vec<f64> = p["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert_eq!((r[0], r[2]), (col.x0, col.x1), "{p}");
+}
+
+#[test]
+fn alt_click_stays_loaded() {
+    let mut td = thread_doc();
+    let original = td.d.clone();
+    let mut t = create("selection");
+    let alt = Mods { alt: true, ..Default::default() };
+    let col = td.d.spreads[0].pages[0].column_rects()[0];
+    let empty = td.at(200.0, 600.0);
+    let new_frame_from =
+        |f: ItemId| thread_exec(serde_json::json!({"from": f.0, "rect": [col.x0, 600.0, col.x1, col.y1], "spread": {"kind": "doc", "index": 0}}));
+    {
+        let cx = td.cx();
+        click(&mut t, &cx, td.port(td.a, true), Mods::default());
+        assert_eq!(click(&mut t, &cx, td.at(175.0, 450.0), alt), thread_exec(serde_json::json!({"from": td.a.0, "to": td.e.0})));
+        assert_eq!(t.cursor(&cx, td.at(500.0, 700.0), Mods::default()), Cursor::LoadedText);
+        // The thread failed (the document is unchanged): still loaded from a.
+        assert_eq!(click(&mut t, &cx, empty, alt), new_frame_from(td.a));
+    }
+    // That click's command ran: the next click threads after the frame it added.
+    let (n, _) =
+        td.d.add_text_frame(SpreadRef::Doc(0), Rect::new(col.x0, 600.0, col.x1, col.y1), td.d.default_layer(), "", ParaFormat::default()).unwrap();
+    td.d.thread(td.a, n).unwrap();
+    {
+        let cx = td.cx();
+        assert_eq!(click(&mut t, &cx, td.at(175.0, 450.0), alt), thread_exec(serde_json::json!({"from": n.0, "to": td.e.0})));
+    }
+    // Undone: back on a, not on a's old neighbour or the frame the undo removed.
+    td.d = original;
+    {
+        let cx = td.cx();
+        assert_eq!(click(&mut t, &cx, empty, Mods::default()), new_frame_from(td.a));
+    }
+    // From x, which threads into y: when threading e in between fails, x stays loaded, not y.
+    let td = ThreadDoc { s: Selection::items(vec![td.x]), ..td };
+    let cx = td.cx();
+    click(&mut t, &cx, td.port(td.x, true), Mods::default());
+    assert_eq!(click(&mut t, &cx, td.at(175.0, 450.0), alt), thread_exec(serde_json::json!({"from": td.x.0, "to": td.e.0})));
+    assert_eq!(click(&mut t, &cx, empty, Mods::default()), new_frame_from(td.x));
+}
+
+#[test]
+fn escape_unloads_and_keeps_the_selection() {
+    let td = thread_doc();
+    let cx = td.cx();
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.a, true), Mods::default());
+    assert_eq!(t.key(&cx, ToolKey::Escape, Mods::default()), vec![Action::Cancel]);
+    assert_eq!(t.cursor(&cx, td.at(500.0, 700.0), Mods::default()), Cursor::Arrow);
+    // An ordinary click on empty space deselects again.
+    let p = td.at(500.0, 700.0);
+    assert_eq!(
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, p.x, p.y)),
+        vec![Action::Exec("selection.set".into(), serde_json::json!({"ids": []}))]
+    );
+}
+
+#[test]
+fn loaded_click_on_the_linked_frame_unthreads() {
+    // x is selected; its out port links to y.
+    let td = thread_doc();
+    let td = ThreadDoc { s: Selection::items(vec![td.x]), ..td };
+    let cx = td.cx();
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.x, true), Mods::default());
+    let over_y = td.at(375.0, 450.0);
+    assert_eq!(t.cursor(&cx, over_y, Mods::default()), Cursor::Unthread);
+    assert_eq!(
+        click(&mut t, &cx, over_y, Mods::default()),
+        vec![Action::Exec("text.unthread".into(), serde_json::json!({"frame": td.x.0, "side": "after"}))]
+    );
+    // From y's in port, x is the frame before.
+    let td = ThreadDoc { s: Selection::items(vec![td.y]), ..td };
+    let cx = td.cx();
+    click(&mut t, &cx, td.port(td.y, false), Mods::default());
+    assert_eq!(
+        click(&mut t, &cx, td.at(375.0, 130.0), Mods::default()),
+        vec![Action::Exec("text.unthread".into(), serde_json::json!({"frame": td.y.0, "side": "before"}))]
+    );
+}
+
+#[test]
+fn in_port_threads_in_front() {
+    let td = thread_doc();
+    let cx = td.cx();
+    let mut t = create("selection");
+    click(&mut t, &cx, td.port(td.a, false), Mods::default());
+    assert_eq!(click(&mut t, &cx, td.at(175.0, 450.0), Mods::default()), thread_exec(serde_json::json!({"from": td.e.0, "to": td.a.0})));
+}
+
+#[test]
+fn double_click_on_a_port_breaks_its_link() {
+    let td = thread_doc();
+    let td = ThreadDoc { s: Selection::items(vec![td.x]), ..td };
+    let cx = td.cx();
+    // A double click sent as such (control channel), and the canvas's second press.
+    let second = |p: Point| [PointerEvent::new(PointerKind::DoubleClick, p.x, p.y), PointerEvent::new(PointerKind::Down, p.x, p.y).with_clicks(2)];
+    let p = td.port(td.x, true);
+    for ev in second(p) {
+        let mut t = create("selection");
+        click(&mut t, &cx, p, Mods::default());
+        let a = t.pointer(&cx, &ev);
+        assert_eq!(a, vec![Action::Exec("text.unthread".into(), serde_json::json!({"frame": td.x.0, "side": "after"}))], "{ev:?}");
+        assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Up, p.x, p.y)).is_empty());
+        assert_eq!(t.cursor(&cx, td.at(500.0, 700.0), Mods::default()), Cursor::Arrow);
+        // The in port of the first frame has no link: nothing to break.
+        let q = td.port(td.x, false);
+        for ev in second(q) {
+            assert!(t.pointer(&cx, &ev).is_empty(), "{ev:?}");
+        }
+    }
+}
+
+#[test]
+fn clicks_in_a_row_edit_and_select_text() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let (fid, _) = d.add_text_frame(SpreadRef::Doc(0), Rect::new(100.0, 100.0, 300.0, 200.0), lid, "Two words", ParaFormat::default()).unwrap();
+    let (s, c, l) = (Selection::default(), Cache::new(), CanvasLayout::new(&d, false));
+    let cx = ctx(&d, &s, &c, &l);
+    let off = l.xf(SpreadRef::Doc(0)).translation();
+    let (x, y) = (150.0 + off.x, 110.0 + off.y);
+    let press = |n: u8| PointerEvent::new(PointerKind::Down, x, y).with_clicks(n);
+    // Selection tool: the second press of a double click edits the text there.
+    let mut t = create("selection");
+    let a = t.pointer(&cx, &press(1));
+    assert!(matches!(&a[0], Action::Exec(id, _) if id == "selection.set"), "{a:?}");
+    t.pointer(&cx, &PointerEvent::new(PointerKind::Up, x, y));
+    let a = t.pointer(&cx, &press(2));
+    assert_eq!(a.first(), Some(&Action::SwitchTool("type".into())));
+    assert!(matches!(&a[1], Action::Exec(id, p) if id == "text.placeCaret" && p["frame"] == fid.0), "{a:?}");
+    // Type tool: word, line, paragraph, then the story.
+    let mut t = create("type");
+    let unit = |a: Vec<Action>| match a.as_slice() {
+        [Action::Exec(id, p)] if id == "text.selectAt" => p["unit"].as_str().map(str::to_string),
+        [Action::Exec(id, _)] if id == "text.placeCaret" => None,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(unit(t.pointer(&cx, &press(1))), None);
+    for (n, want) in [(2, "word"), (3, "line"), (4, "paragraph"), (5, "story"), (9, "story")] {
+        assert_eq!(unit(t.pointer(&cx, &press(n))).as_deref(), Some(want), "{n} clicks");
+    }
+    // A double click sent as such (control channel) selects a word too.
+    assert_eq!(unit(t.pointer(&cx, &PointerEvent::new(PointerKind::DoubleClick, x, y))).as_deref(), Some("word"));
+    // Moving a little while pressed keeps the unit selected.
+    assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, x + 2.0, y)).is_empty());
+}
+
+#[test]
+fn pen_continues_an_open_path_from_either_end_point() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let id = ItemId(d.alloc());
+    let anchors = vec![
+        designcraft_geom::Anchor::corner(Point::new(100.0, 100.0)),
+        designcraft_geom::Anchor {
+            p: Point::new(200.0, 100.0),
+            h_in: Point::new(170.0, 80.0),
+            h_out: Point::new(230.0, 120.0),
+            kind: designcraft_geom::AnchorKind::Smooth,
+        },
+    ];
+    let mut it = Item::new(id, lid, Shape::Path, designcraft_geom::PathData::single(designcraft_geom::SubPath::new(anchors, false)));
+    it.stroke = Stroke::default();
+    d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
+    let (s, c, l) = (Selection::default(), Cache::new(), CanvasLayout::new(&d, false));
+    let cx = ctx(&d, &s, &c, &l);
+    let off = l.xf(SpreadRef::Doc(0)).translation();
+    let at = |x: f64, y: f64| (x + off.x, y + off.y);
+    let ev = |k: PointerKind, (x, y): (f64, f64)| PointerEvent::new(k, x, y);
+    let mut t = create("pen");
+    // The cursor says the end point continues the path; elsewhere it's the plain pen.
+    assert_eq!(t.cursor(&cx, Point::new(at(200.0, 100.0).0, at(200.0, 100.0).1), Mods::default()), Cursor::PenContinue);
+    assert_eq!(t.cursor(&cx, Point::new(at(150.0, 300.0).0, at(150.0, 300.0).1), Mods::default()), Cursor::Pen);
+    // Clicking the last anchor adds nothing yet; the next click appends to that path.
+    assert!(t.pointer(&cx, &ev(PointerKind::Down, at(200.0, 100.0))).is_empty());
+    assert!(t.pointer(&cx, &ev(PointerKind::Up, at(200.0, 100.0))).is_empty(), "a click on the end point changes nothing");
+    t.pointer(&cx, &ev(PointerKind::Down, at(300.0, 200.0)));
+    let a = t.pointer(&cx, &ev(PointerKind::Up, at(300.0, 200.0)));
+    let [Action::Exec(cmd, p)] = a.as_slice() else { panic!("{a:?}") };
+    assert_eq!((cmd.as_str(), p["id"].as_u64(), p["subpath"].as_u64()), ("path.appendAnchor", Some(id.0), Some(0)));
+    assert_eq!((p["anchor"]["p"][0].as_f64(), p["anchor"]["p"][1].as_f64()), (Some(300.0), Some(200.0)));
+    // Clicking the first anchor of the other end closes it.
+    let a = t.pointer(&cx, &ev(PointerKind::Down, at(100.0, 100.0)));
+    assert_eq!(a, vec![Action::Exec("path.close".into(), serde_json::json!({"id": id.0, "subpath": 0}))]);
+    assert!(t.pointer(&cx, &ev(PointerKind::Up, at(100.0, 100.0))).is_empty());
+    // From the first anchor, the path is reversed first; a drag there sets its direction lines.
+    let mut t = create("pen");
+    let a = t.pointer(&cx, &ev(PointerKind::Down, at(100.0, 100.0)));
+    assert_eq!(a, vec![Action::Exec("path.reverse".into(), serde_json::json!({"ids": [id.0], "subpath": 0}))]);
+    t.pointer(&cx, &ev(PointerKind::Drag, at(80.0, 140.0)));
+    let a = t.pointer(&cx, &ev(PointerKind::Up, at(80.0, 140.0)));
+    assert_eq!(
+        a,
+        vec![Action::Exec(
+            "path.setAnchor".into(),
+            serde_json::json!({"id": id.0, "subpath": 0, "anchor": "last", "in": [120.0, 60.0], "out": [80.0, 140.0]})
+        )]
+    );
+    // Closed paths and locked paths aren't continued.
+    let mut d2 = d.clone();
+    d2.item_mut(id).unwrap().locked = true;
+    let cx = ctx(&d2, &s, &c, &l);
+    let t = create("pen");
+    assert_eq!(t.cursor(&cx, Point::new(at(200.0, 100.0).0, at(200.0, 100.0).1), Mods::default()), Cursor::Pen);
+}
+
+#[test]
+fn the_selection_tool_drags_a_path_type_bracket_along_its_path() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let id = ItemId(d.alloc());
+    let line = designcraft_geom::PathData::single(designcraft_geom::SubPath::new(
+        vec![designcraft_geom::Anchor::corner(Point::new(100.0, 300.0)), designcraft_geom::Anchor::corner(Point::new(500.0, 300.0))],
+        false,
+    ));
+    let mut it = Item::new(id, lid, Shape::GraphicLine, line);
+    let sid = designcraft_doc::StoryId(d.alloc());
+    let mut tf = designcraft_doc::TextFrame { story: sid, options: Default::default() };
+    tf.options.path = Some(designcraft_doc::PathType { start: 40.0, end: Some(300.0), ..Default::default() });
+    it.content = designcraft_doc::Content::Text(tf);
+    let mut st = designcraft_doc::Story::with_text(sid, "On the line", Default::default());
+    st.frames = vec![id];
+    d.stories.insert(sid, Arc::new(st));
+    d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
+    let (c, l) = (Cache::new(), CanvasLayout::new(&d, false));
+    let off = l.xf(SpreadRef::Doc(0)).translation();
+    let at = |x: f64, y: f64| Point::new(x + off.x, y + off.y);
+    let ev = |k: PointerKind, p: Point| PointerEvent::new(k, p.x, p.y);
+    // Not selected: no brackets.
+    let none = Selection::default();
+    assert!(create("selection").overlays(&ctx(&d, &none, &c, &l)).is_empty());
+    let s = Selection { items: vec![id], ..Default::default() };
+    let cx = ctx(&d, &s, &c, &l);
+    let mut t = create("selection");
+    // Both brackets drawn across the path at 140 and 400 (a line and a tick each).
+    let o = t.overlays(&cx);
+    let xs: Vec<f64> = o.iter().filter_map(|o| if let Overlay::Line { a, b, .. } = o { (a.x == b.x).then_some(a.x - off.x) } else { None }).collect();
+    assert_eq!(xs, [140.0, 400.0], "{o:?}");
+    assert_eq!(t.cursor(&cx, at(140.0, 300.0), Mods::default()), Cursor::PathBracket);
+    assert_ne!(t.cursor(&cx, at(250.0, 300.0), Mods::default()), Cursor::PathBracket);
+    // Drag the start bracket: its distance along the path follows the pointer, off the path too.
+    assert_eq!(t.pointer(&cx, &ev(PointerKind::Down, at(140.0, 301.0))), vec![Action::Begin("Move Bracket".into())]);
+    let a = t.pointer(&cx, &ev(PointerKind::Drag, at(220.0, 330.0)));
+    let [Action::Preview(cmd, p)] = a.as_slice() else { panic!("{a:?}") };
+    assert_eq!((cmd.as_str(), p["id"].as_u64()), ("type.pathOptions", Some(id.0)));
+    assert!((p["start"].as_f64().unwrap() - 120.0).abs() < 1e-6, "{p}");
+    assert_eq!(t.pointer(&cx, &ev(PointerKind::Up, at(220.0, 330.0))), vec![Action::Commit]);
+    // The end bracket.
+    t.pointer(&cx, &ev(PointerKind::Down, at(400.0, 300.0)));
+    let a = t.pointer(&cx, &ev(PointerKind::Drag, at(450.0, 290.0)));
+    let [Action::Preview(_, p)] = a.as_slice() else { panic!("{a:?}") };
+    assert!((p["end"].as_f64().unwrap() - 350.0).abs() < 1e-6, "{p}");
+}
+
+#[test]
+fn eyedropper_samples_a_placed_image_and_matches_other_objects() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let photo = ItemId(d.alloc());
+    let mut it = Item::new(photo, lid, Shape::Rectangle, shapes::rectangle(Rect::new(100.0, 100.0, 200.0, 200.0)));
+    it.content = designcraft_doc::Content::Graphic(designcraft_doc::Graphic {
+        asset: designcraft_doc::AssetId(1),
+        size: (100.0, 100.0),
+        xf: designcraft_geom::Affine::translate((0.0, 0.0)),
+        auto_fit: Default::default(),
+        fit_align: 4,
+        crop: [0.0; 4],
+    });
+    d.assets.insert(
+        designcraft_doc::AssetId(1),
+        std::sync::Arc::new(designcraft_doc::Asset {
+            id: designcraft_doc::AssetId(1),
+            name: "photo.png".into(),
+            mime: "image/png".into(),
+            link: None,
+            data: std::sync::Arc::new(vec![]),
+            pixels: Some((100, 100)),
+            page: 0,
+        }),
+    );
+    d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
+    // An unfilled text frame over part of the photo lets it show through.
+    d.add_text_frame(SpreadRef::Doc(0), Rect::new(150.0, 150.0, 250.0, 250.0), lid, "x", ParaFormat::default()).unwrap();
+    let swatch = add_rect(&mut d, Rect::new(300.0, 100.0, 350.0, 150.0));
+    d.item_mut(swatch).unwrap().fill.swatch = "[Black]".into();
+    let target = add_rect(&mut d, Rect::new(400.0, 100.0, 450.0, 150.0));
+    // The photo's layer is locked: sampling it still works.
+    d.layers.iter_mut().for_each(|l| l.locked = true);
+    let s = Selection { items: vec![target], ..Default::default() };
+    let (c, l) = (Cache::new(), CanvasLayout::new(&d, false));
+    let off = l.xf(SpreadRef::Doc(0)).translation();
+    let cx = ctx(&d, &s, &c, &l);
+    let mut t = create("eyedropper");
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 120.0 + off.x, 130.0 + off.y));
+    let sample = |x: f64, y: f64| Action::Exec("color.sample".into(), serde_json::json!({"at": [x, y], "spread": {"kind": "doc", "index": 0}}));
+    assert_eq!(a, vec![sample(120.0, 130.0)]);
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 180.0 + off.x, 180.0 + off.y));
+    assert_eq!(a, vec![sample(180.0, 180.0)], "through the text frame");
+    // A filled object is matched as before (here on a locked layer: not reachable, so nothing).
+    assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 320.0 + off.x, 120.0 + off.y)).is_empty());
+    let mut d2 = d.clone();
+    d2.layers.iter_mut().for_each(|l| l.locked = false);
+    let cx = ctx(&d2, &s, &c, &l);
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 320.0 + off.x, 120.0 + off.y));
+    assert_eq!(a, vec![Action::Exec("object.matchAttributes".into(), serde_json::json!({"from": swatch.0}))]);
+    // Vector graphics and missing assets must retain the ordinary attribute-matching path.
+    for mime in ["application/pdf", "application/postscript", "image/svg+xml", "application/octet-stream"] {
+        std::sync::Arc::make_mut(d2.assets.get_mut(&designcraft_doc::AssetId(1)).unwrap()).mime = mime.into();
+        let cx = ctx(&d2, &s, &c, &l);
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 120.0 + off.x, 130.0 + off.y));
+        assert_eq!(a, vec![Action::Exec("object.matchAttributes".into(), serde_json::json!({"from": photo.0}))], "{mime}");
+    }
+    d2.assets.clear();
+    let cx = ctx(&d2, &s, &c, &l);
+    let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 120.0 + off.x, 130.0 + off.y));
+    assert_eq!(a, vec![Action::Exec("object.matchAttributes".into(), serde_json::json!({"from": photo.0}))]);
+}

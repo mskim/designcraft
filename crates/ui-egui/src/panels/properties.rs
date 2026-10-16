@@ -121,6 +121,11 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     section(ui, crate::i18n::tr(&app.ui.language, "Align"), true);
     align_row(app, ui);
     divider(ui);
+    if i.count > 1 {
+        section(ui, crate::i18n::tr(&app.ui.language, "Pathfinder"), true);
+        pathfinder_row(app, ui);
+        divider(ui);
+    }
     if i.is_text && i.count == 1 {
         section(ui, crate::i18n::tr(&app.ui.language, "Text Frame"), true);
         text_frame_section(app, ui);
@@ -460,9 +465,60 @@ fn transform_section(app: &mut DesignApp, ui: &mut Ui, i: &SelInfo) {
         set.insert("ref".into(), json!(rp));
         let _ = app.run("transform.set", Value::Object(set));
     }
+    transform_angles(app, ui, rp);
     if more_options(ui, &app.ui.language).clicked() {
         app.ui.open_panel = Some("info".into());
     }
+}
+
+/// Properties › Transform, below X/Y/W/H as in InDesign: rotation and shear angles beside the
+/// X and Y scales (totals, as Transformations are Totals), then rotate a quarter turn and flip.
+fn transform_angles(app: &mut DesignApp, ui: &mut Ui, rp: u8) {
+    let t = Tokens::get(ui.ctx());
+    let lang = app.ui.language.clone();
+    let tv = app.session.execute("transform.info", &json!({})).ok();
+    let tv_get = |k: &str| tv.as_ref().and_then(|v| v[k].as_f64());
+    ui.add_space(4.0);
+    let b = block(ui, 2.0 * FIELD_H + 4.0);
+    let mut set = serde_json::Map::new();
+    let rows = [
+        [("tool-rotate", "Rotation Angle", "rotation", "°", "p_rot"), ("tool-scale", "Scale X Percentage", "scaleX", "%", "p_sx")],
+        [("tool-shear", "Shear X Angle", "shear", "°", "p_shear"), ("tool-scale", "Scale Y Percentage", "scaleY", "%", "p_sy")],
+    ];
+    for (row, cells) in rows.into_iter().enumerate() {
+        let yy = row as f32 * 25.0;
+        for (col, (icon, tip, key, suffix, id)) in cells.into_iter().enumerate() {
+            let x = if col == 0 { 40.0 } else { 120.0 };
+            let ir = sub(b, x, yy + 2.0, 17.0, 17.0);
+            icons::paint(ui.painter(), ir, icon, t.icon);
+            ui.interact(ir, ui.id().with(id), Sense::hover()).on_hover_text(crate::i18n::tr(&lang, tip));
+            if let Some(v) = place(ui, sub(b, x + 19.0, yy, 54.0, FIELD_H), |ui| widgets::number(ui, id, tv_get(key), suffix, 54.0, 1)) {
+                set.insert(key.into(), json!(v));
+            }
+        }
+    }
+    if !set.is_empty() {
+        set.insert("ref".into(), json!(rp));
+        let _ = app.run("transform.set", Value::Object(set));
+    }
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(36.0);
+        ui.spacing_mut().item_spacing.x = 10.0;
+        for (icon, tip, cmd, params) in [
+            ("rotate-cw", "Rotate 90° Clockwise", "transform.rotate", json!({"angle": -90})),
+            ("rotate-ccw", "Rotate 90° Counterclockwise", "transform.rotate", json!({"angle": 90})),
+            ("flip-h", "Flip Horizontal", "transform.flip", json!({"axis": "horizontal"})),
+            ("flip-v", "Flip Vertical", "transform.flip", json!({"axis": "vertical"})),
+        ] {
+            let label = crate::i18n::tr(&lang, tip);
+            let resp = icon_toggle(ui, icon, false, label);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+            if resp.clicked() {
+                let _ = app.run(cmd, params);
+            }
+        }
+    });
 }
 
 /// A stroke-type preview dropdown (light box with the line style).
@@ -1291,6 +1347,34 @@ pub fn character_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
         crate::rtl::label(ui, c["fill"].as_str().unwrap_or(""));
     });
     ui.horizontal(|ui| {
+        // Bold and Italic pick the family's own styles (style linking).
+        let (weight, italic) = super::fonts(app).traits_of(c["fontFamily"].as_str().unwrap_or_default(), c["fontStyle"].as_str().unwrap_or_default());
+        let tip = |app: &DesignApp, name: &str, id: &str| {
+            let name = crate::i18n::tr(&app.ui.language, name);
+            match crate::menus::shortcut_of(app, id) {
+                Some(sc) => format!("{name} ({})", crate::menus::shortcut_text(&sc)),
+                None => name.to_string(),
+            }
+        };
+        let (bold_tip, italic_tip) = (tip(app, "Bold", "type.bold"), tip(app, "Italic", "type.italic"));
+        if ui
+            .selectable_label(weight >= 650.0, egui::RichText::new("B").strong())
+            .on_hover_ui(|ui| {
+                crate::rtl::label(ui, bold_tip);
+            })
+            .clicked()
+        {
+            let _ = app.run("type.bold", json!({}));
+        }
+        if ui
+            .selectable_label(italic, egui::RichText::new("I").italics())
+            .on_hover_ui(|ui| {
+                crate::rtl::label(ui, italic_tip);
+            })
+            .clicked()
+        {
+            let _ = app.run("type.italic", json!({}));
+        }
         let caps = c["capitalization"].as_str() == Some("allCaps");
         if ui
             .selectable_label(caps, "TT")
@@ -1467,6 +1551,17 @@ pub fn paragraph_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
             }
             ui.end_row();
         }
+        // Drop cap: number of lines and characters.
+        for (label, key, max, id) in [
+            ("Drop Lines", "dropCapLines", designcraft_compose::MAX_DROP_CAP_LINES, "ppdl"),
+            ("Drop Chars", "dropCapChars", designcraft_compose::MAX_DROP_CAP_CHARS, "ppdc"),
+        ] {
+            caption(ui, crate::i18n::tr(&app.ui.language, label));
+            if let Some(v) = number(ui, id, p[key].as_f64(), "", 64.0, 0) {
+                let _ = app.run("type.para", json!({"attrs": {key: (v.max(0.0) as u64).min(max as u64)}}));
+            }
+        }
+        ui.end_row();
     });
     ui.horizontal(|ui| {
         let mut h = p["hyphenate"].as_bool().unwrap_or(true);
@@ -1723,6 +1818,27 @@ pub fn wrap_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
         caption(ui, crate::i18n::tr(&app.ui.language, "Offset"));
         if let Some(v) = measure(ui, "wo", Some(0.0), u, 60.0) {
             let _ = app.run("object.textWrap", json!({"mode": info.as_ref().map(|i| i.wrap).unwrap_or("boundingBox"), "offset": v}));
+        }
+    });
+}
+
+/// The Pathfinder operations, in the order of InDesign's Pathfinder buttons.
+const PATHFINDER: [(&str, &str, &str); 5] = [
+    ("pf-add", "add", "Add"),
+    ("pf-subtract", "subtract", "Subtract"),
+    ("pf-intersect", "intersect", "Intersect"),
+    ("pf-exclude", "exclude", "Exclude Overlap"),
+    ("pf-minus-back", "minusBack", "Minus Back"),
+];
+
+/// Properties › Pathfinder (several objects selected): combine them into one shape.
+fn pathfinder_row(app: &mut DesignApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for (icon, op, tip) in PATHFINDER {
+            if icon_toggle(ui, icon, false, crate::i18n::tr(&app.ui.language, tip)).clicked() {
+                let _ = app.run("object.pathfinder", json!({"op": op}));
+            }
         }
     });
 }
@@ -1991,6 +2107,13 @@ pub fn effects_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
             let _ = app.run("object.opacity", json!({"opacity": (v / 100.0).clamp(0.0, 1.0)}));
         }
     });
+    // The level the settings apply to, with its blend mode and opacity ("Group: Color Dodge 100%").
+    let group = it.is_group();
+    ui.horizontal(|ui| {
+        let level = crate::i18n::tr(&app.ui.language, if group { "Group:" } else { "Object:" });
+        crate::rtl::label(ui, egui::RichText::new(level).font(crate::theme::semibold(12.0)));
+        crate::rtl::label(ui, format!("{} {}%", crate::i18n::tr(&app.ui.language, it.blend.label()), (it.opacity * 100.0).round()));
+    });
     divider(ui);
     let ds = it.effects.drop_shadow.clone();
     let mut on = ds.on;
@@ -2033,6 +2156,20 @@ pub fn effects_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
             ui.end_row();
         });
     }
+    divider(ui);
+    // Groups only, as in InDesign (greyed for other objects).
+    ui.horizontal(|ui| {
+        let mut iso = it.isolate;
+        let label = crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Isolate Blending"));
+        if ui.add_enabled(group, egui::Checkbox::new(&mut iso, label)).changed() {
+            let _ = app.run("object.transparencyGroup", json!({"isolate": iso}));
+        }
+        let mut ko = it.knockout;
+        let label = crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Knockout Group"));
+        if ui.add_enabled(group, egui::Checkbox::new(&mut ko, label)).changed() {
+            let _ = app.run("object.transparencyGroup", json!({"knockout": ko}));
+        }
+    });
 }
 
 pub fn preflight_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
@@ -2209,5 +2346,179 @@ mod tests {
         h.run_steps(4);
         let after = h.state().session.active().unwrap().doc.item(designcraft_doc::ids::ItemId(id)).unwrap().fill.swatch.clone();
         assert_eq!(after, name, "clicking the swatch chip applies it");
+    }
+
+    #[test]
+    fn transform_flips_and_rotates_from_properties() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let id = app.run("frame.create", json!({"rect": [72, 72, 300, 200]})).unwrap()["id"].as_u64().unwrap();
+        app.run("selection.set", json!({"ids": [id]})).unwrap();
+        let mut h = Harness::builder().with_size(vec2(320.0, 1400.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let id = egui::Id::new("test_fonts");
+                if ui.data(|d| d.get_temp::<bool>(id)).is_none() {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    ui.data_mut(|d| d.insert_temp(id, true));
+                    return;
+                }
+                show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let xf = |h: &Harness<'_, DesignApp>| h.state().session.active().unwrap().doc.item(designcraft_doc::ids::ItemId(id)).unwrap().xf;
+        // Flip Horizontal mirrors the frame (a negative determinant); Flip Vertical as well brings it
+        // back to a half turn, as in the tutorial's petal.
+        h.get_by_label("Flip Horizontal").click();
+        h.run_steps(3);
+        assert!(xf(&h).determinant() < 0.0, "{:?}", xf(&h));
+        h.get_by_label("Flip Vertical").click();
+        h.run_steps(3);
+        let c = xf(&h).as_coeffs();
+        assert!((c[0] + 1.0).abs() < 1e-9 && (c[3] + 1.0).abs() < 1e-9, "a half turn: {c:?}");
+        let info = h.state_mut().session.execute("transform.info", &json!({})).unwrap();
+        assert!((info["rotation"].as_f64().unwrap().abs() - 180.0).abs() < 1e-6, "{info}");
+        // A quarter turn clockwise from there.
+        h.get_by_label("Rotate 90° Clockwise").click();
+        h.run_steps(3);
+        let info = h.state_mut().session.execute("transform.info", &json!({})).unwrap();
+        assert!((info["rotation"].as_f64().unwrap() - 90.0).abs() < 1e-6, "{info}");
+        // The angle and scale fields are there.
+        assert!(h.query_by(|n| n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some("90°")).is_some());
+    }
+
+    fn panel(app: DesignApp) -> Harness<'static, DesignApp> {
+        let mut h = Harness::builder().with_size(vec2(320.0, 1400.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let id = egui::Id::new("test_fonts");
+                if ui.data(|d| d.get_temp::<bool>(id)).is_none() {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    ui.data_mut(|d| d.insert_temp(id, true));
+                    return;
+                }
+                show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h
+    }
+
+    #[test]
+    fn several_shapes_show_pathfinder_and_intersect_combines_them() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let a = app.run("frame.create", json!({"rect": [100, 100, 300, 300], "shape": "ellipse"})).unwrap()["id"].clone();
+        let b = app.run("frame.create", json!({"rect": [200, 100, 300, 200]})).unwrap()["id"].clone();
+        // One shape: no Pathfinder section.
+        app.run("selection.set", json!({"ids": [a]})).unwrap();
+        let mut h = panel(app);
+        assert!(h.query_by_label("Pathfinder").is_none());
+        // Two: the section and its five buttons; Intersect leaves one shape, the ellipse's quarter.
+        h.state_mut().run("selection.set", json!({"ids": [a, b]})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Pathfinder").is_some());
+        for op in ["Add", "Subtract", "Intersect", "Exclude Overlap", "Minus Back"] {
+            assert!(h.query_by_label(op).is_some(), "{op}");
+        }
+        h.get_by_label("Intersect").click();
+        h.run_steps(3);
+        let doc = &h.state().session.active().unwrap().doc;
+        let items = &doc.spreads[0].items;
+        assert_eq!(items.len(), 1, "one shape left");
+        let r = items[0].bounds();
+        assert!((r.x0 - 200.0).abs() < 0.5 && (r.y1 - 200.0).abs() < 0.5 && (r.x1 - 300.0).abs() < 0.5, "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod effects_panel_tests {
+    use super::*;
+
+    /// One frame of the Effects panel: the text painted and where.
+    fn frame(app: &mut DesignApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, egui::Rect)> {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 400.0));
+        let time = ctx.input(|i| i.time) + 1.0 / 60.0;
+        let mut out =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() }, |ui| effects_panel(app, ui));
+        out.textures_delta.clear();
+        let mut v = Vec::new();
+        for s in out.shapes {
+            if let egui::Shape::Text(t) = s.shape {
+                v.push((t.galley.job.text.clone(), t.visual_bounding_rect()));
+            }
+        }
+        v
+    }
+
+    fn click(app: &mut DesignApp, ctx: &egui::Context, label: &str) {
+        let labels = frame(app, ctx, vec![]);
+        let pos = labels.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("{label} is painted")).1.center();
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn the_effects_panel_shows_the_level_and_isolate_blending_and_knockout_group_for_groups() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({})).unwrap();
+        let a = app.run("frame.create", json!({"rect": [72, 72, 144, 144]})).unwrap()["id"].as_u64().unwrap();
+        let b = app.run("frame.create", json!({"rect": [100, 100, 200, 200]})).unwrap()["id"].as_u64().unwrap();
+        let g = app.run("object.group", json!({"ids": [a, b]})).unwrap()["id"].as_u64().unwrap();
+        app.run("selection.set", json!({"ids": [g]})).unwrap();
+        app.run("object.opacity", json!({"opacity": 1.0, "blend": "colorDodge"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx, "en");
+        crate::theme::apply(&ctx, &Tokens::for_brightness(crate::theme::Brightness::default()));
+        let texts: Vec<String> = frame(&mut app, &ctx, vec![]).into_iter().map(|(t, _)| t).collect();
+        for expected in ["Group:", "Color Dodge 100%", "Isolate Blending", "Knockout Group"] {
+            assert!(texts.iter().any(|t| t == expected), "{expected} in {texts:?}");
+        }
+        let item = |app: &DesignApp, id: u64| app.session.doc().unwrap().doc.item(designcraft_doc::ItemId(id)).cloned().unwrap();
+        click(&mut app, &ctx, "Isolate Blending");
+        assert!(item(&app, g).isolate);
+        click(&mut app, &ctx, "Knockout Group");
+        assert!(item(&app, g).knockout);
+        // Another object: the level is Object, and the group options are greyed.
+        app.run("selection.set", json!({"ids": [a]})).unwrap();
+        let texts: Vec<String> = frame(&mut app, &ctx, vec![]).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Object:"), "{texts:?}");
+        click(&mut app, &ctx, "Knockout Group");
+        assert!(!item(&app, a).knockout);
+    }
+
+    #[test]
+    fn pasted_into_frames_keep_object_level_and_disable_group_blending() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({})).unwrap();
+        let child = app.run("frame.create", json!({"rect": [80, 80, 120, 120]})).unwrap()["id"].clone();
+        app.run("selection.set", json!({"ids": [child]})).unwrap();
+        app.run("edit.copy", json!({})).unwrap();
+        let container = app.run("frame.create", json!({"rect": [72, 72, 200, 200]})).unwrap()["id"].as_u64().unwrap();
+        app.run("selection.set", json!({"ids": [container]})).unwrap();
+        app.run("edit.pasteInto", json!({})).unwrap();
+        app.run("selection.set", json!({"ids": [container]})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx, "en");
+        crate::theme::apply(&ctx, &Tokens::for_brightness(crate::theme::Brightness::default()));
+        let texts: Vec<String> = frame(&mut app, &ctx, vec![]).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Object:"), "a frame remains an object after Paste Into: {texts:?}");
+        let undo = app.session.doc().unwrap().history.undo.len();
+        click(&mut app, &ctx, "Isolate Blending");
+        click(&mut app, &ctx, "Knockout Group");
+        let st = app.session.doc().unwrap();
+        let it = st.doc.item(designcraft_doc::ItemId(container)).unwrap();
+        assert!(it.has_nested_items());
+        assert!(!it.isolate && !it.knockout, "group-only options stay disabled for a frame holding content");
+        assert_eq!(st.history.undo.len(), undo, "disabled controls do not create undo steps");
     }
 }

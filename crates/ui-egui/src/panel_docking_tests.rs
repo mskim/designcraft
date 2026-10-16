@@ -597,3 +597,28 @@ fn capture_legacy_panel_menu_visual_fixture() {
     assert_eq!(serde_json::to_value(&h.state().session.active().unwrap().doc).unwrap(), doc);
     h.render().unwrap().save(directory.join("designcraft-legacy-last-target-selected-dark-ar.png")).unwrap();
 }
+
+#[test]
+fn legacy_dock_menu_button_opens_the_active_panel_menu() {
+    let mut app = app();
+    app.run("file.new", json!({})).unwrap();
+    app.ui.dock_tab = "pages".into();
+    let pages = app.session.active().unwrap().doc.page_count();
+    let mut h = harness(app, vec2(1280.0, 800.0));
+    assert!(h.state().ui.docking.is_none());
+    let tab = h.query_all_by_label("Pages").find(|node| node.rect().height() <= 45.0).unwrap().rect();
+    let dock = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("dock")).unwrap().outer_rect;
+    let at = egui::pos2(dock.right() - 15.0, tab.center().y);
+    h.event(Event::PointerMoved(at));
+    h.run_steps(1);
+    for pressed in [true, false] {
+        h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    assert!(egui::Popup::is_any_open(&h.ctx), "the three-line button must open a menu");
+    h.get_by_label("Insert Page After").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.active().unwrap().doc.page_count(), pages + 1);
+    assert!(!egui::Popup::is_any_open(&h.ctx));
+}

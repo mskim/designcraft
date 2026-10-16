@@ -9,7 +9,8 @@
 //!
 //! **Script text** ([`parse`]): a JSON array of steps, JSON lines (`{"command": …, "params": …}`),
 //! or compact lines `command.id {json}` / `command.id={json}` / `command.id`; blank lines and
-//! lines starting with `#` or `//` are ignored.
+//! lines starting with `#` or `//` are ignored. A leading byte order mark and CRLF line endings are
+//! accepted.
 
 use serde_json::{Value, json};
 
@@ -22,7 +23,9 @@ pub struct Step {
 
 /// Parse script text (see the module docs).
 pub fn parse(text: &str) -> Result<Vec<Step>, String> {
-    let t = text.trim();
+    // Windows tools save "UTF-8 with BOM"; `trim` keeps U+FEFF, which then became part of the
+    // first command id.
+    let t = text.trim_start_matches('\u{feff}').trim();
     if t.starts_with('[') {
         let v: Value = serde_json::from_str(t).map_err(|e| format!("script: {e}"))?;
         return v
@@ -172,6 +175,17 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert!(parse("frame.create {bad").unwrap_err().contains("line 1"));
+    }
+
+    /// Windows editors and PowerShell 5.1 save "UTF-8 with BOM" with CRLF line endings; the BOM
+    /// became part of the first command id (#654).
+    #[test]
+    fn a_leading_bom_and_crlf_parse_like_plain_text() {
+        let plain = "file.new {\"width\": 100}\nframe.create {\"rect\": [0, 0, 10, 10]}\n";
+        let windows = format!("\u{feff}{}", plain.replace('\n', "\r\n"));
+        assert_eq!(parse(&windows).unwrap(), parse(plain).unwrap());
+        let array = r#"[{"command": "file.new"}]"#;
+        assert_eq!(parse(&format!("\u{feff}{array}")).unwrap(), parse(array).unwrap());
     }
 
     #[test]

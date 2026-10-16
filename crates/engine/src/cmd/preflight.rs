@@ -5,6 +5,7 @@
 use designcraft_compose::ComposedStory;
 use designcraft_doc::{Content, Document, Intent, Item, SpreadRef};
 use designcraft_fonts::FaceRef;
+use designcraft_geom::Affine;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -29,10 +30,12 @@ pub fn specs() -> Vec<CommandSpec> {
         "{minPpi?: 150} → issues [{severity, kind, message, item?, page?}]", has_doc, run)]
 }
 
-fn page_of(d: &Document, sr: SpreadRef, it: &Item) -> Option<usize> {
+fn page_of(d: &Document, sr: SpreadRef, it: &Item, parent: Affine) -> Option<usize> {
     let SpreadRef::Doc(si) = sr else { return None };
     let sp = d.spreads.get(si)?;
-    Some(d.first_page_of_spread(si) + sp.page_at_x(it.bounds().center().x).unwrap_or(0))
+    // Item bounds include its own transform; ancestors bring the frame into spread space.
+    let bounds = parent.transform_rect_bbox(it.bounds());
+    Some(d.first_page_of_spread(si) + sp.page_at_x(bounds.center().x).unwrap_or(0))
 }
 
 /// Characters a missing-glyph report names before "and N more".
@@ -85,7 +88,7 @@ pub fn check(s: &Session, min_ppi: f64) -> Vec<Issue> {
         missing_glyphs(&cs, &story.text, 0, &mut missing);
         if cs.is_overset() {
             let last = story.frames.last().copied();
-            let page = last.and_then(|f| d.find(f).zip(d.item(f))).and_then(|(loc, it)| page_of(d, loc.spread, it));
+            let page = last.and_then(|f| d.find(f).zip(d.item(f))).and_then(|(loc, it)| page_of(d, loc.spread, it, Affine::IDENTITY));
             let n = story.text[cs.overset_at.unwrap_or(0).min(story.len())..].chars().count();
             out.push(Issue { severity: "error", kind: "overset", message: format!("Overset text: {n} characters"), item: last.map(|i| i.0), page });
         }
@@ -161,48 +164,52 @@ pub fn check(s: &Session, min_ppi: f64) -> Vec<Issue> {
             page: None,
         });
     }
-    // Items.
+    // Carry the ancestor transform in the same order as rendering, retaining pre-order.
     for (si, sp) in d.spreads.iter().enumerate() {
-        for top in &sp.items {
-            top.walk(&mut |it| {
-                let page = page_of(d, SpreadRef::Doc(si), it);
-                match &it.content {
-                    Content::Graphic(g) => match d.assets.get(&g.asset) {
-                        None => {
-                            out.push(Issue { severity: "error", kind: "missingLink", message: "Missing graphic".into(), item: Some(it.id.0), page })
-                        }
-                        Some(a) if a.data.is_empty() => out.push(Issue {
-                            severity: "error",
-                            kind: "missingLink",
-                            message: format!("Missing link: {}", a.link.as_deref().unwrap_or(&a.name)),
-                            item: Some(it.id.0),
-                            page,
-                        }),
-                        Some(a) => {
-                            // Effective ppi: pixels per inch at the placed size. Placed PDF and
-                            // SVG pages export as vectors; their `pixels` is only the preview's.
-                            let vector = designcraft_images::is_pdf(&a.data) || designcraft_images::is_svg(&a.data);
-                            if let Some((pw, _)) = a.pixels.filter(|_| !vector) {
-                                let placed_w = (g.xf * it.xf).as_coeffs()[0].hypot((g.xf * it.xf).as_coeffs()[1]) * g.size.0;
-                                let ppi = pw as f64 / (placed_w / 72.0).max(1e-6);
-                                if d.settings.intent == Intent::Print && ppi < min_ppi {
-                                    out.push(Issue {
-                                        severity: "warning",
-                                        kind: "lowResolution",
-                                        message: format!("{}: effective {ppi:.0} ppi (< {min_ppi:.0})", a.name),
-                                        item: Some(it.id.0),
-                                        page,
-                                    });
-                                }
+        let mut pending: Vec<_> = sp.items.iter().rev().map(|it| (it.as_ref(), Affine::IDENTITY)).collect();
+        while let Some((it, parent)) = pending.pop() {
+            let xf = parent * it.xf;
+            pending.extend(it.children().iter().rev().map(|child| (child.as_ref(), xf)));
+            let page = page_of(d, SpreadRef::Doc(si), it, parent);
+            match &it.content {
+                Content::Graphic(g) => match d.assets.get(&g.asset) {
+                    None => out.push(Issue { severity: "error", kind: "missingLink", message: "Missing graphic".into(), item: Some(it.id.0), page }),
+                    Some(a) if a.data.is_empty() => out.push(Issue {
+                        severity: "error",
+                        kind: "missingLink",
+                        message: format!("Missing link: {}", a.link.as_deref().unwrap_or(&a.name)),
+                        item: Some(it.id.0),
+                        page,
+                    }),
+                    Some(a) => {
+                        // Placed PDF and SVG pages export as vectors; `pixels` is only the preview's.
+                        let vector = designcraft_images::is_pdf(&a.data) || designcraft_images::is_svg(&a.data);
+                        if let Some((pw, ph)) = a.pixels.filter(|_| !vector) {
+                            // Measure each image axis in points, not its rotated bounding box or
+                            // cropped frame. Either axis can fall below the minimum resolution.
+                            let [xx, yx, xy, yy, _, _] = (xf * g.xf).as_coeffs();
+                            let placed_w = xx.hypot(yx) * g.size.0;
+                            let placed_h = xy.hypot(yy) * g.size.1;
+                            let ppi_x = pw as f64 / (placed_w / 72.0).max(1e-6);
+                            let ppi_y = ph as f64 / (placed_h / 72.0).max(1e-6);
+                            let ppi = ppi_x.min(ppi_y);
+                            if d.settings.intent == Intent::Print && ppi < min_ppi {
+                                out.push(Issue {
+                                    severity: "warning",
+                                    kind: "lowResolution",
+                                    message: format!("{}: effective {ppi:.0} ppi (< {min_ppi:.0})", a.name),
+                                    item: Some(it.id.0),
+                                    page,
+                                });
                             }
                         }
-                    },
-                    Content::Text(tf) if d.story(tf.story).is_some_and(|s| s.is_empty()) => {
-                        out.push(Issue { severity: "warning", kind: "emptyText", message: "Empty text frame".into(), item: Some(it.id.0), page });
                     }
-                    _ => {}
+                },
+                Content::Text(tf) if d.story(tf.story).is_some_and(|s| s.is_empty()) => {
+                    out.push(Issue { severity: "warning", kind: "emptyText", message: "Empty text frame".into(), item: Some(it.id.0), page });
                 }
-            });
+                _ => {}
+            }
         }
     }
     // RGB swatches in use in a print document.

@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Frame",
             [],
             None,
-            "{spread?, rect: [x0,y0,x1,y1] (spread coords), shape?: rectangle|ellipse|polygon, content?: graphic|text|unassigned, sides?: 6, text?: string, caret?: bool, vertical?: bool (text: a new vertical story)}",
+            "{spread?: index | {kind: doc|parent, index} (a parent spread: index into `parents` of document.inspect), rect: [x0,y0,x1,y1] (spread coords), shape?: rectangle|ellipse|polygon, content?: graphic|text|unassigned, sides?: 6, text?: string, caret?: bool, vertical?: bool (text: a new vertical story)}",
             has_doc,
             frame_create
         ),
@@ -185,6 +185,24 @@ pub fn specs() -> Vec<CommandSpec> {
             let tint = f64_or(p, "tint", 1.0) as f32;
             set_flag(s, p, move |i| i.fill = Fill { swatch: sw.clone(), tint, ..i.fill.clone() }, false)
         }),
+        cmd!(
+            "object.swapFillStroke",
+            "Swap Fill and Stroke",
+            [],
+            None,
+            "{ids?} — each object's fill and stroke colours (and tints) trade places; locked objects stay as they are",
+            has_editable_selection,
+            |s, p| edit_unlocked(s, p, swap_fill_stroke)
+        ),
+        cmd!(
+            "object.defaultFillStroke",
+            "Default Fill and Stroke",
+            [],
+            None,
+            "{ids?} — no fill and a black stroke; locked objects stay as they are",
+            has_editable_selection,
+            |s, p| edit_unlocked(s, p, default_fill_stroke)
+        ),
         cmd!(
             "object.stroke",
             "Stroke",
@@ -514,7 +532,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Frame Options…",
             ["Object"],
             Some("Cmd+B"),
-            "{columns?, gutter?, inset?: number|[t,l,b,r] (null keeps that side), verticalJustification?: top|center|bottom|justify, firstBaseline?, autoSize?, ignoreWrap?, balanceColumns?, columnRule?: bool, columnRuleWeight? (pt), columnRuleColor? (swatch name), columnRuleTint? (0..1), columnRuleOffset? (pt, horizontal), columnRuleTopInset? (pt), columnRuleBottomInset? (pt), vertical?: bool (sets the story direction of the frames' stories, as Type ▸ Story Direction), ids?}",
+            "{columns?, gutter?, inset?: number|[t,l,b,r] (null keeps that side), verticalJustification?: top|center|bottom|justify, firstBaseline?: ascent|capHeight|leading|xHeight|emboxHeight|fixed, autoSize?, ignoreWrap?, balanceColumns?, columnRule?: bool, columnRuleWeight? (pt), columnRuleColor? (swatch name), columnRuleTint? (0..1), columnRuleOffset? (pt, horizontal), columnRuleTopInset? (pt), columnRuleBottomInset? (pt), vertical?: bool (sets the story direction of the frames' stories, as Type ▸ Story Direction), ids?}",
             has_selection,
             text_frame_options
         ),
@@ -595,8 +613,34 @@ pub fn specs() -> Vec<CommandSpec> {
             step_and_repeat
         ),
         cmd!("path.create", "Create Path", [], None, "{spread?, anchors: [{p:[x,y], in?:[x,y], out?:[x,y]}], closed?: bool}", has_doc, path_create),
-        cmd!("path.appendAnchor", "Add Anchor", [], None, "{id, anchor: {p, in?, out?}} (spread coords)", has_doc, path_append),
-        cmd!("path.close", "Close Path", ["Object", "Paths"], None, "{id}", has_doc, path_close),
+        cmd!(
+            "path.appendAnchor",
+            "Add Anchor",
+            [],
+            None,
+            "{id, anchor: {p, in?, out?} (spread coords), subpath?: index (default the last)} — after the subpath's last anchor",
+            has_doc,
+            path_append
+        ),
+        cmd!(
+            "path.setAnchor",
+            "Set Anchor",
+            [],
+            None,
+            "{id, subpath?: index (default the last), anchor: index|\"first\"|\"last\", p?, in?, out? (spread coords)} — moves an anchor or its direction lines; with both lines given and collinear it becomes smooth",
+            has_doc,
+            path_set_anchor
+        ),
+        cmd!(
+            "path.reverse",
+            "Reverse Path",
+            ["Object", "Paths"],
+            None,
+            "{ids?, subpath?: index (only that subpath of the first target)} — the anchors run the other way (the end point becomes the start)",
+            has_selection,
+            path_reverse
+        ),
+        cmd!("path.close", "Close Path", ["Object", "Paths"], None, "{id, subpath?: index (default every subpath)}", has_doc, path_close),
         cmd!("path.moveAnchors", "Move Anchors", [], None, "{id, anchors: [[subpath, index]], dx, dy, handle?: in|out}", has_doc, path_move_anchors),
         cmd!(
             "object.align",
@@ -828,7 +872,7 @@ fn frame_create(s: &mut Session, p: &Value) -> Result<Value> {
     let rect = rect_param(p, "rect").ok_or_else(|| bad("frame.create", "missing rect"))?;
     let shape = str_param(p, "shape").unwrap_or("rectangle");
     let content = str_param(p, "content").unwrap_or("graphic");
-    let sr = spread_param(p, "spread");
+    let sr = spread_param(p, "frame.create")?;
     let lid = s.doc()?.active_layer;
     let text = super::text_param(p, "text");
     let caret = bool_or(p, "caret", content == "text");
@@ -891,7 +935,7 @@ pub(crate) fn polygon_in(r: Rect, sides: u32, inset: f64) -> designcraft_geom::P
 fn line_create(s: &mut Session, p: &Value) -> Result<Value> {
     let a = point_param(p, "a").ok_or_else(|| bad("line.create", "missing a"))?;
     let b = point_param(p, "b").ok_or_else(|| bad("line.create", "missing b"))?;
-    let sr = spread_param(p, "spread");
+    let sr = spread_param(p, "line.create")?;
     let lid = s.doc()?.active_layer;
     s.edit(|d, sel| {
         let id = ItemId(d.alloc());
@@ -1318,6 +1362,43 @@ fn arrange(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = targets(s, p)?;
     let to = str_param(p, "to").unwrap_or("front").to_string();
     s.edit(|d, _| {
+        if matches!(to.as_str(), "forward" | "backward") {
+            let selected: HashSet<ItemId> = ids.iter().copied().collect();
+            let mut positions: Vec<_> = selected
+                .iter()
+                .filter_map(|id| {
+                    let loc = d.find(*id)?;
+                    match loc.path.as_slice() {
+                        [i] => Some((loc.spread, *i)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            // Move the leading selected items first, independently of selection/click order.
+            // Swapping only with unselected siblings leaves the other selected indices valid.
+            positions.sort_by_key(|(_, i)| *i);
+            let forward = to == "forward";
+            if forward {
+                positions.reverse();
+            }
+            for (spread, i) in positions {
+                let Some(sp) = d.spread_mut(spread) else { continue };
+                let Some(it) = sp.items.get(i) else { continue };
+                let layer = it.layer;
+                let sibling = if forward {
+                    sp.items.iter().enumerate().skip(i.saturating_add(1)).find(|(_, it)| it.layer == layer)
+                } else {
+                    sp.items.iter().enumerate().take(i).rev().find(|(_, it)| it.layer == layer)
+                };
+                if let Some((j, it)) = sibling
+                    && !selected.contains(&it.id)
+                {
+                    // Keep every other layer's slots and relative stacking order untouched.
+                    sp.items.swap(i, j);
+                }
+            }
+            return ok();
+        }
         for id in &ids {
             let Some(loc) = d.find(*id) else { continue };
             if loc.path.len() != 1 {
@@ -1330,7 +1411,6 @@ fn arrange(s: &mut Session, p: &Value) -> Result<Value> {
             let j = match to.as_str() {
                 "front" => n - 1,
                 "back" => 0,
-                "forward" => (i + 1).min(n - 1),
                 _ => i.saturating_sub(1),
             };
             sp.items.insert(j, it);
@@ -1402,6 +1482,60 @@ fn set_flag(s: &mut Session, p: &Value, f: impl Fn(&mut Item), deselect: bool) -
         }
         Ok(json!({"changed": ids.len()}))
     })
+}
+
+/// An object a colour command may change: neither it nor its layer is locked.
+fn unlocked(d: &Document, it: &Item) -> bool {
+    !it.locked && d.layer(it.layer).is_none_or(|l| !l.locked)
+}
+
+fn has_editable_selection(s: &Session) -> std::result::Result<(), String> {
+    has_selection(s)?;
+    let st = s.active().ok_or_else(|| super::NOTHING_SELECTED.to_string())?;
+    if st.selection.items.iter().any(|id| st.doc.item(*id).is_some_and(|it| unlocked(&st.doc, it))) {
+        Ok(())
+    } else {
+        Err("the selected objects are locked".into())
+    }
+}
+
+/// Runs `f` on each unlocked target in one edit (one undo step).
+fn edit_unlocked(s: &mut Session, p: &Value, f: impl Fn(&mut Item)) -> Result<Value> {
+    let ids = targets(s, p)?;
+    s.edit(|d, _| {
+        let mut changed = 0;
+        for id in &ids {
+            if d.item(*id).is_some_and(|it| unlocked(d, it))
+                && let Some(it) = d.item_mut(*id)
+            {
+                f(it);
+                changed += 1;
+            }
+        }
+        Ok(json!({"changed": changed}))
+    })
+}
+
+/// A stroke that gets a colour needs a weight to show it.
+fn visible_weight(st: &mut Stroke) {
+    if st.swatch != designcraft_color::swatch::NONE && st.weight <= 0.0 {
+        st.weight = Stroke::default().weight;
+    }
+}
+
+fn swap_fill_stroke(it: &mut Item) {
+    let fill = std::mem::take(&mut it.fill);
+    it.fill = Fill { swatch: std::mem::take(&mut it.stroke.swatch), tint: it.stroke.tint, ..fill.clone() };
+    it.stroke.swatch = fill.swatch;
+    it.stroke.tint = fill.tint;
+    visible_weight(&mut it.stroke);
+}
+
+fn default_fill_stroke(it: &mut Item) {
+    it.fill = Fill { swatch: designcraft_color::swatch::NONE.into(), tint: 1.0, ..it.fill.clone() };
+    it.stroke.swatch = designcraft_color::swatch::BLACK.into();
+    it.stroke.tint = 1.0;
+    visible_weight(&mut it.stroke);
 }
 
 fn all_flag(s: &mut Session, f: impl Fn(&mut Item)) -> Result<Value> {
@@ -1592,7 +1726,7 @@ fn gap_move(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .and_then(|a| Some(Point::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?)))
         .ok_or_else(|| bad(ID, "missing at"))?;
-    let sr = spread_param(p, "spread");
+    let sr = spread_param(p, ID)?;
     let (vertical, a, z, before, after) = find_gap(&s.doc()?.doc, sr, at).ok_or_else(|| bad(ID, "no gap there"))?;
     // `delta` along the gap's axis, or a drag (dx, dy) of which the axis part counts.
     let delta =
@@ -1887,6 +2021,10 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
         for ((id, r), t) in items.iter().zip(targets) {
             let delta = t - lo(r);
             if let Some(it) = d.item_mut(*id) {
+                // Keep locked items in the spacing calculation, as align does for its reference.
+                if it.locked {
+                    continue;
+                }
                 let v = if horizontal { Vec2::new(delta, 0.0) } else { Vec2::new(0.0, delta) };
                 it.xf = Affine::translate(v) * it.xf;
             }
@@ -1919,7 +2057,7 @@ fn path_create(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("path.create", "a path needs at least two anchors"));
     }
     let closed = bool_or(p, "closed", false);
-    let sr = spread_param(p, "spread");
+    let sr = spread_param(p, "path.create")?;
     let lid = s.doc()?.active_layer;
     s.edit(|d, sel| {
         let id = ItemId(d.alloc());
@@ -1935,11 +2073,20 @@ fn path_create(s: &mut Session, p: &Value) -> Result<Value> {
 fn path_append(s: &mut Session, p: &Value) -> Result<Value> {
     let id = super::id_param(p, "id").ok_or_else(|| bad("path.appendAnchor", "missing id"))?;
     let a = p.get("anchor").and_then(anchor_from).ok_or_else(|| bad("path.appendAnchor", "missing anchor"))?;
+    let subpath = p.get("subpath").and_then(Value::as_u64);
     s.edit(|d, _| {
         let loc = d.find(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
         let inv = (d.parent_xf(&loc) * d.item_at(&loc).map(|i| i.xf).unwrap_or_default()).inverse();
         let it = d.item_mut(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
-        let sp = it.path.subpaths.last_mut().ok_or_else(|| bad("path.appendAnchor", "empty path"))?;
+        let sp = match subpath {
+            Some(i) => {
+                usize::try_from(i).ok().and_then(|i| it.path.subpaths.get_mut(i)).ok_or_else(|| bad("path.appendAnchor", "no such subpath"))?
+            }
+            None => it.path.subpaths.last_mut().ok_or_else(|| bad("path.appendAnchor", "empty path"))?,
+        };
+        if sp.closed {
+            return Err(bad("path.appendAnchor", "the subpath is closed"));
+        }
         sp.anchors.push(a.transform(inv));
         if it.shape == Shape::GraphicLine {
             it.shape = Shape::Path;
@@ -1948,12 +2095,103 @@ fn path_append(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn path_set_anchor(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "path.setAnchor";
+    let id = super::id_param(p, "id").ok_or_else(|| bad(ID, "missing id"))?;
+    let pt = |k: &str| -> Option<Point> {
+        let a = p.get(k)?.as_array()?;
+        let q = Point::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+        (q.x.is_finite() && q.y.is_finite()).then_some(q)
+    };
+    let (new_p, new_in, new_out) = (pt("p"), pt("in"), pt("out"));
+    if new_p.is_none() && new_in.is_none() && new_out.is_none() {
+        return Err(bad(ID, "give p, in or out"));
+    }
+    let subpath = p.get("subpath").and_then(Value::as_u64);
+    let which = p.get("anchor").cloned().unwrap_or(Value::Null);
+    s.edit(|d, _| {
+        let loc = d.find(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
+        let inv = (d.parent_xf(&loc) * d.item_at(&loc).map(|i| i.xf).unwrap_or_default()).inverse();
+        let it = d.item_mut(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
+        if it.locked {
+            return Err(bad(ID, "the path is locked"));
+        }
+        let sp = match subpath {
+            Some(i) => usize::try_from(i).ok().and_then(|i| it.path.subpaths.get_mut(i)),
+            None => it.path.subpaths.last_mut(),
+        }
+        .ok_or_else(|| bad(ID, "no such subpath"))?;
+        let n = sp.anchors.len();
+        let ai = match &which {
+            Value::String(w) if w == "first" => 0,
+            Value::String(w) if w == "last" => n.saturating_sub(1),
+            v => v.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad(ID, "anchor: an index, \"first\" or \"last\""))?,
+        };
+        let a = sp.anchors.get_mut(ai).ok_or_else(|| bad(ID, "no such anchor"))?;
+        if let Some(q) = new_p {
+            let v = inv * q - a.p;
+            a.p += v;
+            a.h_in += v;
+            a.h_out += v;
+        }
+        if let Some(q) = new_in {
+            a.h_in = inv * q;
+        }
+        if let Some(q) = new_out {
+            a.h_out = inv * q;
+        }
+        if new_in.is_some() && new_out.is_some() {
+            let (i, o) = (a.h_in - a.p, a.h_out - a.p);
+            let collinear = (i.x * o.y - i.y * o.x).abs() <= 1e-6 * i.hypot().max(1.0) * o.hypot().max(1.0) && i.dot(o) <= 0.0;
+            a.kind = if collinear { designcraft_geom::AnchorKind::Smooth } else { designcraft_geom::AnchorKind::Corner };
+        }
+        ok()
+    })
+}
+
+fn path_reverse(s: &mut Session, p: &Value) -> Result<Value> {
+    let ids = targets(s, p)?;
+    let only = p.get("subpath").and_then(Value::as_u64).map(|i| usize::try_from(i).unwrap_or(usize::MAX));
+    if let (Some(i), Some(id)) = (only, ids.first())
+        && s.doc()?.doc.item(*id).is_none_or(|it| it.path.subpaths.get(i).is_none())
+    {
+        return Err(bad("path.reverse", "no such subpath"));
+    }
+    let ids = if only.is_some() { ids.into_iter().take(1).collect() } else { ids };
+    s.edit(|d, _| {
+        let mut reversed = 0;
+        for id in &ids {
+            let Some(it) = d.item_mut(*id) else { continue };
+            if it.locked || it.is_group() {
+                continue;
+            }
+            for (i, sp) in it.path.subpaths.iter_mut().enumerate() {
+                if only.is_some_and(|o| o != i) {
+                    continue;
+                }
+                sp.anchors.reverse();
+                for a in &mut sp.anchors {
+                    std::mem::swap(&mut a.h_in, &mut a.h_out);
+                }
+            }
+            reversed += 1;
+        }
+        Ok(json!({"reversed": reversed}))
+    })
+}
+
 fn path_close(s: &mut Session, p: &Value) -> Result<Value> {
     let id = super::id_param(p, "id").ok_or_else(|| bad("path.close", "missing id"))?;
+    let only = p.get("subpath").and_then(Value::as_u64).map(|i| usize::try_from(i).unwrap_or(usize::MAX));
     s.edit(|d, _| {
         let it = d.item_mut(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
-        for sp in &mut it.path.subpaths {
-            sp.closed = true;
+        if only.is_some_and(|i| i >= it.path.subpaths.len()) {
+            return Err(bad("path.close", "no such subpath"));
+        }
+        for (i, sp) in it.path.subpaths.iter_mut().enumerate() {
+            if only.is_none_or(|o| o == i) {
+                sp.closed = true;
+            }
         }
         if it.shape == Shape::GraphicLine {
             it.shape = Shape::Path;
@@ -2122,8 +2360,188 @@ fn step_and_repeat(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(test)]
+mod arrange_tests {
+    use super::*;
+
+    fn fixture<const N: usize>(layers: [usize; N]) -> (Session, [ItemId; N]) {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1, "facingPages": false})).unwrap();
+        let first = s.doc().unwrap().doc.default_layer().0;
+        let second = s.execute("layer.new", &json!({"name": "Other layer"})).unwrap()["id"].as_u64().unwrap();
+        let layer_ids = [first, second];
+        let mut ids = [ItemId(0); N];
+        for (id, layer) in ids.iter_mut().zip(layers) {
+            // Overlap objects within each layer; separate layers spatially for hit testing.
+            let x = if layer == 0 { 0 } else { 200 };
+            *id = ItemId(s.execute("frame.create", &json!({"rect": [x, 0, x + 100, 100]})).unwrap()["id"].as_u64().unwrap());
+            s.execute("object.setLayer", &json!({"ids": [id.0], "layer": layer_ids[layer]})).unwrap();
+        }
+        (s, ids)
+    }
+
+    fn stack(s: &Session) -> Vec<ItemId> {
+        s.doc().unwrap().doc.spreads[0].items.iter().map(|it| it.id).collect()
+    }
+
+    fn snapshot(s: &Session) -> Value {
+        let st = s.doc().unwrap();
+        json!({"document": &*st.doc, "selection": &st.selection})
+    }
+
+    fn assert_items_unchanged(before: &Document, after: &Document) {
+        assert_eq!(serde_json::to_value(&before.layers).unwrap(), serde_json::to_value(&after.layers).unwrap());
+        for it in &before.spreads[0].items {
+            assert_eq!(serde_json::to_value(it).unwrap(), serde_json::to_value(after.item(it.id).unwrap()).unwrap());
+        }
+    }
+
+    #[test]
+    fn arrange_steps_past_other_layers_change_hit_order_and_undo() {
+        for direction in ["forward", "backward"] {
+            let (mut s, [a, x, y, b]) = fixture([0, 1, 1, 0]);
+            let selected = if direction == "forward" { a } else { b };
+            s.execute("selection.set", &json!({"ids": [selected.0]})).unwrap();
+            let before = snapshot(&s);
+            let doc = s.doc().unwrap().doc.clone();
+            let undo_len = s.doc().unwrap().history.undo.len();
+            let hit = |s: &Session| s.doc().unwrap().doc.hit_item(0, Point::new(50.0, 50.0), 0.0);
+            assert_eq!(hit(&s), Some(b));
+
+            s.execute("object.arrange", &json!({"to": direction})).unwrap();
+            assert_eq!(stack(&s), [b, x, y, a], "{direction}");
+            assert_eq!(hit(&s), Some(a), "the visible topmost object must change");
+            assert_items_unchanged(&doc, &s.doc().unwrap().doc);
+            assert_eq!(s.doc().unwrap().history.undo.len(), undo_len + 1);
+            assert_eq!(s.doc().unwrap().selection.items, [selected]);
+            let after = snapshot(&s);
+
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(snapshot(&s), before);
+            assert_eq!(hit(&s), Some(b));
+            s.execute("edit.redo", &json!({})).unwrap();
+            assert_eq!(snapshot(&s), after);
+            assert_eq!(hit(&s), Some(a));
+        }
+    }
+
+    #[test]
+    fn arrange_multiple_selection_preserves_order_independent_of_input_order() {
+        // Layer 0: a, b, c, d. Layer 1: x, y. Arrays name the original stack indices.
+        let cases = [
+            ("forward", [0, 2], [4, 1, 0, 3, 2, 5]),  // a,b cross c as a block
+            ("backward", [2, 4], [2, 1, 4, 3, 0, 5]), // b,c cross a as a block
+            ("forward", [0, 4], [2, 1, 0, 3, 5, 4]),  // separate selected blocks
+            ("backward", [2, 5], [2, 1, 0, 3, 5, 4]),
+            ("forward", [4, 5], [0, 1, 2, 3, 4, 5]),  // front block is already at its endpoint
+            ("backward", [0, 2], [0, 1, 2, 3, 4, 5]), // back block is already at its endpoint
+        ];
+        for (direction, selected, expected) in cases {
+            for reverse in [false, true] {
+                let (mut s, ids) = fixture([0, 1, 0, 1, 0, 0]);
+                let doc = s.doc().unwrap().doc.clone();
+                let mut selected = selected.map(|i| ids[i].0).to_vec();
+                if reverse {
+                    selected.reverse();
+                }
+                // Explicit command targets may contain duplicates: an item still moves once.
+                selected.push(selected[0]);
+                s.execute("object.arrange", &json!({"to": direction, "ids": selected})).unwrap();
+                assert_eq!(stack(&s), expected.map(|i| ids[i]), "{direction}, reverse={reverse}");
+                assert_items_unchanged(&doc, &s.doc().unwrap().doc);
+            }
+        }
+    }
+
+    #[test]
+    fn arrange_same_layer_steps_stop_at_layer_endpoints() {
+        let cases = [
+            ("forward", vec![1], [0, 2, 1, 3, 4]),
+            ("backward", vec![3], [0, 1, 3, 2, 4]),
+            ("forward", vec![3], [0, 1, 2, 3, 4]),
+            ("backward", vec![1], [0, 1, 2, 3, 4]),
+            ("forward", vec![3, 1, 2], [0, 1, 2, 3, 4]),
+            ("backward", vec![3, 1, 2], [0, 1, 2, 3, 4]),
+        ];
+        for (direction, selected, expected) in cases {
+            let (mut s, ids) = fixture([1, 0, 0, 0, 1]);
+            let selected: Vec<_> = selected.into_iter().map(|i| ids[i].0).collect();
+            s.execute("object.arrange", &json!({"to": direction, "ids": selected})).unwrap();
+            assert_eq!(stack(&s), expected.map(|i| ids[i]));
+        }
+        for direction in ["forward", "backward"] {
+            let (mut s, [x, a, y]) = fixture([1, 0, 1]);
+            s.execute("object.arrange", &json!({"to": direction, "ids": [a.0]})).unwrap();
+            assert_eq!(stack(&s), [x, a, y], "only object on its layer");
+        }
+    }
+
+    #[test]
+    fn arrange_selection_on_two_layers_moves_each_layer_independently() {
+        for direction in ["forward", "backward"] {
+            let (mut s, [a, x, b, y]) = fixture([0, 1, 0, 1]);
+            let selected = if direction == "forward" { [x.0, a.0] } else { [b.0, y.0] };
+            s.execute("object.arrange", &json!({"to": direction, "ids": selected})).unwrap();
+            assert_eq!(stack(&s), [b, y, a, x]);
+            let doc = &s.doc().unwrap().doc;
+            assert_eq!(doc.hit_item(0, Point::new(50.0, 50.0), 0.0), Some(a));
+            assert_eq!(doc.hit_item(0, Point::new(250.0, 50.0), 0.0), Some(x));
+        }
+    }
+
+    #[test]
+    fn arrange_menu_steps_use_same_layer_order() {
+        for command in ["object.bringForward", "object.sendBackward"] {
+            let (mut s, [a, x, b]) = fixture([0, 1, 0]);
+            let selected = if command == "object.bringForward" { a } else { b };
+            s.execute("selection.set", &json!({"ids": [selected.0]})).unwrap();
+            s.execute(command, &json!({})).unwrap();
+            assert_eq!(stack(&s), [b, x, a]);
+            assert_eq!(s.doc().unwrap().doc.hit_item(0, Point::new(50.0, 50.0), 0.0), Some(a));
+        }
+    }
+}
+
+#[cfg(test)]
 mod step_repeat_tests {
     use super::*;
+
+    #[test]
+    fn swap_and_default_fill_stroke_are_one_undo_step_per_object() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let id = |v: Value| ItemId(v["id"].as_u64().unwrap());
+        let a = id(s.execute("frame.create", &json!({"rect": [0, 0, 10, 10]})).unwrap());
+        let b = id(s.execute("frame.create", &json!({"rect": [20, 0, 30, 10]})).unwrap());
+        let locked = id(s.execute("frame.create", &json!({"rect": [40, 0, 50, 10]})).unwrap());
+        s.execute("object.fill", &json!({"ids": [a.0], "swatch": "[Paper]", "tint": 0.5})).unwrap();
+        s.execute("object.stroke", &json!({"ids": [a.0], "swatch": "[Black]", "weight": 2})).unwrap();
+        s.execute("object.fill", &json!({"ids": [b.0, locked.0], "swatch": "[Black]"})).unwrap();
+        s.execute("object.stroke", &json!({"ids": [b.0, locked.0], "swatch": "[None]"})).unwrap();
+        s.execute("object.lock", &json!({"ids": [locked.0]})).unwrap();
+        s.execute("selection.set", &json!({"ids": [a.0, b.0, locked.0]})).unwrap();
+        let colors = |s: &Session, i: ItemId| {
+            let it = s.doc().unwrap().doc.item(i).unwrap().clone();
+            (it.fill.swatch, it.fill.tint, it.stroke.swatch, it.stroke.tint)
+        };
+        let before = [colors(&s, a), colors(&s, b), colors(&s, locked)];
+
+        assert_eq!(s.execute("object.swapFillStroke", &json!({})).unwrap()["changed"], 2);
+        assert_eq!(colors(&s, a), ("[Black]".into(), 1.0, "[Paper]".into(), 0.5));
+        assert_eq!(colors(&s, b), ("[None]".into(), 1.0, "[Black]".into(), 1.0));
+        assert_eq!(colors(&s, locked), before[2], "a locked object keeps its colours");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!([colors(&s, a), colors(&s, b), colors(&s, locked)], before, "one undo restores both");
+
+        s.execute("object.defaultFillStroke", &json!({})).unwrap();
+        for i in [a, b] {
+            assert_eq!(colors(&s, i), ("[None]".into(), 1.0, "[Black]".into(), 1.0));
+        }
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!([colors(&s, a), colors(&s, b), colors(&s, locked)], before);
+
+        s.execute("selection.set", &json!({"ids": [locked.0]})).unwrap();
+        assert!(s.execute("object.swapFillStroke", &json!({})).is_err(), "nothing unlocked to change");
+    }
 
     #[test]
     fn step_repeat_validates_counts_and_offsets() {
@@ -2604,6 +3022,18 @@ mod line_end_tests {
         s.execute("text.insert", &json!({"text": "\rFour", "raw": true})).unwrap();
         assert_eq!(story(&s).text, "One\nTwo\nThree\nFour");
         assert_eq!(story(&s).paras.len(), 4);
+        // Editing a range or the whole story (scripts written for InDesign end paragraphs with \r).
+        s.execute("story.replaceRange", &json!({"story": sid.0, "start": 0, "end": 3, "text": "Zero\rOne"})).unwrap();
+        assert_eq!((story(&s).text.as_str(), story(&s).paras.len()), ("Zero\nOne\nTwo\nThree\nFour", 5));
+        s.execute("story.setText", &json!({"story": sid.0, "text": "A\r\nB\rC"})).unwrap();
+        assert_eq!((story(&s).text.as_str(), story(&s).paras.len()), ("A\nB\nC", 3));
+        // Notes, made and edited.
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 1})).unwrap();
+        let n = s.execute("note.new", &json!({"text": "One\rTwo"})).unwrap();
+        let note = |s: &mut Session| s.execute("note.list", &json!({})).unwrap()[0]["text"].clone();
+        assert_eq!(note(&mut s), "One\nTwo");
+        s.execute("note.edit", &json!({"story": n["story"], "id": n["id"], "text": "Three\r\nFour"})).unwrap();
+        assert_eq!(note(&mut s), "Three\nFour");
     }
 }
 
@@ -2811,5 +3241,89 @@ mod swatch_name_tests {
             s.execute("object.fill", &json!({"swatch": sw, "ids": [id]})).unwrap();
             s.execute("object.stroke", &json!({"swatch": sw, "ids": [id]})).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod path_edit_tests {
+    use designcraft_doc::ItemId;
+    use designcraft_geom::Point;
+    use serde_json::json;
+
+    fn session_with_path() -> (crate::Session, u64) {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let id = s
+            .execute(
+                "path.create",
+                &json!({"anchors": [{"p": [100, 100]}, {"p": [200, 100], "in": [170, 80], "out": [230, 120]}, {"p": [300, 200]}]}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        (s, id)
+    }
+
+    fn anchors(s: &crate::Session, id: u64) -> Vec<designcraft_geom::Anchor> {
+        let d = &s.doc().unwrap().doc;
+        let it = d.item(ItemId(id)).unwrap();
+        let xf = d.parent_xf(&d.find(ItemId(id)).unwrap()) * it.xf;
+        it.path.subpaths[0].anchors.iter().map(|a| a.transform(xf)).collect()
+    }
+
+    #[test]
+    fn reverse_path_swaps_ends_and_direction_lines() {
+        let (mut s, id) = session_with_path();
+        s.execute("path.reverse", &json!({"ids": [id]})).unwrap();
+        let a = anchors(&s, id);
+        assert_eq!(a.iter().map(|a| a.p).collect::<Vec<_>>(), [Point::new(300.0, 200.0), Point::new(200.0, 100.0), Point::new(100.0, 100.0)]);
+        assert_eq!((a[1].h_in, a[1].h_out), (Point::new(230.0, 120.0), Point::new(170.0, 80.0)));
+        assert!(s.execute("path.reverse", &json!({"ids": [id], "subpath": 3})).is_err());
+    }
+
+    #[test]
+    fn anchors_go_on_the_named_open_subpath_and_set_anchor_reshapes_one() {
+        let (mut s, id) = session_with_path();
+        s.execute("path.appendAnchor", &json!({"id": id, "subpath": 0, "anchor": {"p": [400, 250]}})).unwrap();
+        assert_eq!(anchors(&s, id).last().unwrap().p, Point::new(400.0, 250.0));
+        assert!(s.execute("path.appendAnchor", &json!({"id": id, "subpath": 1, "anchor": {"p": [0, 0]}})).is_err());
+        // Direction lines on the last anchor: collinear and opposite make it smooth.
+        s.execute("path.setAnchor", &json!({"id": id, "anchor": "last", "in": [380, 230], "out": [420, 270]})).unwrap();
+        let last = *anchors(&s, id).last().unwrap();
+        assert_eq!((last.h_in, last.h_out, last.kind), (Point::new(380.0, 230.0), Point::new(420.0, 270.0), designcraft_geom::AnchorKind::Smooth));
+        s.execute("path.setAnchor", &json!({"id": id, "anchor": 0, "p": [90, 110]})).unwrap();
+        assert_eq!(anchors(&s, id)[0].p, Point::new(90.0, 110.0));
+        assert!(s.execute("path.setAnchor", &json!({"id": id, "anchor": 9, "p": [0, 0]})).is_err());
+        assert!(s.execute("path.setAnchor", &json!({"id": id, "anchor": "last"})).is_err(), "nothing to set");
+        // Closing one subpath; then it takes no more anchors.
+        s.execute("path.close", &json!({"id": id, "subpath": 0})).unwrap();
+        assert!(s.execute("path.appendAnchor", &json!({"id": id, "anchor": {"p": [0, 0]}})).is_err());
+        assert!(s.execute("path.close", &json!({"id": id, "subpath": 4})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod spread_target_tests {
+    use super::*;
+
+    #[test]
+    fn creating_on_a_parent_spread_and_rejecting_unknown_spreads() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1, "facingPages": false})).unwrap();
+        let parent = json!({"kind": "parent", "index": 0});
+        let r = s.execute("frame.create", &json!({"spread": parent, "rect": [0, 0, 100, 100]})).unwrap();
+        let id = ItemId(r["id"].as_u64().unwrap());
+        assert_eq!(s.doc().unwrap().doc.find(id).unwrap().spread, SpreadRef::Parent(0));
+        s.execute("line.create", &json!({"spread": parent, "a": [0, 0], "b": [50, 50]})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.parents[0].items.len(), 2);
+
+        // Each of these used to land on the first body page.
+        for bad in
+            [json!("A-Parent"), json!("0"), json!(-1), json!(1.5), json!({"kind": "master", "index": 0}), json!({"kind": "parent"}), json!([0])]
+        {
+            assert!(s.execute("frame.create", &json!({"spread": bad, "rect": [0, 0, 100, 100]})).is_err(), "frame.create spread {bad}");
+            assert!(s.execute("line.create", &json!({"spread": bad, "a": [0, 0], "b": [50, 50]})).is_err(), "line.create spread {bad}");
+        }
+        assert!(s.doc().unwrap().doc.spreads[0].items.is_empty());
     }
 }

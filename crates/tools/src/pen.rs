@@ -1,8 +1,9 @@
 //! Pen tool (P): click for corner points, drag for smooth points, click the first point to close,
 //! Enter/Esc (or switching tools) to finish an open path. Each anchor is its own undo step, as in
-//! InDesign.
+//! InDesign. Clicking an end point of an open path (the cursor shows it) continues that path from
+//! there; dragging from it first reshapes its direction lines.
 
-use designcraft_doc::SpreadRef;
+use designcraft_doc::{ItemId, SpreadRef};
 use designcraft_geom::{BezPath, Point};
 use serde_json::{Value, json};
 
@@ -19,6 +20,45 @@ pub struct PenTool {
     hover: Point,
     /// Smart guides in canvas coordinates, as `snap_point` returned them.
     guides: Vec<Overlay>,
+    /// Continuing an existing path: the subpath the new anchors go on.
+    subpath: Option<usize>,
+    /// The press was on the continued path's end point: a drag reshapes its direction lines
+    /// instead of adding an anchor.
+    editing_end: bool,
+    /// The press on the end point has been dragged.
+    end_moved: bool,
+}
+
+/// An end point of an open path under canvas point `p`: (item, subpath, whether it is the last
+/// anchor). The selection is checked first, then the frontmost item under the pointer.
+fn endpoint_at(cx: &ToolContext, p: Point) -> Option<(ItemId, usize, bool)> {
+    let tol = cx.tol(6.0);
+    let mut ids = cx.selection.items.clone();
+    if let Some((_, id)) = cx.hit(p)
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+    for id in ids {
+        let Some(it) = cx.doc.item(id) else { continue };
+        if it.locked || it.is_group() || !matches!(it.content, designcraft_doc::Content::Unassigned) {
+            continue;
+        }
+        let Some(xf) = cx.item_canvas_xf(id).map(|m| m * it.xf) else { continue };
+        for (si, sp) in it.path.subpaths.iter().enumerate() {
+            if sp.closed {
+                continue;
+            }
+            let (Some(first), Some(last)) = (sp.anchors.first(), sp.anchors.last()) else { continue };
+            if (xf * last.p - p).hypot() <= tol {
+                return Some((id, si, true));
+            }
+            if (xf * first.p - p).hypot() <= tol {
+                return Some((id, si, false));
+            }
+        }
+    }
+    None
 }
 
 fn anchor_json(a: &(Point, Point, Point)) -> Value {
@@ -32,7 +72,33 @@ impl PenTool {
         self.anchors.clear();
         self.dragging = false;
         self.guides.clear();
+        self.subpath = None;
+        self.editing_end = false;
+        self.end_moved = false;
         vec![]
+    }
+
+    /// Start continuing subpath `si` of `id` from its last (`at_end`) or first anchor: the anchors
+    /// so far are its other end and the end point, in spread coordinates.
+    fn continue_from(&mut self, cx: &ToolContext, id: ItemId, si: usize, at_end: bool) -> Vec<Action> {
+        let (Some(it), Some(loc)) = (cx.doc.item(id), cx.doc.find(id)) else { return vec![] };
+        let Some(sp) = it.path.subpaths.get(si) else { return vec![] };
+        let (Some(first), Some(last)) = (sp.anchors.first(), sp.anchors.last()) else { return vec![] };
+        let xf = cx.doc.parent_xf(&loc) * it.xf;
+        let at = |a: &designcraft_geom::Anchor, flip: bool| {
+            let (i, o) = if flip { (a.h_out, a.h_in) } else { (a.h_in, a.h_out) };
+            (xf * a.p, xf * i, xf * o)
+        };
+        // From the first anchor the path is reversed first, so the new anchors follow on.
+        let (other, end) = if at_end { (at(first, false), at(last, false)) } else { (at(last, true), at(first, true)) };
+        self.path = Some(id.0);
+        self.subpath = Some(si);
+        self.spread = Some(loc.spread);
+        self.anchors = vec![other, end];
+        self.editing_end = true;
+        self.end_moved = false;
+        self.dragging = true;
+        if at_end { vec![] } else { vec![Action::Exec("path.reverse".into(), json!({"ids": [id.0], "subpath": si}))] }
     }
 
     /// Shift constrains first. The stored point is the snapped spread point. Guides are already canvas.
@@ -53,7 +119,13 @@ impl PenTool {
                 let anchors: Vec<Value> = self.anchors.iter().map(anchor_json).collect();
                 vec![Action::Exec("path.create".into(), json!({"spread": spread_json(sr), "anchors": anchors, "closed": false, "notifyPen": true}))]
             }
-            Some(id) => vec![Action::Exec("path.appendAnchor".into(), json!({"id": id, "anchor": anchor_json(last)}))],
+            Some(id) => {
+                let mut p = json!({"id": id, "anchor": anchor_json(last)});
+                if let Some(si) = self.subpath {
+                    p["subpath"] = json!(si);
+                }
+                vec![Action::Exec("path.appendAnchor".into(), p)]
+            }
             None => vec![],
         }
     }
@@ -93,11 +165,23 @@ impl Tool for PenTool {
                     && (first.0 - sp).hypot() <= cx.tol(6.0)
                 {
                     let out = match self.path {
-                        Some(id) => vec![Action::Exec("path.close".into(), json!({"id": id}))],
+                        Some(id) => {
+                            let mut p = json!({"id": id});
+                            if let Some(si) = self.subpath {
+                                p["subpath"] = json!(si);
+                            }
+                            vec![Action::Exec("path.close".into(), p)]
+                        }
                         None => vec![],
                     };
                     self.finish();
                     return out;
+                }
+                // On an open path's end point: continue that path.
+                if self.anchors.is_empty()
+                    && let Some((id, si, at_end)) = endpoint_at(cx, ev.pos)
+                {
+                    return self.continue_from(cx, id, si, at_end);
                 }
                 let p = self.snap_click(cx, snap_spread, sp, ev.mods.shift);
                 if self.anchors.is_empty() {
@@ -108,6 +192,7 @@ impl Tool for PenTool {
                 vec![]
             }
             PointerKind::Drag => {
+                self.end_moved |= self.editing_end;
                 if let Some(a) = self.anchors.last_mut() {
                     // Smooth point: out handle follows the pointer, in handle mirrors it.
                     a.2 = sp;
@@ -120,6 +205,17 @@ impl Tool for PenTool {
                     return vec![];
                 }
                 self.dragging = false;
+                // The continued path's end point: a drag set its direction lines.
+                if std::mem::take(&mut self.editing_end) {
+                    let (Some(id), Some(si), Some(&(p, h_in, h_out))) = (self.path, self.subpath, self.anchors.last()) else { return vec![] };
+                    if !std::mem::take(&mut self.end_moved) || (h_out - p).hypot() < 1e-9 {
+                        return vec![];
+                    }
+                    return vec![Action::Exec(
+                        "path.setAnchor".into(),
+                        json!({"id": id, "subpath": si, "anchor": "last", "in": [h_in.x, h_in.y], "out": [h_out.x, h_out.y]}),
+                    )];
+                }
                 self.commit_anchor()
             }
             _ => vec![],
@@ -165,8 +261,8 @@ impl Tool for PenTool {
         out
     }
 
-    fn cursor(&self, _cx: &ToolContext, _p: Point, _m: Mods) -> Cursor {
-        Cursor::Pen
+    fn cursor(&self, cx: &ToolContext, p: Point, _m: Mods) -> Cursor {
+        if self.anchors.is_empty() && endpoint_at(cx, p).is_some() { Cursor::PenContinue } else { Cursor::Pen }
     }
 
     fn busy(&self) -> bool {

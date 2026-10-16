@@ -38,6 +38,37 @@ use serde_json::{Value, json};
 /// The usage block. Shared by `--help` (stdout, success) and an unknown command (stderr, failure).
 const USAGE: &str = "usage: designcraft-cli run [--in FILE | --sample] [--cmd ID[=JSON]]... [--page N] [--scale S] [--pdf-options JSON] [--export OUT] [--all-pages DIR]\n         (--page, --scale and --pdf-options apply to the exports that follow them)\n       designcraft-cli commands [FILTER]\n       designcraft-cli describe COMMAND\n       designcraft-cli script [FILE|-] [--in FILE | --sample] [--connect PORT] [--save OUT] [--export OUT] [--keep-going]\n       designcraft-cli app [--port PORT] COMMAND [JSON] | --method METHOD [JSON]\n       designcraft-cli mcp [--connect PORT] [--sample]\n       designcraft-cli perf [--pages N] [--runs N] [--strict]\n       designcraft-cli bench FILE [--runs N]\n       designcraft-cli links\n       designcraft-cli --version";
 
+/// `script --help`: the script syntax, otherwise only in `describe script.run` and docs/agents.md.
+const SCRIPT_HELP: &str = r#"usage: designcraft-cli script [FILE|-] [--in FILE | --sample] [--connect PORT] [--save OUT] [--export OUT] [--keep-going]
+
+Runs a command script from FILE (stdin when FILE is `-` or missing), headless or, with
+--connect PORT, in the running app (designcraft --control PORT).
+
+Script text, one step per line:
+  command.id {"param": 1}     also `command.id={json}`, or `command.id` alone
+  {"command": "command.id", "params": {...}}   JSON lines, or a JSON array of them
+  # comment, // comment       skipped, like blank lines
+  UTF-8 with or without a byte order mark; LF or CRLF line endings.
+
+References to earlier results (in string parameters):
+  "$N.path"     the value at `path` in the result of step N. N is the 0-based step index:
+                comments and blank lines are not steps. `$last` is the previous step.
+                Paths go through result fields and array indices: "$1.story", "$3.ids.0".
+  "${N.path}"   inside a longer string, replaced by the value's text: "Frame ${0.id}".
+
+Text parameters: "\n" starts a new paragraph, "\u2028" is a forced line break, "\t" a tab.
+Most commands ignore parameters they do not know instead of rejecting them: check names
+with `designcraft-cli describe COMMAND`.
+
+Options:
+  --in FILE / --sample   open a document (.designcraft or .idml) or the sample first
+  --save OUT             save as .designcraft after the script succeeds
+  --export OUT           export after the script succeeds (.pdf, .idml, .epub, .png, .jpg); repeatable
+  --keep-going           run every step, recording failures as {"error": ...} results
+
+Prints {"completed": n, "results": [...]}, plus failedIndex / failedCommand / error and a
+non-zero exit when a step fails."#;
+
 /// The links line under the usage block.
 fn usage_footer() -> String {
     format!(
@@ -281,7 +312,7 @@ fn export(s: &mut Session, out: &str, page: usize, scale: f64) -> Result<(), Str
         .render_page(&st.doc, &s.cache, page, scale, true, &designcraft_render::RenderOptions { printing_only: true, ..Default::default() })
         .ok_or("no such page")?;
     let bytes = if out.ends_with(".jpg") || out.ends_with(".jpeg") { img.to_jpeg(90) } else { img.to_png() };
-    std::fs::write(out, bytes).map_err(|e| format!("{out}: {e}"))?;
+    designcraft_engine::atomic::write_atomic(std::path::Path::new(out), &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({}×{}, {:.1} ms, {} glyphs)", img.width, img.height, t.elapsed().as_secs_f64() * 1000.0, r.stats.glyphs);
     Ok(())
 }
@@ -335,6 +366,10 @@ fn script(args: &[String]) -> Result<(), String> {
             "--save" => save = Some(val()?),
             "--export" => export.push(val()?),
             "--keep-going" => keep_going = true,
+            "--help" | "-h" => {
+                outln!("{SCRIPT_HELP}");
+                return Ok(());
+            }
             f if !f.starts_with("--") && file.is_none() => file = Some(f.to_string()),
             other => return Err(format!("unknown script option `{other}`")),
         }

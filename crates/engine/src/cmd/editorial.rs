@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if ts.cell.is_some() {
                 return Err(bad("note.new", "notes go in story text"));
             }
-            let text = str_param(p, "text").unwrap_or("").to_string();
+            let text = super::text_param(p, "text");
             let author = str_param(p, "author").unwrap_or("").to_string();
             let at = ts.anchor.max(ts.focus);
             s.edit(|d, sel| {
@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!("note.edit", "Edit Note", [], None, "{story, id, text?, author?}", has_doc, |s, p| {
             let (sid, id) = target(p)?;
-            let (text, author) = (str_param(p, "text").map(str::to_string), str_param(p, "author").map(str::to_string));
+            let (text, author) = (str_param(p, "text").map(|_| super::text_param(p, "text")), str_param(p, "author").map(str::to_string));
             s.edit(|d, _| {
                 let st = d.story_mut(sid).ok_or_else(|| bad("note.edit", "no such story"))?;
                 let n = st.editorial.iter_mut().find(|n| n.id == id).ok_or_else(|| bad("note.edit", format!("no note {id}")))?;

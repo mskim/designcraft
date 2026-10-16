@@ -86,6 +86,282 @@ fn csv_parsing() {
 }
 
 #[test]
+fn data_source_sniffs_quoted_logical_headers() {
+    for (body, delimiter, names) in [
+        ("\"Last, First\";City\nAda;London\n", Delimiter::Semicolon, ["Last, First", "City"]),
+        ("\"Name\tLabel\",City\nAda,London\n", Delimiter::Comma, ["Name\tLabel", "City"]),
+        ("\"Name\nLabel\";City\nAda;London\n", Delimiter::Semicolon, ["Name\nLabel", "City"]),
+        ("\r\n \r\nName;City\r\nAda;London\r\n", Delimiter::Semicolon, ["Name", "City"]),
+        ("\"Name \"\"label,\"\"\";City\nAda;London\n", Delimiter::Semicolon, ["Name \"label,\"", "City"]),
+    ] {
+        let mut s = Session::new();
+        new_doc(&mut s, 1);
+        let result = exec(&mut s, "data.source.select", json!({"bytes": crate::cmd::base64_encode(body.as_bytes()), "name": "people.txt"}));
+        assert_eq!(result["records"], 1, "{body:?}");
+        let source = &s.documents()[0].doc.data_merge.sources[0];
+        assert_eq!(source.delimiter, delimiter, "{body:?}");
+        assert_eq!(source.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), names, "{body:?}");
+        assert_eq!(source.rows, vec![vec!["Ada", "London"]], "{body:?}");
+    }
+}
+
+#[test]
+fn data_source_sniff_quote_state_belongs_to_the_candidate_delimiter() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for (body, delimiter, names) in [
+            (format!("Name,\"preferred\tCity\"{ending}Ada\tLondon{ending}"), Delimiter::Tab, ["Name,\"preferred", "City\""]),
+            (format!("\"Last, First\";City{ending}Ada;London{ending}"), Delimiter::Semicolon, ["Last, First", "City"]),
+            (format!("\"Name\tLabel\",City{ending}Ada,London{ending}"), Delimiter::Comma, ["Name\tLabel", "City"]),
+            (format!("\"\";\"\"{ending} \t{ending}\"Last, First\";City{ending}Ada;London{ending}"), Delimiter::Semicolon, ["Last, First", "City"]),
+        ] {
+            let automatic = parse::table_from_bytes(body.as_bytes(), "people.txt", None).unwrap();
+            let explicit = parse::table_from_bytes(body.as_bytes(), "people.txt", Some(delimiter)).unwrap();
+            let fields: Vec<_> = names.into_iter().map(|name| DataField { name: name.into(), kind: DataFieldKind::Text }).collect();
+            assert_eq!(automatic.delimiter, delimiter, "{body:?}");
+            assert_eq!(automatic.fields, fields, "{body:?}");
+            assert_eq!(automatic.rows, vec![vec!["Ada", "London"]], "{body:?}");
+            assert!(automatic.warnings.is_empty(), "{body:?}: {:?}", automatic.warnings);
+            assert_eq!(automatic, explicit, "{body:?}");
+        }
+    }
+}
+
+#[test]
+fn data_source_sniff_prefers_coherent_quoted_field_boundaries() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for (header, first, second, delimiter, names, rows, warnings) in [
+            (
+                "\"Name\";\"Last, First\"",
+                "\"Ada\";\"Lovelace, Countess\"",
+                "\"Grace\";\"Hopper, Admiral\"",
+                Delimiter::Semicolon,
+                vec!["Name", "Last, First"],
+                vec![vec!["Ada", "Lovelace, Countess"], vec!["Grace", "Hopper, Admiral"]],
+                vec![],
+            ),
+            (
+                "\"Name\",\"Region\tCity\"",
+                "\"Ada\",\"London\"",
+                "\"Grace\",\"Paris\"",
+                Delimiter::Comma,
+                vec!["Name", "Region\tCity"],
+                vec![vec!["Ada", "London"], vec!["Grace", "Paris"]],
+                vec![],
+            ),
+            (
+                "\"Name\";\"City\";\"Last, \"\"First\"\"\";\"Title\"",
+                "\"Ada\";\"London\";\"Lovelace, \"\"Countess\"\"\";\"Analyst\"",
+                "\"Grace\";\"Paris\";\"Hopper, \"\"Admiral\"\"\";\"Engineer\";\"ignored\"",
+                Delimiter::Semicolon,
+                vec!["Name", "City", "Last, \"First\"", "Title"],
+                vec![vec!["Ada", "London", "Lovelace, \"Countess\"", "Analyst"], vec!["Grace", "Paris", "Hopper, \"Admiral\"", "Engineer"]],
+                vec!["Row 3 has cells past the header. Those cells were ignored."],
+            ),
+            (
+                "\"Name\",\"Role\",\"Region\t\"\"City\"\"\",\"Title\"",
+                "\"Ada\",\"Analyst\",\"London\t\"\"West End\"\"\",\"Countess\"",
+                "\"Grace\",\"Engineer\",\"Paris\t\"\"Centre\"\"\",\"Admiral\",\"ignored\"",
+                Delimiter::Comma,
+                vec!["Name", "Role", "Region\t\"City\"", "Title"],
+                vec![vec!["Ada", "Analyst", "London\t\"West End\"", "Countess"], vec!["Grace", "Engineer", "Paris\t\"Centre\"", "Admiral"]],
+                vec!["Row 3 has cells past the header. Those cells were ignored."],
+            ),
+        ] {
+            let body = format!("{header}{ending}{first}{ending}{second}{ending}");
+            let automatic = parse::table_from_bytes(body.as_bytes(), "people.txt", None).unwrap();
+            let explicit = parse::table_from_bytes(body.as_bytes(), "people.txt", Some(delimiter)).unwrap();
+            let fields: Vec<_> = names.into_iter().map(|name| DataField { name: name.into(), kind: DataFieldKind::Text }).collect();
+            assert_eq!(automatic.delimiter, delimiter, "{body:?}");
+            assert_eq!(automatic.fields, fields, "{body:?}");
+            assert_eq!(automatic.rows, rows, "{body:?}");
+            assert_eq!(automatic.warnings, warnings, "{body:?}");
+            assert_eq!(automatic, explicit, "{body:?}");
+        }
+    }
+}
+
+#[test]
+fn data_source_sniff_retains_priority_and_permissive_fallback() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for (header, row, delimiter, names, cells) in [
+            // Equally coherent candidates retain Tab, then Comma, then Semicolon priority.
+            ("Name,Title\tCity", "Ada,Analyst\tLondon\tignored", Delimiter::Tab, ["Name,Title", "City"], ["Ada,Analyst", "London"]),
+            ("Name;Title,City", "Ada;Analyst,London,ignored", Delimiter::Comma, ["Name;Title", "City"], ["Ada;Analyst", "London"]),
+            // No coherent candidate separates fields here. Keep parsing the trailing text
+            // after a quoted field exactly as before, using the same delimiter priority.
+            (
+                "\"Name\"suffix,Title\tCity",
+                "\"Ada\"suffix,Analyst\tLondon\tignored",
+                Delimiter::Tab,
+                ["Namesuffix,Title", "City"],
+                ["Adasuffix,Analyst", "London"],
+            ),
+            (
+                "\"Name\"suffix;Title,City",
+                "\"Ada\"suffix;Analyst,London,ignored",
+                Delimiter::Comma,
+                ["Namesuffix;Title", "City"],
+                ["Adasuffix;Analyst", "London"],
+            ),
+            ("\"Name\"suffix;City", "\"Ada\"suffix;London;ignored", Delimiter::Semicolon, ["Namesuffix", "City"], ["Adasuffix", "London"]),
+        ] {
+            let body = format!("{header}{ending}{row}{ending}");
+            let automatic = parse::table_from_bytes(body.as_bytes(), "people.txt", None).unwrap();
+            let explicit = parse::table_from_bytes(body.as_bytes(), "people.txt", Some(delimiter)).unwrap();
+            let fields: Vec<_> = names.into_iter().map(|name| DataField { name: name.into(), kind: DataFieldKind::Text }).collect();
+            assert_eq!(automatic.delimiter, delimiter, "{body:?}");
+            assert_eq!(automatic.fields, fields, "{body:?}");
+            assert_eq!(automatic.rows, vec![cells.to_vec()], "{body:?}");
+            assert_eq!(automatic.warnings, vec!["Row 2 has cells past the header. Those cells were ignored."], "{body:?}");
+            assert_eq!(automatic, explicit, "{body:?}");
+        }
+    }
+}
+
+#[test]
+fn data_source_sniff_allows_post_quote_whitespace() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for space in [" ", "\u{00A0}", "\u{2003}"] {
+            for (header, separator, delimiter, names) in [
+                (format!("\"Name\"{space};\"Last, First\""), ';', Delimiter::Semicolon, ["Name", "Last, First"]),
+                (format!("\"Name\"{space},\"Region\tCity\"{space}"), ',', Delimiter::Comma, ["Name", "Region\tCity"]),
+                (format!("\"Name\"{space}\t\"Last, First; City\"{space}"), '\t', Delimiter::Tab, ["Name", "Last, First; City"]),
+            ] {
+                let body = format!(
+                    "{header}{ending}\"Ada\"{space}{separator}\"London\"{space}{ending}\"Grace\"{space}{separator}\"Paris\"{space}{separator}ignored{ending}"
+                );
+                let automatic = parse::table_from_bytes(body.as_bytes(), "people.txt", None).unwrap();
+                let explicit = parse::table_from_bytes(body.as_bytes(), "people.txt", Some(delimiter)).unwrap();
+                let fields: Vec<_> = names.into_iter().map(|name| DataField { name: name.into(), kind: DataFieldKind::Text }).collect();
+                assert_eq!(automatic.delimiter, delimiter, "{body:?}");
+                assert_eq!(automatic.fields, fields, "{body:?}");
+                // Header classification trims; record values must keep their whitespace.
+                assert_eq!(
+                    automatic.rows,
+                    vec![vec![format!("Ada{space}"), format!("London{space}")], vec![format!("Grace{space}"), format!("Paris{space}")]],
+                    "{body:?}"
+                );
+                assert_eq!(automatic.warnings, vec!["Row 3 has cells past the header. Those cells were ignored."], "{body:?}");
+                assert_eq!(automatic, explicit, "{body:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn data_source_sniff_post_quote_whitespace_keeps_closed_field_state() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for space in [" ", "\u{00A0}", "\u{2003}"] {
+            for suffix in ["suffix", "\"suffix\""] {
+                let body = format!("\"Name\"{space}{suffix};\"Last, First\"{ending}Ada,London,ignored{ending}");
+                // Both separated formats have incompatible post-quote suffixes. Keep
+                // the permissive Comma fallback, including literal quotes in the name.
+                let automatic = parse::table_from_bytes(body.as_bytes(), "people.txt", None).unwrap();
+                let explicit = parse::table_from_bytes(body.as_bytes(), "people.txt", Some(Delimiter::Comma)).unwrap();
+                assert_eq!(automatic.delimiter, Delimiter::Comma, "{body:?}");
+                assert_eq!(
+                    automatic.fields,
+                    vec![
+                        DataField { name: format!("Name{space}{suffix};\"Last"), kind: DataFieldKind::Text },
+                        DataField { name: "First\"".into(), kind: DataFieldKind::Text },
+                    ],
+                    "{body:?}"
+                );
+                assert_eq!(automatic.rows, vec![vec!["Ada", "London"]], "{body:?}");
+                assert_eq!(automatic.warnings, vec!["Row 2 has cells past the header. Those cells were ignored."], "{body:?}");
+                assert_eq!(automatic, explicit, "{body:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn data_source_literal_quote_header_merges_the_detected_column() {
+    let mut s = Session::new();
+    new_doc(&mut s, 1);
+    text_frame(&mut s, [36.0, 36.0, 240.0, 80.0], "", None);
+    let body = "Name,\"preferred\tCity\"\nAda\tLondon\nGrace\tParis\n";
+    let selected = exec(&mut s, "data.source.select", json!({"bytes": crate::cmd::base64_encode(body.as_bytes()), "name": "people.txt"}));
+    assert_eq!(selected["records"], 2);
+    let source = &s.documents()[0].doc.data_merge.sources[0];
+    assert_eq!(source.delimiter, Delimiter::Tab);
+    assert_eq!(source.rows, vec![vec!["Ada", "London"], vec!["Grace", "Paris"]]);
+    exec(&mut s, "data.placeholder.add", json!({"field": "City\""}));
+    let merged = exec(&mut s, "data.merge", json!({}));
+    assert_eq!(merged["records"], 2);
+    assert_eq!(merged["pages"], 2);
+    assert_eq!(texts(&s), vec!["London", "Paris"]);
+}
+
+#[test]
+fn data_source_preserves_quoted_newlines_and_counts_record_lines() {
+    for ending in ["\n", "\r\n", "\r"] {
+        let body = format!("Name,City{ending}\"Ada{ending}Lovelace\",London{ending}Grace,Paris,extra{ending}");
+        let mut s = Session::new();
+        new_doc(&mut s, 1);
+        let result = select_csv(&mut s, &body);
+        assert_eq!(result["records"], 2, "{ending:?}");
+        let source = &s.documents()[0].doc.data_merge.sources[0];
+        assert_eq!(source.rows, vec![vec![format!("Ada{ending}Lovelace"), "London".into()], vec!["Grace".into(), "Paris".into()]]);
+        assert_eq!(source.warnings.len(), 1);
+        assert!(source.warnings[0].contains("Row 4"), "{:?}", source.warnings);
+    }
+}
+
+#[test]
+fn data_source_quoted_header_and_cr_records_merge_independently() {
+    let mut s = Session::new();
+    new_doc(&mut s, 1);
+    text_frame(&mut s, [36.0, 36.0, 240.0, 80.0], "", None);
+    let body = "\u{FEFF}\"Last, First\";City\rAda;London\rGrace;Paris\r";
+    exec(&mut s, "data.source.select", json!({"bytes": crate::cmd::base64_encode(body.as_bytes()), "name": "people.txt"}));
+    exec(&mut s, "data.placeholder.add", json!({"field": "Last, First"}));
+    let template = s.documents()[0].doc.clone();
+    let result = exec(&mut s, "data.merge", json!({}));
+    assert_eq!(result["records"], 2);
+    assert_eq!(result["pages"], 2);
+    assert_eq!(texts(&s), vec!["Ada", "Grace"]);
+    assert_eq!(serde_json::to_value(&s.documents()[0].doc).unwrap(), serde_json::to_value(&template).unwrap());
+}
+
+#[test]
+fn data_source_discarded_quoted_fields_keep_records_and_warning_lines() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for (discarded, following_line) in [(format!("\"Address \"\"line 1\"\"{ending}Address line 2\""), 4), ("literal\"quote".into(), 3)] {
+            let mut s = Session::new();
+            new_doc(&mut s, 1);
+            text_frame(&mut s, [36.0, 36.0, 240.0, 80.0], "", None);
+            let body = format!("Name{ending}Ada,,,{discarded}{ending}Grace,extra{ending}");
+            let selected = select_csv(&mut s, &body);
+            assert_eq!(selected["records"], 2, "{body:?}");
+            let source = &s.documents()[0].doc.data_merge.sources[0];
+            assert_eq!(source.rows, vec![vec!["Ada"], vec!["Grace"]], "{body:?}");
+            assert_eq!(source.warnings.len(), 2, "{:?}", source.warnings);
+            assert!(source.warnings[0].contains("Row 2"), "{:?}", source.warnings);
+            assert!(source.warnings[1].contains(&format!("Row {following_line}")), "{:?}", source.warnings);
+            exec(&mut s, "data.placeholder.add", json!({"field": "Name"}));
+            let merged = exec(&mut s, "data.merge", json!({}));
+            assert_eq!(merged["records"], 2);
+            assert_eq!(merged["pages"], 2);
+            assert_eq!(texts(&s), vec!["Ada", "Grace"]);
+        }
+    }
+}
+
+#[test]
+fn data_source_delimiter_override_and_known_extensions_win() {
+    let body = "Name;City\nAda;London\n";
+    let csv = parse::table_from_bytes(body.as_bytes(), "people.csv", None).unwrap();
+    assert_eq!(csv.delimiter, Delimiter::Comma);
+    assert_eq!(csv.rows, vec![vec!["Ada;London"]]);
+    let explicit = parse::table_from_bytes(body.as_bytes(), "people.csv", Some(Delimiter::Semicolon)).unwrap();
+    assert_eq!(explicit.rows, vec![vec!["Ada", "London"]]);
+    let tab = parse::table_from_bytes(b"Name,Title\tCity\nAda,Analyst\tLondon", "people.tsv", None).unwrap();
+    assert_eq!(tab.delimiter, Delimiter::Tab);
+    assert_eq!(tab.rows, vec![vec!["Ada,Analyst", "London"]]);
+}
+
+#[test]
 fn text_sniff_padding_skips_and_warnings() {
     let dir = scratch("sniff");
     write(&dir.join("tab.txt"), "Name\tCity\nAda\tTown\n");

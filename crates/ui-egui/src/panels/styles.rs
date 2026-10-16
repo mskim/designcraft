@@ -150,3 +150,44 @@ fn style_row(app: &mut DesignApp, ui: &mut egui::Ui, para: bool, n: &str, curren
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    use super::*;
+
+    #[test]
+    fn character_style_plus_captures_selection_for_reuse() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let frame = app.run("frame.create", json!({"rect": [36, 36, 300, 200], "content": "text", "text": "alpha beta"})).unwrap();
+        app.run("text.select", json!({"story": frame["story"], "anchor": 0, "focus": 5})).unwrap();
+        app.run("type.char", json!({"underline": true})).unwrap();
+        let selection = app.session.doc().unwrap().selection.clone();
+        let undo_len = app.session.doc().unwrap().history.undo.len();
+        let mut h = Harness::builder().with_size(vec2(360.0, 240.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let id = egui::Id::new("test_fonts");
+                if ui.data(|d| d.get_temp::<bool>(id)).is_none() {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    ui.data_mut(|d| d.insert_temp(id, true));
+                    return;
+                }
+                character(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Create New Style from Selection").click();
+        h.run_steps(3);
+        let app = h.state_mut();
+        let style = app.session.doc().unwrap().doc.styles.char_style("Character Style 1").unwrap();
+        assert_eq!(style.chars, designcraft_doc::CharAttrs { underline: Some(true), ..Default::default() });
+        assert_eq!(app.session.doc().unwrap().selection, selection);
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo_len + 1);
+        app.run("text.select", json!({"story": frame["story"], "anchor": 6, "focus": 10})).unwrap();
+        app.run("style.character.apply", json!({"name": "Character Style 1"})).unwrap();
+        assert_eq!(app.run("type.selectionAttrs", json!({})).unwrap()["chars"]["underline"], true);
+    }
+}

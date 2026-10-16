@@ -28,7 +28,7 @@ fn no_book() -> EngineError {
 #[cfg(not(target_arch = "wasm32"))]
 fn save(b: &Book) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(b).map_err(|e| EngineError::Other(e.to_string()))?;
-    std::fs::write(&b.path, bytes).map_err(|e| EngineError::Other(format!("{}: {e}", b.path)))
+    crate::atomic::write_file(&b.path, &bytes)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -47,20 +47,176 @@ fn load(path: &str) -> Result<designcraft_doc::Document> {
     if path.to_lowercase().ends_with(".idml") {
         return designcraft_idml::import_idml(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")));
     }
-    super::file::from_bytes(&bytes)
+    super::file::from_bytes(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 
-fn store(path: &str, d: &designcraft_doc::Document) -> Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    return std::fs::write(path, super::file::to_bytes(d)).map_err(|e| EngineError::Other(format!("{path}: {e}")));
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (path, d);
-        Err(EngineError::Other("books need a file system".into()))
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_BATCH_CHAPTERS: usize = 4096;
+
+/// A batch keeps only bounded path records in memory. Chapter snapshots live in a private
+/// temporary directory; only one document and serialized blob are live while staging.
+#[cfg(not(target_arch = "wasm32"))]
+struct ChapterBatch {
+    directory: tempfile::TempDir,
+    chapters: Vec<(String, tempfile::TempPath)>,
+    command: &'static str,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ChapterBatch {
+    fn new(chapters: usize, command: &'static str) -> Result<Self> {
+        if chapters > MAX_BATCH_CHAPTERS {
+            return Err(bad(command, format!("a book update supports at most {MAX_BATCH_CHAPTERS} chapters")));
+        }
+        let directory = tempfile::Builder::new()
+            .prefix(".designcraft-book-")
+            .tempdir()
+            .map_err(|e| EngineError::Other(format!("{command}: cannot stage chapter changes: {e}")))?;
+        Ok(Self { directory, chapters: Vec::with_capacity(chapters), command })
+    }
+
+    fn stage(&mut self, path: &str, doc: &designcraft_doc::Document) -> Result<()> {
+        use std::io::Write;
+
+        // Propagate serialization errors; an empty fallback must never replace a chapter.
+        let bytes = designcraft_format::save(doc).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let mut file = tempfile::Builder::new()
+            .prefix("chapter-")
+            .tempfile_in(self.directory.path())
+            .map_err(|e| EngineError::Other(format!("{path}: cannot stage changes: {e}")))?;
+        file.write_all(&bytes).map_err(|e| EngineError::Other(format!("{path}: cannot stage changes: {e}")))?;
+        self.chapters.push((path.to_string(), file.into_temp_path()));
+        Ok(())
+    }
+
+    fn commit(self) -> Result<()> {
+        self.commit_with(write_staged_chapter)
+    }
+
+    fn commit_with(self, mut write: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>) -> Result<()> {
+        let mut completed = Vec::with_capacity(self.chapters.len());
+        for (path, staged) in self.chapters {
+            if let Err(e) = write(std::path::Path::new(&path), &staged) {
+                // Each file is atomic; the whole book is not. Keep the successful prefix visible
+                // rather than pretending that an error undid earlier chapter replacements.
+                return Err(EngineError::Other(format!(
+                    "{}: failed to save chapter {path}: {e}; completed chapter paths: {completed:?}",
+                    self.command
+                )));
+            }
+            completed.push(path);
+        }
+        Ok(())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn write_staged_chapter(path: &std::path::Path, staged: &std::path::Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(staged)?;
+    crate::atomic::write_atomic_with(path, |file| std::io::copy(&mut input, file).map(|_| ()))
+}
+
+/// Batch commands only write closed native chapters. IDML is an imported source, and an open
+/// chapter's model (including unsaved edits) cannot be reconciled by a disk-only book update.
+#[cfg(not(target_arch = "wasm32"))]
+fn writable_chapter(s: &Session, path: &str, command: &'static str) -> Result<()> {
+    use std::path::Path;
+
+    if Path::new(path).extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("idml")) {
+        return Err(bad(command, format!("cannot change imported IDML chapter {path}; convert it to a native DesignCraft document first")));
+    }
+    let target = std::fs::canonicalize(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if s.docs.iter().any(|doc| doc.path.as_ref().is_some_and(|open| std::fs::canonicalize(open).is_ok_and(|open| open == target))) {
+        return Err(bad(command, format!("chapter {path} is open; close it before updating the book")));
+    }
+    if !std::fs::metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(bad(command, format!("chapter {path} is not a regular file")));
+    }
+    // Check both the file and its resolved parent without truncating it. Replacement needs a
+    // writable directory even when an in-place write would be permitted.
+    std::fs::OpenOptions::new().write(true).open(&target).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let parent = target.parent().ok_or_else(|| bad(command, format!("chapter {path} has no parent folder")))?;
+    tempfile::Builder::new().prefix(".designcraft-book-check-").tempfile_in(parent).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn paginate(s: &Session) -> Result<Value> {
+    let b = s.book.as_ref().ok_or_else(no_book)?;
+    if b.documents.is_empty() {
+        return Ok(json!({"pages": 0}));
+    }
+    let mut batch = ChapterBatch::new(b.documents.len(), "book.paginate")?;
+    let mut next = 1u32;
+    for path in &b.documents {
+        writable_chapter(s, path, "book.paginate")?;
+        let mut d = load(path)?;
+        start_at(&mut d, next);
+        let pages = u32::try_from(d.page_count()).map_err(|_| bad("book.paginate", "too many pages for continuous numbering"))?;
+        next = next.checked_add(pages).ok_or_else(|| bad("book.paginate", "too many pages for continuous numbering"))?;
+        batch.stage(path, &d)?;
+    }
+    batch.commit()?;
+    Ok(json!({"pages": next - 1}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_styles(s: &Session) -> Result<Value> {
+    let b = s.book.as_ref().ok_or_else(no_book)?;
+    let mut batch = ChapterBatch::new(b.documents.len(), "book.syncStyles")?;
+    let src_path = b.documents.get(b.style_source).ok_or_else(|| bad("book.syncStyles", "the book is empty"))?;
+    let src = load(src_path)?;
+    let styles = src.styles.clone();
+    let swatches = src.swatches.clone();
+    drop(src);
+    let mut n = 0;
+    for (i, path) in b.documents.iter().enumerate() {
+        if i == b.style_source {
+            continue;
+        }
+        writable_chapter(s, path, "book.syncStyles")?;
+        let mut d = load(path)?;
+        {
+            let st = d.styles_mut();
+            for ps in &styles.paragraph {
+                st.paragraph.retain(|x| x.name != ps.name);
+                st.paragraph.push(ps.clone());
+            }
+            for cs in &styles.character {
+                st.character.retain(|x| x.name != cs.name);
+                st.character.push(cs.clone());
+            }
+        }
+        for sw in &swatches {
+            match d.swatches.iter_mut().find(|w| w.name == sw.name) {
+                Some(w) if !w.locked => *w = sw.clone(),
+                Some(_) => {}
+                None => d.swatches.push(sw.clone()),
+            }
+        }
+        batch.stage(path, &d)?;
+        n += 1;
+    }
+    batch.commit()?;
+    Ok(json!({"synced": n}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn paginate(_: &Session) -> Result<Value> {
+    Err(EngineError::Other("books need a file system".into()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sync_styles(_: &Session) -> Result<Value> {
+    Err(EngineError::Other("books need a file system".into()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "book/safety_tests.rs"]
+mod safety_tests;
+
 /// Make page numbering of `d` start at `n` (the first section).
+#[cfg(not(target_arch = "wasm32"))]
 fn start_at(d: &mut designcraft_doc::Document, n: u32) {
     if !d.sections.iter().any(|x| x.start == 0) {
         d.sections.insert(
@@ -108,15 +264,16 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "book.add", "Add Document", [], None, "{path, at?: index}", has_book, |s, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("book.add", "`path` required"))?.to_string();
             load(&path)?;
-            let b = s.book.as_mut().ok_or_else(no_book)?;
+            let mut b = s.book.as_ref().ok_or_else(no_book)?.clone();
             let at = p.get("at").and_then(Value::as_u64).map_or(b.documents.len(), |i| (i as usize).min(b.documents.len()));
             b.documents.insert(at, path);
-            save(b)?;
+            save(&b)?;
+            s.book = Some(b);
             ok()
         }),
         cmd!(noundo "book.remove", "Remove Document", [], None, "{index}", has_book, |s, p| {
             let i = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("book.remove", "`index` required"))? as usize;
-            let b = s.book.as_mut().ok_or_else(no_book)?;
+            let mut b = s.book.as_ref().ok_or_else(no_book)?.clone();
             if i >= b.documents.len() {
                 return Err(bad("book.remove", format!("no document {i}")));
             }
@@ -124,17 +281,19 @@ pub fn specs() -> Vec<CommandSpec> {
             if b.style_source >= b.documents.len() {
                 b.style_source = 0;
             }
-            save(b)?;
+            save(&b)?;
+            s.book = Some(b);
             ok()
         }),
         cmd!(noundo "book.styleSource", "Style Source", [], None, "{index}", has_book, |s, p| {
             let i = p.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let b = s.book.as_mut().ok_or_else(no_book)?;
+            let mut b = s.book.as_ref().ok_or_else(no_book)?.clone();
             if i >= b.documents.len() {
                 return Err(bad("book.styleSource", format!("no document {i}")));
             }
             b.style_source = i;
-            save(b)?;
+            save(&b)?;
+            s.book = Some(b);
             ok()
         }),
         cmd!(query "book.list", "Book", [], None, "{} → {path, styleSource, documents: [{path, pages, firstPage}]}", has_book, |s, _| {
@@ -149,48 +308,10 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"path": b.path, "styleSource": b.style_source, "documents": docs}))
         }),
         cmd!(noundo "book.paginate", "Update Numbering", [], None, "{} — each document starts numbering where the previous one ended (files are saved)", has_book, |s, _| {
-            let b = s.book.clone().ok_or_else(no_book)?;
-            let mut next = 1u32;
-            for p in &b.documents {
-                let mut d = load(p)?;
-                start_at(&mut d, next);
-                next += d.page_count() as u32;
-                store(p, &d)?;
-            }
-            Ok(json!({"pages": next - 1}))
+            paginate(s)
         }),
         cmd!(noundo "book.syncStyles", "Synchronize Book", [], None, "{} — paragraph and character styles and swatches of the style source go into every document (by name)", has_book, |s, _| {
-            let b = s.book.clone().ok_or_else(no_book)?;
-            let src_path = b.documents.get(b.style_source).ok_or_else(|| bad("book.syncStyles", "the book is empty"))?;
-            let src = load(src_path)?;
-            let mut n = 0;
-            for (i, p) in b.documents.iter().enumerate() {
-                if i == b.style_source {
-                    continue;
-                }
-                let mut d = load(p)?;
-                {
-                    let st = d.styles_mut();
-                    for ps in &src.styles.paragraph {
-                        st.paragraph.retain(|x| x.name != ps.name);
-                        st.paragraph.push(ps.clone());
-                    }
-                    for cs in &src.styles.character {
-                        st.character.retain(|x| x.name != cs.name);
-                        st.character.push(cs.clone());
-                    }
-                }
-                for sw in &src.swatches {
-                    match d.swatches.iter_mut().find(|w| w.name == sw.name) {
-                        Some(w) if !w.locked => *w = sw.clone(),
-                        Some(_) => {}
-                        None => d.swatches.push(sw.clone()),
-                    }
-                }
-                store(p, &d)?;
-                n += 1;
-            }
-            Ok(json!({"synced": n}))
+            sync_styles(s)
         }),
         cmd!(noundo "book.exportPdf", "Export Book to PDF…", [], None, "{path?} — every document in order as one PDF → {path, bytes, pages} (no path: {base64, …})", has_book, |s, p| {
             let b = s.book.clone().ok_or_else(no_book)?;
@@ -210,7 +331,7 @@ pub fn specs() -> Vec<CommandSpec> {
             match str_param(p, "path") {
                 Some(path) => {
                     #[cfg(not(target_arch = "wasm32"))]
-                    std::fs::write(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+                    crate::atomic::write_file(path, &bytes)?;
                     Ok(json!({"path": path, "bytes": bytes.len(), "pages": pages}))
                 }
                 None => Ok(json!({"base64": super::file::base64_encode(&bytes), "bytes": bytes.len(), "pages": pages})),
@@ -235,6 +356,7 @@ mod tests {
             s.execute("file.new", &json!({"pages": pages})).unwrap();
             s.execute("style.paragraph.create", &json!({"name": style, "chars": {"size": 20}})).unwrap();
             s.execute("file.saveAs", &json!({"path": p(name)})).unwrap();
+            s.execute("file.close", &json!({})).unwrap();
         }
         s.execute("book.new", &json!({"path": p("book.dcbook")})).unwrap();
         s.execute("book.add", &json!({"path": p("a.designcraft")})).unwrap();

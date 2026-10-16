@@ -20,7 +20,7 @@ pub(crate) fn place_media(s: &mut Session, p: &Value, name: String, mime: &str, 
         let st = s.active()?;
         st.selection.items.iter().copied().find(|i| st.doc.item(*i).is_some_and(|it| matches!(it.content, Content::Unassigned | Content::Graphic(_))))
     });
-    let spread = super::spread_param(p, "spread");
+    let spread = super::spread_param(p, "file.place")?;
     let lid = s.doc()?.active_layer;
     let (px, py) = (p.get("x").and_then(Value::as_f64), p.get("y").and_then(Value::as_f64));
     let mime = mime.to_string();

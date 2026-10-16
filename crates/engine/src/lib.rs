@@ -7,6 +7,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod atomic;
 pub mod cmd;
 pub mod dtd;
 pub mod guard;
@@ -91,6 +93,9 @@ pub struct DocState {
     /// Editing parent spreads (Pages panel double-click on a parent).
     pub editing_parents: bool,
     pub uid: u64,
+    /// Recovery entries this state actually opened or published, for repeated-open and cleanup.
+    /// Bounded, deduplicated checkpoint addresses; never inferred from uid alone.
+    pub(crate) recovery_entries: Vec<(std::path::PathBuf, u64)>,
     /// Unfilled document while data-merge preview is showing a record. Not saved.
     pub preview_stash: Option<Arc<Document>>,
     /// 1-based record currently previewed.
@@ -129,6 +134,7 @@ impl DocState {
             interaction: None,
             editing_parents: false,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            recovery_entries: Vec::new(),
             preview_stash: None,
             preview_record: None,
             fonts: None,
@@ -177,6 +183,8 @@ pub struct Prefs {
     pub rich_black_output: bool,
     /// Font menu favourites (family names).
     pub favorite_fonts: Vec<String>,
+    /// Fonts picked in the font menus, most recent first (shown at the menus' top).
+    pub recent_fonts: Vec<String>,
     /// Preferences › Type › Show Font Names in English: the font menus show CJK families by their
     /// English names instead of their native ones. Documents store the English name either way.
     pub show_font_names_in_english: bool,
@@ -233,6 +241,7 @@ impl Default for Prefs {
             highlight_substituted_fonts: true,
             rich_black_output: false,
             favorite_fonts: Vec::new(),
+            recent_fonts: Vec::new(),
             show_font_names_in_english: false,
             smart_text_reflow: true,
             autocorrect: false,
@@ -267,6 +276,8 @@ pub struct Session {
     pub(crate) transforms: (Vec<(String, Value)>, Vec<designcraft_doc::ItemId>, bool),
     /// Drag and drop text editing: the press landed in the selected text.
     pub(crate) text_drag: bool,
+    /// Character formatting chosen at a bare caret, for the text typed there next.
+    pub(crate) typing_format: Option<cmd::text::TypingFormat>,
     /// The open Object Library (File › New / Open Library).
     pub library: Option<cmd::library::Library>,
     /// The open book (File › Open Book).
@@ -298,6 +309,7 @@ impl Session {
             loaded: None,
             transforms: Default::default(),
             text_drag: false,
+            typing_format: None,
             library: None,
             conveyor: Vec::new(),
             book: None,
@@ -374,8 +386,9 @@ impl Session {
             self.stop_data_preview();
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let (Some(dir), Some(d)) = (&self.recovery_dir, self.docs.get(i)) {
-            recovery::discard(dir, d.uid);
+        {
+            let recovery_dir = self.recovery_dir.clone();
+            recovery::discard_document(self, i, recovery_dir.as_deref());
         }
         if i < self.docs.len() {
             self.docs.remove(i);
@@ -465,7 +478,7 @@ impl Session {
         }
         let mut d = (*st.doc).clone();
         if overset {
-            let _ = cmd::place_text_autoflow(&mut d, sid, 500);
+            let _ = cmd::place_text_autoflow(&mut d, sid, 500, "Smart Text Reflow");
         } else {
             // Drop empty trailing frames on the last pages (one frame, nothing else there).
             while let Some(story) = d.story(sid) {

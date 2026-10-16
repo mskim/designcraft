@@ -25,9 +25,11 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path}", has_doc, file_save),
         cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path} — writes the document without changing which file it is or its unsaved state", has_doc, |s, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.saveACopy", "missing `path`"))?.to_string();
-            let bytes = to_bytes(&s.doc()?.doc);
+            let mut copy = (*s.doc()?.doc).clone();
+            super::datamerge::refresh_relative_paths(&mut copy, std::path::Path::new(&path));
+            let bytes = to_bytes(&copy);
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }),
         cmd!(noundo "file.revert", "Revert", ["File"], None, "{} — back to the last saved version (not undoable)", can_revert, file_revert),
@@ -37,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(noundo "file.recovery.save", "Save Recovery Data", [], None, "{dir?} — write every unsaved document to the recovery folder (the app does this on a timer)", always, |s, p| {
             let dir = recovery_dir(s, p)?;
-            Ok(json!({"saved": crate::recovery::save(s, &dir)?}))
+            Ok(json!({"saved": crate::recovery::save_tracked(s, &dir)?}))
         }),
         cmd!(noundo "file.recovery.open", "Recover Documents", [], None, "{dir?} — reopen documents left in the recovery folder (unsaved)", always, |s, p| {
             let dir = recovery_dir(s, p)?;
@@ -237,24 +239,26 @@ fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
         .map(str::to_string)
         .or_else(|| st.path.clone())
         .ok_or_else(|| bad("file.save", "missing `path` (document has never been saved)"))?;
-    {
-        let mut d = (*st.doc).clone();
-        super::datamerge::refresh_relative_paths(&mut d, std::path::Path::new(&path));
-        if d.data_merge != st.doc.data_merge {
-            st.doc = Arc::new(d);
-            st.revision = st.revision.saturating_add(1);
-        }
-    }
-    let bytes = to_bytes(&st.doc);
+    // Prepare paths for the destination without changing the live document until persistence succeeds.
+    let mut saved = (*st.doc).clone();
+    super::datamerge::refresh_relative_paths(&mut saved, std::path::Path::new(&path));
+    let paths_changed = saved.data_merge != st.doc.data_merge;
+    let saved = if paths_changed { Arc::new(saved) } else { st.doc.clone() };
+    let bytes = to_bytes(&saved);
     #[cfg(not(target_arch = "wasm32"))]
-    std::fs::write(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    crate::atomic::write_file(&path, &bytes)?;
+    if paths_changed {
+        st.doc = saved;
+        st.revision = st.revision.saturating_add(1);
+    }
     st.path = Some(path.clone());
     st.saved_revision = st.revision;
     st.saved_doc = st.doc.clone();
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(dir) = &s.recovery_dir {
-        let uid = s.doc()?.uid;
-        crate::recovery::discard(dir, uid);
+    {
+        let recovery_dir = s.recovery_dir.clone();
+        let index = s.active_index().ok_or(EngineError::NoDocument)?;
+        crate::recovery::discard_document(s, index, recovery_dir.as_deref());
     }
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }
@@ -331,7 +335,7 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         let st = s.active()?;
         st.selection.items.iter().copied().find(|i| st.doc.item(*i).is_some_and(|it| matches!(it.content, Content::Unassigned | Content::Graphic(_))))
     });
-    let spread = super::spread_param(p, "spread");
+    let spread = super::spread_param(p, "file.place")?;
     let lid = s.doc()?.active_layer;
     let px = p.get("x").and_then(Value::as_f64);
     let py = p.get("y").and_then(Value::as_f64);
@@ -454,7 +458,7 @@ fn place_load(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn place_drop(s: &mut Session, p: &Value) -> Result<Value> {
     let (aid, (nw, nh)) = s.loaded.ok_or_else(|| bad("place.drop", "nothing loaded in the place cursor"))?;
-    let sr = super::spread_param(p, "spread");
+    let sr = super::spread_param(p, "place.drop")?;
     let lid = s.doc()?.active_layer;
     let frame = super::id_param(p, "frame");
     let rect = super::rect_param(p, "rect");
@@ -518,7 +522,7 @@ fn snippet_export(s: &mut Session, p: &Value) -> Result<Value> {
     match str_param(p, "path") {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len(), "items": d.spreads.first().map(|s| s.items.len()).unwrap_or(0)}))
         }
         None => Ok(json!({"base64": base64_encode(&bytes), "bytes": bytes.len()})),
@@ -546,7 +550,7 @@ fn place_layout_page(s: &mut Session, p: &Value, name: &str, bytes: &[u8]) -> Re
     if ids.is_empty() {
         return Err(bad(ID, format!("page {page} has no objects")));
     }
-    let to = super::spread_param(p, "spread");
+    let to = super::spread_param(p, ID)?;
     let off = match (p.get("x").and_then(Value::as_f64), p.get("y").and_then(Value::as_f64)) {
         (Some(x), Some(y)) => designcraft_geom::Vec2::new(x - pr.x0, y - pr.y0),
         _ => designcraft_geom::Vec2::new(-pr.x0, -pr.y0),
@@ -582,7 +586,7 @@ pub(crate) fn snippet_place(s: &mut Session, p: &Value) -> Result<Value> {
     if ids.is_empty() {
         return Err(bad("snippet.place", "the snippet is empty"));
     }
-    let sr = super::spread_param(p, "spread");
+    let sr = super::spread_param(p, "snippet.place")?;
     let bounds = ids.iter().filter_map(|i| src.item(*i).map(|it| it.bounds())).reduce(|a, b| a.union(b)).unwrap_or(Rect::ZERO);
     let off = match (p.get("x").and_then(Value::as_f64), p.get("y").and_then(Value::as_f64)) {
         (Some(x), Some(y)) => designcraft_geom::Vec2::new(x - bounds.x0, y - bounds.y0),
@@ -643,15 +647,14 @@ fn file_revert(s: &mut Session, _: &Value) -> Result<Value> {
         // As opened again: the fonts beside it now (unchanged files are shared, not read again).
         let (fonts, _, _) = load_document_fonts(&mut d, &path);
         let uid = s.doc()?.uid;
-        let st = s.doc_mut()?;
+        let recovery_dir = s.recovery_dir.clone();
+        let index = s.active_index().ok_or(EngineError::NoDocument)?;
         let mut fresh = DocState::new(d, Some(path.clone()));
         fresh.fonts = fonts;
         fresh.uid = uid;
-        fresh.revision = st.revision + 1;
-        *st = fresh;
-        if let Some(dir) = &s.recovery_dir {
-            crate::recovery::discard(dir, uid);
-        }
+        fresh.revision = s.doc()?.revision + 1;
+        crate::recovery::discard_document(s, index, recovery_dir.as_deref());
+        *s.doc_mut()? = fresh;
         Ok(json!({"path": path}))
     }
     #[cfg(target_arch = "wasm32")]
@@ -732,6 +735,37 @@ mod layout_place_tests {
         assert!((bb.x0 - 100.0).abs() < 1e-6 && (bb.y0 - 100.0).abs() < 1e-6, "page top-left at 0,0: {bb:?}");
         assert!(d.stories.values().any(|st| st.text == "From page one"), "stories come along");
         assert!(b.execute("file.place", &json!({"base64": b64, "name": "src.idml", "layoutPage": 2})).is_err(), "page 2 is empty");
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    /// Saving over an existing document replaces it whole and leaves nothing beside it.
+    #[test]
+    fn save_replaces_the_existing_file_without_leftovers() {
+        let dir = std::env::temp_dir().join(format!("dc-save-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.designcraft");
+        std::fs::write(&path, vec![b'x'; 1 << 20]).unwrap();
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [36, 36, 300, 200], "content": "text", "text": "Saved whole", "caret": false})).unwrap();
+        s.execute("file.save", &json!({"path": path.to_string_lossy()})).unwrap();
+        s.execute("file.saveACopy", &json!({"path": path.to_string_lossy()})).unwrap();
+        let saved = super::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.stories.values().any(|st| st.text == "Saved whole"));
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["doc.designcraft"], "no temporary file is left");
+        // A folder that doesn't exist: an error naming the path.
+        let missing = dir.join("missing").join("doc.designcraft");
+        let e = s.execute("file.save", &json!({"path": missing.to_string_lossy()})).unwrap_err();
+        assert!(e.to_string().contains("missing"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -953,6 +987,26 @@ mod document_fonts_tests {
         s.execute("file.revert", &json!({})).unwrap();
         assert_eq!(font_entry(&mut s, FAMILY)["source"], "document");
         assert!(glyph_faces(&s).iter().all(|(_, f)| f.family == FAMILY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bold_and_italic_link_the_document_fonts_styles() {
+        const FAMILY: &str = "DocFont Linked";
+        let dir = temp_dir("linked");
+        std::fs::write(dir.join(DOCUMENT_FONTS_FOLDER).join("linked.ttf"), font_with(FAMILY, &['H', 'e', 'l', 'o']).unwrap()).unwrap();
+        let path = dir.join("Linked.designcraft");
+        write_document(&path, FAMILY);
+
+        let mut s = Session::new();
+        open(&mut s, &path);
+        let sid = *s.doc().unwrap().doc.stories.keys().next().unwrap();
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+        // The family is the document's alone: its Regular is the style without bold or italic.
+        let r = s.execute("type.bold", &json!({"on": false})).unwrap();
+        assert_eq!(r["fontStyle"], "Regular", "{r}");
+        let r = s.execute("type.italic", &json!({"on": false})).unwrap();
+        assert_eq!(r["fontStyle"], "Regular", "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

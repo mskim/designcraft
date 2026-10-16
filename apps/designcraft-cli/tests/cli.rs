@@ -87,6 +87,21 @@ fn help_goes_to_stdout_and_unknown_args_to_stderr() {
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("usage: designcraft-cli"));
 }
 
+/// `script --help` was "unknown script option `--help`"; the line syntax was only in
+/// `describe script.run` (#654).
+#[test]
+fn script_help_documents_the_syntax() {
+    for flag in ["--help", "-h"] {
+        let out = cli().args(["script", flag]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{flag}: {:?} {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.starts_with("usage: designcraft-cli script"), "{flag}: {stdout:?}");
+        for needle in ["0-based", "$1.story", "$3.ids.0", "\\u2028", "ignore"] {
+            assert!(stdout.contains(needle), "{flag}: no {needle:?} in {stdout:?}");
+        }
+    }
+}
+
 /// `designcraft-cli commands | head -1` panicked with "failed printing to
 /// stdout: Broken pipe (os error 32)" and exit status 101.
 #[test]
@@ -121,4 +136,36 @@ fn run_export_options_come_before_their_export() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("wrote") && std::path::Path::new(a).exists() && std::path::Path::new(b).exists(), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn raster_export_preserves_an_existing_reader_and_private_symlink_target() {
+    use std::io::Read;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("designcraft-cli-atomic-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let fixture = Fixture(dir);
+    let target = fixture.0.join(format!("{}.png", "a".repeat(243)));
+    let old = b"previous private export";
+    std::fs::write(&target, old).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let alias = fixture.0.join("linked.png");
+    symlink(target.file_name().unwrap(), &alias).unwrap();
+    let mut reader = std::fs::File::open(&target).unwrap();
+    let out = cli().args(["run", "--sample", "--scale", "0.1", "--export", alias.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut observed = Vec::new();
+    reader.read_to_end(&mut observed).unwrap();
+    assert!(observed == old, "CLI export changed bytes under an existing reader");
+    assert!(std::fs::read(&target).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(std::fs::symlink_metadata(alias).unwrap().file_type().is_symlink());
 }

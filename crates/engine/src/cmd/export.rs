@@ -44,7 +44,7 @@ fn print_booklet(s: &mut Session, p: &Value) -> Result<Value> {
     match str_param(p, "path") {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(path, &r.bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(path, &r.bytes)?;
             Ok(json!({"path": path, "bytes": r.bytes.len(), "sheets": r.pages, "warnings": r.warnings}))
         }
         None => Ok(json!({"base64": super::file::base64_encode(&r.bytes), "bytes": r.bytes.len(), "sheets": r.pages, "warnings": r.warnings})),
@@ -59,7 +59,7 @@ fn export_html(s: &mut Session, p: &Value) -> Result<Value> {
     match str_param(p, "path") {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(path, text.as_bytes())?;
             Ok(json!({"path": path, "bytes": text.len()}))
         }
         None => Ok(json!({"bytes": text.len(), "text": text})),
@@ -91,7 +91,7 @@ fn export_text(s: &mut Session, p: &Value) -> Result<Value> {
     match path {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(path, text.as_bytes())?;
             Ok(json!({"path": path, "bytes": text.len()}))
         }
         None => Ok(json!({"bytes": text.len(), "text": text})),
@@ -160,7 +160,7 @@ fn export_epub(s: &mut Session, p: &Value) -> Result<Value> {
     match p.get("path").and_then(Value::as_str) {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
-            std::fs::write(path, &bytes).map_err(|e| crate::EngineError::Other(format!("{path}: {e}")))?;
+            crate::atomic::write_file(path, &bytes)?;
             Ok(serde_json::json!({"path": path, "bytes": bytes.len()}))
         }
         None => Ok(serde_json::json!({"base64": super::file::base64_encode(&bytes), "bytes": bytes.len()})),
@@ -601,7 +601,7 @@ fn export_pdf(s: &mut Session, p: &Value) -> Result<Value> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+    crate::atomic::write_file(path, bytes)
 }
 #[cfg(target_arch = "wasm32")]
 fn write_file(path: &str, _bytes: &[u8]) -> Result<()> {

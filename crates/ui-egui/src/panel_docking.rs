@@ -418,31 +418,7 @@ fn icon_rail(app: &mut DesignApp, ui: &mut egui::Ui) {
 
 pub(crate) fn legacy_tab(app: &mut DesignApp, ui: &mut egui::Ui, panel: &str, response: &egui::Response) {
     let Some(panel) = normalize(panel) else { return };
-    let language = app.ui.language.clone();
-    response.context_menu(|ui| {
-        if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&language, "Float Panel"))).clicked() {
-            if let Err(error) = app.run("window.panel.float", json!({"panel": panel})) {
-                app.status(error);
-            }
-            ui.close();
-        }
-        ui.menu_button(crate::rtl::widget(ui, crate::i18n::tr(&language, "Group with")), |ui| {
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for (anchor, label, _) in crate::dock::DOCK_TABS.iter().chain(crate::dock::ICON_PANELS) {
-                    if *anchor != panel && ui.button(crate::rtl::widget(ui, crate::i18n::tr(&language, label))).clicked() {
-                        // A closed icon panel is made visible before becoming the destination.
-                        let result = app
-                            .run("window.panel.activate", json!({"panel": anchor}))
-                            .and_then(|_| app.run("window.panel.move", json!({"panel":panel,"anchor":anchor})));
-                        if let Err(error) = result {
-                            app.status(error);
-                        }
-                        ui.close();
-                    }
-                }
-            });
-        });
-    });
+    response.context_menu(|ui| panel_menu(app, ui, panel));
     if response.drag_started()
         && let Some(id) = normalize(panel)
     {
@@ -470,6 +446,34 @@ pub(crate) fn legacy_tab(app: &mut DesignApp, ui: &mut egui::Ui, panel: &str, re
             app.ui.open_panel = None;
         }
     }
+}
+
+/// The docking commands of a panel: its tab's context menu and the end of its panel menu.
+pub(crate) fn panel_menu(app: &mut DesignApp, ui: &mut egui::Ui, panel: &str) {
+    let Some(panel) = normalize(panel) else { return };
+    let language = app.ui.language.clone();
+    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&language, "Float Panel"))).clicked() {
+        if let Err(error) = app.run("window.panel.float", json!({"panel": panel})) {
+            app.status(error);
+        }
+        ui.close();
+    }
+    ui.menu_button(crate::rtl::widget(ui, crate::i18n::tr(&language, "Group with")), |ui| {
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (anchor, label, _) in crate::dock::DOCK_TABS.iter().chain(crate::dock::ICON_PANELS) {
+                if *anchor != panel && ui.button(crate::rtl::widget(ui, crate::i18n::tr(&language, label))).clicked() {
+                    // A closed icon panel is made visible before becoming the destination.
+                    let result = app
+                        .run("window.panel.activate", json!({"panel": anchor}))
+                        .and_then(|_| app.run("window.panel.move", json!({"panel":panel,"anchor":anchor})));
+                    if let Err(error) = result {
+                        app.status(error);
+                    }
+                    ui.close();
+                }
+            }
+        });
+    });
 }
 
 struct PanelContent<'a>(&'a mut DesignApp);

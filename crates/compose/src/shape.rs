@@ -31,9 +31,14 @@ pub struct Glyph {
     /// Baseline shift (positive = up), including super/subscript.
     pub shift: f64,
     pub ascent: f64,
+    /// The font's typographic ascender at the point size (vertical scale doesn't apply): the Ascent
+    /// first baseline offset.
+    pub typo_ascent: f64,
     pub descent: f64,
     /// The leading this character asks for (absolute, or auto = size × auto %).
     pub leading: f64,
+    /// Cap height and x height, scaled like `ascent`: the Cap Height and x Height first baseline
+    /// offsets.
     pub cap: f64,
     pub xh: f64,
     pub size: f64,
@@ -67,6 +72,9 @@ pub struct Glyph {
     /// Upright in a vertical frame: shaped top to bottom (`adv` is its vertical advance) and hung
     /// from its vertical origin on the line's centre (see [`crate::PlacedGlyph::vertical_xf`]).
     pub upright: bool,
+    /// Part of the bullet or number the paragraph's list adds: not the line's own text, so it
+    /// doesn't raise the Ascent first baseline.
+    pub list_label: bool,
 }
 
 impl Glyph {
@@ -188,7 +196,8 @@ impl StyleTable<'_> {
     }
 }
 
-/// Resolve and shape one paragraph.
+/// Resolve and shape one paragraph. Its drop cap ends at byte `drop.0` (`range.start` without
+/// one) and takes the character style `drop.1` ("" = none).
 pub(crate) fn shape_para(
     db: &ScopedFonts<'_>,
     styles: &Styles,
@@ -202,13 +211,37 @@ pub(crate) fn shape_para(
     nested: &[designcraft_doc::NestedStyle],
     grep: &[designcraft_doc::GrepStyle],
     lines: &[(std::ops::Range<usize>, String)],
+    drop: (usize, &str),
 ) -> ShapedPara {
     let _ = pi;
     let mut glyphs = Vec::with_capacity(range.len());
-    // Nested line styles lie under nested and GREP styles (later overlays win).
+    // Nested line styles lie under nested and GREP styles, and the drop cap's style over them all
+    // (later overlays win).
     let mut overlays: Vec<(std::ops::Range<usize>, String)> = lines.to_vec();
+    // The drop cap's style is the nested styles' leading "through 1 Dropcap" entry (the form IDML
+    // stores it in). Set (`[None]` included), it restyles that entry; a real one stands in for a
+    // missing entry. Either way the nested styles after it start after the drop cap.
+    let set = Some(drop.1).filter(|s| !s.is_empty());
+    let cap_style = set.filter(|s| *s != designcraft_doc::NO_CHAR_STYLE);
+    let with_cap: Vec<designcraft_doc::NestedStyle>;
+    let nested = match set {
+        Some(s) if nested.first().is_some_and(designcraft_doc::NestedStyle::is_drop_cap) => {
+            with_cap = std::iter::once(designcraft_doc::NestedStyle::drop_cap(s)).chain(nested.iter().skip(1).cloned()).collect();
+            &with_cap[..]
+        }
+        Some(s) if cap_style.is_some() && !nested.is_empty() => {
+            with_cap = std::iter::once(designcraft_doc::NestedStyle::drop_cap(s)).chain(nested.iter().cloned()).collect();
+            &with_cap[..]
+        }
+        _ => nested,
+    };
     if !nested.is_empty() || !grep.is_empty() {
-        overlays.extend(crate::overlay::overlays(&story.text, range.clone(), nested, grep));
+        overlays.extend(crate::overlay::overlays(&story.text, range.clone(), nested, grep, drop.0));
+    }
+    if let Some(s) = cap_style
+        && drop.0 > range.start
+    {
+        overlays.push((range.start..drop.0, s.to_string()));
     }
     // Each run, cut where nested / GREP styles start and end.
     let mut segments: Vec<(usize, usize, Option<&str>, &designcraft_doc::CharFormat)> = Vec::new();
@@ -276,7 +309,7 @@ pub(crate) fn shape_para(
                 }
                 let mut g = control_glyph(&face, &props, auto_leading, style, a + i, c);
                 g.ch = HIDDEN;
-                (g.ascent, g.descent, g.leading, g.cap, g.xh) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                (g.ascent, g.typo_ascent, g.descent, g.leading, g.cap, g.xh) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
                 glyphs.push(g);
             }
             continue;
@@ -603,6 +636,9 @@ fn shape_run_raw(
                             Some(y) => {
                                 g.adv = o.w;
                                 g.ascent = g.ascent.max(o.h + y);
+                                g.typo_ascent = g.typo_ascent.max(o.h + y);
+                                g.cap = g.cap.max(o.h + y);
+                                g.xh = g.xh.max(o.h + y);
                                 g.descent = g.descent.max(-y);
                                 if auto {
                                     g.leading = g.leading.max(o.h + y + (auto_leading.auto_leading - 1.0).max(0.0) * g.size);
@@ -611,6 +647,9 @@ fn shape_run_raw(
                             // Pushes its line down by its height and spacing.
                             None => {
                                 g.ascent += o.h + o.space;
+                                g.typo_ascent += o.h + o.space;
+                                g.cap += o.h + o.space;
+                                g.xh += o.h + o.space;
                                 g.leading = g.leading.max(g.ascent + g.descent);
                             }
                         }
@@ -781,6 +820,7 @@ fn control_glyph(face: &Arc<FontFace>, p: &CharProps, auto_leading: TypeEnv, sty
         sy: k * p.v_scale,
         shift,
         ascent,
+        typo_ascent: face.typo_ascent * k,
         descent,
         leading,
         cap,
@@ -806,6 +846,7 @@ fn control_glyph(face: &Arc<FontFace>, p: &CharProps, auto_leading: TypeEnv, sty
         shaping_rtl: false,
         lang: designcraft_doc::language_tag(&p.language),
         upright: false,
+        list_label: false,
     }
 }
 
@@ -902,6 +943,7 @@ fn shape_segment(
             sy: k * p.v_scale,
             shift,
             ascent,
+            typo_ascent: face.typo_ascent * k,
             descent,
             leading,
             cap,
@@ -931,6 +973,7 @@ fn shape_segment(
             shaping_rtl: sg.rtl,
             lang,
             upright: up,
+            list_label: false,
         });
     }
 }

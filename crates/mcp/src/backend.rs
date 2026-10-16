@@ -55,10 +55,27 @@ impl Remote {
         Err(last)
     }
 
-    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+    fn prepare_connection(&mut self) -> std::io::Result<()> {
+        if let Some((reader, writer)) = self.conn.take() {
+            writer.set_nonblocking(true)?;
+            let probe = writer.peek(&mut [0]);
+            writer.set_nonblocking(false)?;
+            let live = match probe {
+                Ok(0) => false,
+                Ok(_) => true,
+                Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+            };
+            if live {
+                self.conn = Some((reader, writer));
+            }
+        }
         if self.conn.is_none() {
             self.reconnect()?;
         }
+        Ok(())
+    }
+
+    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
         let Some((reader, writer)) = self.conn.as_mut() else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
         };
@@ -78,6 +95,10 @@ impl Backend for Remote {
         let id = self.next_id;
         self.next_id += 1;
         let line = json!({"id": id, "method": method, "params": params}).to_string();
+        if let Err(e) = self.prepare_connection() {
+            self.conn = None;
+            return Err(format!("DesignCraft app at {} is not reachable: {e}; nothing was sent", self.addr));
+        }
         let reply = match self.roundtrip(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -106,6 +127,98 @@ impl Backend for Remote {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn closed_remote() -> (Remote, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut remote = Remote::connect(&addr).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "document.inspect");
+            writeln!(stream, "{}", json!({"id": request["id"], "ok": true, "result": null})).unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(listener);
+        });
+        assert_eq!(remote.call("document.inspect", json!({})), Ok(Value::Null));
+        server.join().unwrap();
+        let stream = &remote.conn.as_ref().unwrap().1;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(stream.peek(&mut [0]).unwrap(), 0, "FIN must be observable before the next call");
+        (remote, addr)
+    }
+
+    #[test]
+    fn remote_executes_once_when_app_restarts_between_calls() {
+        let (mut remote, addr) = closed_remote();
+        let listener = TcpListener::bind(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return 0;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            // The listener polls accept; the connection blocks while waiting for its request.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut applied = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                let request: Value = serde_json::from_str(&line).unwrap();
+                match request["method"].as_str().unwrap() {
+                    "engine.execute" => {
+                        assert_eq!(request["params"]["command"], "frame.create");
+                        applied += 1;
+                    }
+                    "document.inspect" => {}
+                    method => panic!("unexpected method: {method}"),
+                }
+                writeln!(stream, "{}", json!({"id": request["id"], "ok": true, "result": {"applied": applied}})).unwrap();
+                if request["method"] == "document.inspect" {
+                    return applied;
+                }
+            }
+        });
+
+        let result = remote.call("engine.execute", json!({"command": "frame.create", "params": {"rect": [0, 0, 100, 100]}}));
+        let inspected = match &result {
+            Ok(_) => remote.call("document.inspect", json!({})),
+            Err(_) => Err("edit failed".to_string()),
+        };
+        let applied = server.join().unwrap();
+
+        assert_eq!(result, Ok(json!({"applied": 1})), "the first edit after restart must succeed");
+        assert_eq!(inspected, Ok(json!({"applied": 1})));
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn remote_reports_nothing_sent_when_reconnect_has_no_listener() {
+        let (mut remote, _addr) = closed_remote();
+
+        let error = remote.call("engine.execute", json!({"command": "frame.create", "params": {}})).unwrap_err();
+
+        assert!(error.contains("not reachable"), "{error}");
+        assert!(error.contains("nothing was sent"), "{error}");
+        assert!(!error.contains("operation may have completed"), "{error}");
+    }
 
     #[test]
     fn remote_does_not_replay_when_reply_is_lost() {
@@ -149,7 +262,7 @@ mod tests {
         let applied = server.join().unwrap();
 
         assert_eq!(applied, 1, "lost reply must not replay the applied edit; client returned {result:?}");
-        assert!(result.is_err(), "lost reply must report an uncertain outcome: {result:?}");
+        assert!(result.unwrap_err().contains("operation may have completed"), "lost reply must report an uncertain outcome");
         assert_eq!(next, Ok(json!({"applied": 1})), "the next explicit request must reconnect successfully");
     }
 }

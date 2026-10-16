@@ -104,9 +104,12 @@ impl Gradient {
         out
     }
     pub fn reverse(&mut self) {
+        // A midpoint belongs to the segment after its stop, so it moves with that segment and mirrors.
+        let mids: Vec<_> = self.stops.iter().rev().skip(1).map(|s| 1.0 - s.midpoint).collect();
         self.stops.reverse();
-        for s in &mut self.stops {
+        for (s, m) in self.stops.iter_mut().zip(mids.into_iter().chain([0.5])) {
             s.offset = 1.0 - s.offset;
+            s.midpoint = m;
         }
     }
     pub fn sort(&mut self) {
@@ -219,8 +222,24 @@ mod tests {
     #[test]
     fn reverse_stops() {
         let mut g = Gradient::default();
+        g.stops[0].midpoint = 0.25;
         g.reverse();
         assert_eq!(g.stops[0].color.to_hex(), "#000000");
         assert_eq!(g.stops[0].offset, 0.0);
+        // The midpoint moves to its reversed segment and mirrors.
+        assert!((g.sample(0.75).0.to_rgb()[0] - 0.5).abs() < 1e-5);
+        assert_eq!(g.stops.iter().map(|s| s.midpoint).collect::<Vec<_>>(), [0.75, 0.5]);
+
+        // With several stops, the reversed gradient is the original mirrored.
+        let mut g = Gradient::default();
+        g.stops[0].midpoint = 0.3;
+        g.stops.insert(1, GradientStop { offset: 0.4, color: Color::rgb(1.0, 0.0, 0.0), opacity: 0.5, midpoint: 0.8 });
+        let original = g.clone();
+        g.reverse();
+        for t in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let ((c, o), (want_c, want_o)) = (g.sample(t), original.sample(1.0 - t));
+            assert!(c.to_rgb().iter().zip(want_c.to_rgb()).all(|(a, b)| (a - b).abs() < 1e-5), "colour at {t}");
+            assert!((o - want_o).abs() < 1e-5, "opacity at {t}");
+        }
     }
 }

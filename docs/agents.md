@@ -21,8 +21,12 @@ Parameters are documented on each command (`params`), e.g. `{anchor? | paragraph
 ## Scripts: several commands, later ones using earlier results
 
 A script is one command per line (`command.id {json params}`; `#` comments), JSON lines, or a JSON array of
-`{command, params}`. A parameter string `"$N.path"` becomes that value of step N's result (0-based, `$last` for the
-previous step); `"${N.path}"` interpolates inside longer strings.
+`{command, params}`, in UTF-8 with or without a byte order mark. A parameter string `"$N.path"` becomes that value
+of step N's result: N is the 0-based step index (comments and blank lines are not steps, `$last` is the previous
+step) and the path goes through result fields and array indices (`"$1.story"`, `"$3.ids.0"`); `"${N.path}"`
+interpolates inside longer strings. In text parameters `\n` starts a new paragraph and `\u2028` is a forced line
+break. Most commands ignore parameters they don't know instead of rejecting them, so check names with `describe`.
+`designcraft-cli script --help` prints this reference.
 
 ```sh
 cat > page.dcs <<'DCS'

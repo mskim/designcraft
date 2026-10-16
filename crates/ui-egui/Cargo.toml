@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 designcraft-idml = { workspace = true }
 zip = { workspace = true }
 # Headless (offscreen wgpu) rendering of the whole window for UI screenshots: `examples/ui_shot.rs`.

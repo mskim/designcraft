@@ -123,7 +123,8 @@ impl Headless {
             let x = e.get("x").and_then(Value::as_f64).ok_or("pointer event needs numeric `x`")?;
             let y = e.get("y").and_then(Value::as_f64).ok_or("pointer event needs numeric `y`")?;
             let mods = e.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or(base);
-            self.session.pointer(&PointerEvent { kind, pos: Point::new(x, y), mods }, VIEW).map_err(|e| e.to_string())?;
+            let clicks = e.get("clicks").and_then(Value::as_u64).map_or(1, |n| n.clamp(1, 255) as u8);
+            self.session.pointer(&PointerEvent { kind, pos: Point::new(x, y), mods, clicks }, VIEW).map_err(|e| e.to_string())?;
         }
         let requests: Vec<Value> = self.session.ui_requests.drain(..).map(|r| serde_json::to_value(r).unwrap_or_default()).collect();
         Ok(json!({"selection": self.selection(), "tool": self.session.tool_id(), "requests": requests}))
@@ -201,7 +202,7 @@ impl Headless {
         let png = img.to_png();
         match s(p, "path") {
             Some(path) => {
-                std::fs::write(path, &png).map_err(|e| format!("write {path}: {e}"))?;
+                designcraft_engine::atomic::write_atomic(std::path::Path::new(path), &png).map_err(|e| format!("write {path}: {e}"))?;
                 Ok(json!({"path": path, "width": img.width, "height": img.height}))
             }
             None => Ok(json!({"width": img.width, "height": img.height, "pngBase64": designcraft_engine::cmd::base64_encode(&png)})),
@@ -221,7 +222,7 @@ impl Headless {
             .ok_or_else(|| format!("no page {page}"))?;
         let lower = path.to_ascii_lowercase();
         let bytes = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { img.to_jpeg(90) } else { img.to_png() };
-        std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
+        designcraft_engine::atomic::write_atomic(std::path::Path::new(path), &bytes).map_err(|e| format!("write {path}: {e}"))?;
         Ok(json!({"path": path, "width": img.width, "height": img.height}))
     }
 }

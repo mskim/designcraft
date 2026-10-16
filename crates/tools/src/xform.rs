@@ -1,6 +1,7 @@
 //! Rotate (R), Scale (S) and Shear (O) tools: drag around the selection centre (Alt-click sets
 //! the reference point elsewhere in a later iteration); Eyedropper (I): click an object to apply
-//! its attributes to the selection.
+//! its attributes to the selection, or a placed image to colour the selection (text or objects)
+//! with the image's colour under the pointer.
 
 use designcraft_doc::SpreadRef;
 use designcraft_geom::{Point, Rect};
@@ -247,6 +248,43 @@ fn positive_pad(v: f64) -> f64 {
     if v.is_finite() && v > 0.0 { v } else { 0.0 }
 }
 
+/// The spread and spread point under `p` when a placed raster shows there. Other graphic formats
+/// still block an image behind them, but use attribute matching instead of pixel sampling.
+fn image_under(cx: &ToolContext, p: Point) -> Option<(SpreadRef, Point)> {
+    use designcraft_doc::{Content, Item};
+    fn shows(d: &designcraft_doc::Document, it: &Item, outer: designcraft_geom::Affine, at: Point, depth: usize) -> Option<bool> {
+        if it.hidden || depth > 64 {
+            return None;
+        }
+        let xf = outer * it.xf;
+        if let Content::Group { items } = &it.content {
+            return items.iter().rev().find_map(|c| shows(d, c, xf, at, depth + 1));
+        }
+        let graphic = matches!(it.content, Content::Graphic(_));
+        // Unfilled frames (a text frame over the photo) let the image show through.
+        if !graphic && it.fill.is_none() {
+            return None;
+        }
+        if !designcraft_doc::edit_hit(it, outer.inverse() * at, 0.0) {
+            return None;
+        }
+        Some(match &it.content {
+            Content::Graphic(g) => d.assets.get(&g.asset).is_some_and(|a| a.is_raster()),
+            _ => false,
+        })
+    }
+    let (sr, at) = cx.layout.spread_at(p)?;
+    let sp = cx.doc.spread(sr)?;
+    let mut items: Vec<&Item> = sp.items.iter().map(|i| &**i).collect();
+    items.sort_by_key(|i| cx.doc.layer_rank(i.layer));
+    let image = items
+        .into_iter()
+        .rev()
+        .filter(|it| cx.doc.layer(it.layer).is_none_or(|l| l.visible))
+        .find_map(|it| shows(cx.doc, it, designcraft_geom::Affine::IDENTITY, at, 0))?;
+    image.then_some((sr, at))
+}
+
 #[derive(Default)]
 pub struct EyedropperTool;
 
@@ -258,8 +296,13 @@ impl Tool for EyedropperTool {
         if ev.kind != PointerKind::Down {
             return vec![];
         }
+        let selected = !cx.selection.items.is_empty() || cx.selection.text.is_some() || cx.selection.cells.is_some();
+        // A placed image under the pointer is sampled (its layer may be locked: sampling changes nothing).
+        if selected && let Some((sr, at)) = image_under(cx, ev.pos) {
+            return vec![Action::Exec("color.sample".into(), json!({"at": [at.x, at.y], "spread": sr}))];
+        }
         let Some((_, id)) = cx.hit(ev.pos) else { return vec![] };
-        if cx.selection.items.is_empty() && cx.selection.text.is_none() {
+        if !selected {
             return vec![Action::Exec("selection.set".into(), json!({"ids": [id.0]}))];
         }
         vec![Action::Exec("object.matchAttributes".into(), json!({"from": id.0}))]

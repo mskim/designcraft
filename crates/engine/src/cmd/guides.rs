@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("guide.move", "Move Guide", [], None, "{spread?, page, index, position}", has_doc, move_guide),
         cmd!("guide.delete", "Delete Guide", [], None, "{spread?, page, index}", has_doc, delete),
         cmd!("guide.deleteAll", "Delete All Guides on Spread", ["View", "Grids & Guides"], None, "{spread?}", has_doc, |s, p| {
-            let r = guide_spread(p, "guide.deleteAll")?;
+            let r = super::spread_param(p, "guide.deleteAll")?;
             s.edit(|d, _| {
                 let sp = d.spread_mut(r).ok_or_else(|| bad("guide.deleteAll", "no such spread"))?;
                 let mut n = 0;
@@ -41,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(query "guide.list", "Guides", [], None, "{spread?} → [{page, index, orientation, position, spread}]", has_doc, |s, p| {
             let d = &s.doc()?.doc;
-            let sp = d.spread(guide_spread(p, "guide.list")?).ok_or_else(|| bad("guide.list", "no such spread"))?;
+            let sp = d.spread(super::spread_param(p, "guide.list")?).ok_or_else(|| bad("guide.list", "no such spread"))?;
             let mut out = Vec::new();
             for (pi, pg) in sp.pages.iter().enumerate() {
                 for (i, g) in pg.guides.iter().enumerate() {
@@ -71,23 +71,6 @@ fn optional_usize(p: &Value, key: &str, command: &str) -> Result<Option<usize>> 
     p.get(key).map(|value| checked_usize(value, key, command)).transpose()
 }
 
-/// Numeric spread shorthand or the serialized `SpreadRef` form, without lossy/defaulting casts.
-fn guide_spread(p: &Value, command: &str) -> Result<SpreadRef> {
-    let Some(value) = p.get("spread") else { return Ok(SpreadRef::Doc(0)) };
-    if value.is_number() {
-        return Ok(SpreadRef::Doc(checked_usize(value, "spread", command)?));
-    }
-    let object = value.as_object().ok_or_else(|| bad(command, "`spread` must be a non-negative integer or a spread reference"))?;
-    let kind = object.get("kind").and_then(Value::as_str).ok_or_else(|| bad(command, "`spread.kind` must be `doc` or `parent`"))?;
-    let index = object.get("index").ok_or_else(|| bad(command, "missing `spread.index`"))?;
-    let index = checked_usize(index, "spread.index", command)?;
-    match kind {
-        "doc" => Ok(SpreadRef::Doc(index)),
-        "parent" => Ok(SpreadRef::Parent(index)),
-        _ => Err(bad(command, "`spread.kind` must be `doc` or `parent`")),
-    }
-}
-
 fn finite_number(p: &Value, key: &str, command: &str) -> Result<Option<f64>> {
     let Some(value) = p.get(key) else { return Ok(None) };
     let number = value.as_f64().ok_or_else(|| bad(command, format!("`{key}` must be a finite number")))?;
@@ -113,7 +96,7 @@ fn page_at(d: &Document, r: SpreadRef, x: f64) -> usize {
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let o = orientation(p)?;
     let pos = finite_number(p, "position", "guide.add")?.ok_or_else(|| bad("guide.add", "missing position"))?;
-    let r = guide_spread(p, "guide.add")?;
+    let r = super::spread_param(p, "guide.add")?;
     let spread_guide = p.get("spreadGuide").and_then(Value::as_bool).unwrap_or(false);
     let d = &s.doc()?.doc;
     let pi = match optional_usize(p, "page", "guide.add")? {
@@ -139,7 +122,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 fn guide_ref(p: &Value, cmd: &str) -> Result<(SpreadRef, usize, usize)> {
     let pi = optional_usize(p, "page", cmd)?.ok_or_else(|| bad(cmd, "missing page"))?;
     let i = optional_usize(p, "index", cmd)?.ok_or_else(|| bad(cmd, "missing index"))?;
-    Ok((guide_spread(p, cmd)?, pi, i))
+    Ok((super::spread_param(p, cmd)?, pi, i))
 }
 
 /// Commands must use the same guide/layer protection as pointer editing.
@@ -237,7 +220,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
     let cg = guide_gutter(p, "columnGutter")?;
     let to_page = str_param(p, "fitTo") == Some("page");
     let remove = p.get("removeExisting").and_then(Value::as_bool).unwrap_or(false);
-    let r = guide_spread(p, "layout.createGuides")?;
+    let r = super::spread_param(p, "layout.createGuides")?;
     let only = optional_usize(p, "page", "layout.createGuides")?;
     let page_count = {
         let sp = s.doc()?.doc.spread(r).ok_or_else(|| bad("layout.createGuides", "no such spread"))?;

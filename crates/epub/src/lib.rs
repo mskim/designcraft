@@ -322,7 +322,10 @@ pub fn stylesheet(doc: &Document) -> String {
         let mut rule = String::new();
         para_css(&pp, base, lead, &mut rule);
         char_css(doc, &cp, base, &mut rule);
-        let _ = writeln!(css, "p.{} {{ {rule}}}", pc[ps.name.as_str()]);
+        let (tag, class) = export_mapping(st, &ps.name, false, &pc);
+        if let Some(selector) = class_selector(tag, &class) {
+            let _ = writeln!(css, "{selector} {{ {rule}}}");
+        }
     }
     for cs in &st.character {
         if cs.name == story::NO_CHAR_STYLE {
@@ -347,7 +350,10 @@ pub fn stylesheet(doc: &Document) -> String {
         if let Some(sz) = c.size {
             let _ = write!(rule, "font-size: {:.3}em; ", sz / base);
         }
-        let _ = writeln!(css, "span.{} {{ {rule}}}", cc[cs.name.as_str()]);
+        let (tag, class) = export_mapping(st, &cs.name, true, &cc);
+        if let Some(selector) = class_selector(tag, &class) {
+            let _ = writeln!(css, "{selector} {{ {rule}}}");
+        }
     }
     css
 }
@@ -386,6 +392,39 @@ fn is_tag(t: &str, character: bool) -> bool {
     }
 }
 
+/// Resolve Export Tagging once for both markup and its stylesheet. Keep the generated,
+/// collision-free class when no custom class was supplied, and the existing tag fallback.
+fn export_mapping<'a>(st: &'a Styles, name: &str, character: bool, classes: &BTreeMap<&str, String>) -> (&'a str, String) {
+    let et = st.export_tag(name, character);
+    let tag = et.map(|e| e.tag.as_str()).filter(|t| is_tag(t, character)).unwrap_or(if character { "span" } else { "p" });
+    let class = et.map(|e| e.class.clone()).filter(|c| !c.is_empty()).or_else(|| classes.get(name).cloned()).unwrap_or_else(|| slug(name));
+    // Match the characters xml_attr actually emits, before escaping either output context.
+    let class = class.chars().filter(|c| valid_xml_char(*c) && !('\u{E000}'..='\u{E1FF}').contains(c)).collect();
+    (tag, class)
+}
+
+/// Each class token must match on the same element. Escape CSS identifier punctuation and
+/// leading digits without changing the class written into XHTML.
+fn class_selector(tag: &str, class: &str) -> Option<String> {
+    let mut tokens = class.split_ascii_whitespace().peekable();
+    // A nonempty but whitespace-only custom class has no token to select. Never emit a bare
+    // element selector, which would apply this style to unrelated paragraphs or character runs.
+    tokens.peek()?;
+    let mut selector = tag.to_string();
+    for token in tokens {
+        selector.push('.');
+        for (i, c) in token.chars().enumerate() {
+            let leading_digit = c.is_ascii_digit() && (i == 0 || i == 1 && token.starts_with('-'));
+            if !leading_digit && token != "-" && (c.is_ascii_alphanumeric() || matches!(c, '-' | '_') || !c.is_ascii()) {
+                selector.push(c);
+            } else {
+                let _ = write!(selector, "\\{:x} ", c as u32);
+            }
+        }
+    }
+    Some(selector)
+}
+
 /// One story as XHTML paragraphs.
 pub fn story_html(doc: &Document, sid: StoryId) -> String {
     let Some(st) = doc.story(sid) else { return String::new() };
@@ -394,10 +433,7 @@ pub fn story_html(doc: &Document, sid: StoryId) -> String {
     for (pi, r) in st.para_ranges().iter().enumerate() {
         let pf = &st.paras[pi];
         // Export Tagging: the style's element and class.
-        let et = doc.styles.export_tag(&pf.style, false);
-        let tag = et.map(|e| e.tag.as_str()).filter(|t| is_tag(t, false)).unwrap_or("p");
-        let class =
-            et.map(|e| e.class.clone()).filter(|c| !c.is_empty()).or_else(|| pc.get(pf.style.as_str()).cloned()).unwrap_or_else(|| slug(&pf.style));
+        let (tag, class) = export_mapping(&doc.styles, &pf.style, false, &pc);
         let text_empty = st.text[r.clone()].trim().is_empty();
         let rtl = doc.styles.resolve_para(pf).0.direction == designcraft_doc::TextDirection::RightToLeft;
         let _ = write!(out, "<{tag} class=\"{}\"{}>", xml_attr(&class), if rtl { " dir=\"rtl\"" } else { "" });
@@ -427,17 +463,11 @@ pub fn story_html(doc: &Document, sid: StoryId) -> String {
             } else {
                 story_markup(raw)
             };
-            let et = (f.style != story::NO_CHAR_STYLE).then(|| doc.styles.export_tag(&f.style, true)).flatten();
-            let ctag = et.map(|e| e.tag.as_str()).filter(|t| is_tag(t, true)).unwrap_or("span");
-            let cls = if f.style != story::NO_CHAR_STYLE {
-                let class = et
-                    .map(|e| e.class.clone())
-                    .filter(|c| !c.is_empty())
-                    .or_else(|| cc.get(f.style.as_str()).cloned())
-                    .unwrap_or_else(|| slug(&f.style));
-                format!(" class=\"{}\"", xml_attr(&class))
+            let (ctag, cls) = if f.style != story::NO_CHAR_STYLE {
+                let (tag, class) = export_mapping(&doc.styles, &f.style, true, &cc);
+                (tag, format!(" class=\"{}\"", xml_attr(&class)))
             } else {
-                String::new()
+                ("span", String::new())
             };
             let style = override_css(doc, &f.over);
             let style_attr = if style.is_empty() { String::new() } else { format!(" style=\"{}\"", xml_attr(&style)) };

@@ -127,6 +127,23 @@ fn a_link_back_to_a_parent_folder_ends_the_scan() {
 }
 
 #[test]
+fn a_familys_kind_is_read_without_keeping_it_loaded() {
+    let dir = font_dir("kind");
+    let db = FontDb::with_font_dirs(vec![dir]);
+    db.load_system_fonts();
+    let fonts = db.scoped(0);
+    let (kind, added) = fonts.family_kind(FAMILY).expect("an installed family");
+    assert_eq!(kind.class, crate::kind::FontClass::SansSerif);
+    assert!(added.is_some(), "the file's date");
+    assert!(!db.is_loaded(FAMILY), "the file was read and let go");
+    // A loaded family is asked directly, with the same answer.
+    let _ = fonts.face(FAMILY, "Regular");
+    assert!(db.is_loaded(FAMILY));
+    assert_eq!(fonts.family_kind(FAMILY).map(|(k, _)| k.class), Some(crate::kind::FontClass::SansSerif));
+    assert!(fonts.family_kind("No Such Family").is_none());
+}
+
+#[test]
 fn the_scan_reads_names_without_loading_the_font() {
     let dir = font_dir("names");
     let names: Vec<(String, String)> = file_face_names(&dir.join("Sysfont-Regular.ttf")).into_iter().map(|f| (f.family, f.style)).collect();

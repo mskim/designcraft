@@ -489,9 +489,17 @@ fn control_text(app: &mut DesignApp, ui: &mut egui::Ui) {
     });
 }
 
+/// The widest a document tab grows: a longer name is shortened so its close button and the
+/// tabs after it stay in view.
+const DOC_TAB_MAX_W: f32 = 260.0;
+/// Close button and padding around a tab's title.
+const DOC_TAB_PAD: f32 = 44.0;
+
 pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+    let max_w = DOC_TAB_MAX_W.min(bar.width());
+    let close_label = crate::i18n::tr(&app.ui.language, "Close");
     ui.painter().rect_filled(bar, 0.0, t.tab_strip);
     ui.painter().line_segment([bar.left_bottom(), bar.right_bottom()], Stroke::new(1.0, t.border));
     let mut x = bar.min.x;
@@ -504,14 +512,28 @@ pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
         let is_active = Some(i) == active;
         // `*` = unsaved; the view-mode suffix only in Preview (InDesign shows its GPU mode there).
         let suffix = if is_active && app.ui.screen_mode == crate::ScreenMode::Preview { " [Preview]" } else { "" };
-        let label = format!("{}{} @ {:.0}%{suffix}", if *dirty { "*" } else { "" }, crate::rtl::isolate(title), zoom * 100.0);
-        let galley = crate::rtl::plain(ui.ctx(), &label, semibold(11.5), if is_active { t.text_strong } else { t.text_dim });
-        let w = (galley.size().x + 44.0).max(if is_active { 210.0 } else { 150.0 });
+        let color = if is_active { t.text_strong } else { t.text_dim };
+        // The name gives way first; the dirty marker and zoom stay readable.
+        let zoom_label = crate::rtl::plain(ui.ctx(), &format!(" @ {:.0}%{suffix}", zoom * 100.0), semibold(11.5), color);
+        let name = format!("{}{}", if *dirty { "*" } else { "" }, crate::rtl::isolate(title));
+        let name_max = max_w - DOC_TAB_PAD - zoom_label.size().x;
+        let galley = crate::rtl::truncated(ui.ctx(), &name, semibold(11.5), color, name_max);
+        let elided = galley.elided;
+        let w = (galley.size().x + zoom_label.size().x + DOC_TAB_PAD).max(if is_active { 210.0 } else { 150.0 }).min(max_w);
         let r = egui::Rect::from_min_size(egui::pos2(x, bar.min.y), vec2(w, 28.0));
         let resp = ui.interact(r, ui.id().with(("doctab", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+        let resp = if elided {
+            resp.on_hover_ui(|ui| {
+                let _ = crate::rtl::label(ui, title);
+            })
+        } else {
+            resp
+        };
         ui.painter().rect_filled(r, 0.0, if is_active { t.panel } else { t.tab_strip });
         let cr = egui::Rect::from_center_size(egui::pos2(r.min.x + 18.0, r.center().y), vec2(14.0, 14.0));
         let cresp = ui.interact(cr, ui.id().with(("docclose", i)), Sense::click());
+        cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{close_label} {title}")));
         ui.painter().text(
             cr.center(),
             egui::Align2::CENTER_CENTER,
@@ -519,7 +541,11 @@ pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
             egui::FontId::proportional(14.0),
             if cresp.hovered() { t.text_strong } else { t.text_dim },
         );
-        ui.painter().galley(egui::pos2(r.min.x + 32.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        let name_w = galley.size().x;
+        // Clipped too, for a window narrower than the zoom label.
+        let text = ui.painter().with_clip_rect(r);
+        text.galley(egui::pos2(r.min.x + 32.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        text.galley(egui::pos2(r.min.x + 32.0 + name_w, r.center().y - zoom_label.size().y / 2.0), zoom_label, Color32::WHITE);
         ui.painter().line_segment([r.right_top(), r.right_bottom()], Stroke::new(1.0, t.border));
         if cresp.clicked() {
             close = Some(i);
@@ -781,6 +807,27 @@ mod tests {
 
     fn rect(h: &egui_kittest::Harness<'static, test_window::Window>, label: &str) -> egui::Rect {
         h.get_by_label(label).rect()
+    }
+
+    /// A very long document name made its tab grow past the window, hiding the close button
+    /// and the tabs after it (#603).
+    #[test]
+    fn long_document_names_keep_tabs_short_and_close_buttons_visible() {
+        let latin = "Quarterly report with a very long file name ".repeat(6);
+        let hebrew = "דוח רבעוני עם שם קובץ ארוך מאוד ".repeat(6);
+        let mut app = app();
+        for title in [latin.as_str(), hebrew.as_str(), "Short"] {
+            app.run("file.new", serde_json::json!({ "title": title })).unwrap();
+        }
+        let h = test_window::open(app, vec2(1200.0, 600.0));
+        for title in [latin.as_str(), hebrew.as_str()] {
+            let tab = rect(&h, title);
+            assert!(tab.width() <= super::DOC_TAB_MAX_W, "{title:?} tab is {} wide", tab.width());
+            let close = rect(&h, &format!("Close {title}"));
+            assert!(tab.contains_rect(close), "close button {close:?} outside its tab {tab:?}");
+        }
+        let (first, short) = (rect(&h, &latin), rect(&h, "Short"));
+        assert!(short.min.x - first.min.x <= 2.0 * super::DOC_TAB_MAX_W, "the last tab {short:?} starts too far right");
     }
 
     #[test]

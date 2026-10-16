@@ -50,6 +50,7 @@ mod strokes;
 mod style;
 pub mod table;
 pub mod text;
+mod thread;
 mod toc;
 mod transitions;
 mod variables;
@@ -184,6 +185,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(package::specs());
         v.extend(print::specs());
         v.extend(text::specs());
+        v.extend(thread::specs());
         v.extend(style::specs());
         v.extend(table::specs());
         v.extend(layout::specs());
@@ -254,12 +256,23 @@ pub(crate) fn rect_param(p: &Value, key: &str) -> Option<Rect> {
     let f = |i: usize| a.get(i).and_then(Value::as_f64);
     Some(Rect::new(f(0)?, f(1)?, f(2)?, f(3)?))
 }
-/// `{"kind":"doc","index":0}`, `0` or absent (= spread 0).
-pub(crate) fn spread_param(p: &Value, key: &str) -> SpreadRef {
-    match p.get(key) {
-        Some(Value::Number(n)) => SpreadRef::Doc(n.as_u64().unwrap_or(0) as usize),
-        Some(v) => serde_json::from_value(v.clone()).unwrap_or(SpreadRef::Doc(0)),
-        None => SpreadRef::Doc(0),
+/// The `spread` param: a body spread index (`0`), a spread reference (`{"kind":"doc"|"parent","index":0}`)
+/// or absent (= spread 0). Anything else is an error: read as spread 0, a script aiming at a parent
+/// spread got its items on the first page without a word.
+pub(crate) fn spread_param(p: &Value, command: &str) -> Result<SpreadRef> {
+    let index = |v: &Value, key: &str| {
+        v.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(command, format!("`{key}` must be a non-negative integer")))
+    };
+    let Some(value) = p.get("spread") else { return Ok(SpreadRef::Doc(0)) };
+    if value.is_number() {
+        return Ok(SpreadRef::Doc(index(value, "spread")?));
+    }
+    let object = value.as_object().ok_or_else(|| bad(command, "`spread` must be a non-negative integer or {kind: doc|parent, index}"))?;
+    let i = index(object.get("index").ok_or_else(|| bad(command, "missing `spread.index`"))?, "spread.index")?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("doc") => Ok(SpreadRef::Doc(i)),
+        Some("parent") => Ok(SpreadRef::Parent(i)),
+        _ => Err(bad(command, "`spread.kind` must be `doc` or `parent`")),
     }
 }
 

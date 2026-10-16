@@ -64,8 +64,31 @@ impl eframe::App for App {
         if let Some(s) = self.startup.as_mut() {
             s.presented();
         }
+        if let Err(e) = preserve_documents_on_exit(&mut self.app) {
+            log::error!("Couldn't preserve documents on exit: {e}");
+            eprintln!("designcraft: couldn't preserve documents on exit: {e}");
+        }
         save_prefs(&self.app);
     }
+}
+
+/// Orderly OS termination can bypass egui's cancelable close event. Finish only a complete,
+/// current quit plan; otherwise preserve every live document, including edits after the timer.
+fn preserve_documents_on_exit(app: &mut DesignApp) -> Result<(), String> {
+    app.finish_confirmed_quit()?;
+    if app.session.documents().is_empty() {
+        return Ok(());
+    }
+    if app.session.recovery_dir.is_none() {
+        return if app.session.documents().iter().any(|d| d.is_dirty()) {
+            Err("Recovery is unavailable; unsaved documents could not be preserved on exit".into())
+        } else {
+            Ok(())
+        };
+    }
+    // Also discard stale recovery for clean documents (for example, Undo back to the saved
+    // state after the last timer tick). Never choose a fallback recovery path here.
+    app.run("file.recovery.save", serde_json::json!({})).map(|_| ())
 }
 
 /// `DESIGNCRAFT_NO_PREFS`: read and write nothing in the settings directory (tests, demos).
@@ -186,7 +209,8 @@ fn services() -> Services {
         })),
         pick_save: Some(Box::new(|name: &str| rfd::FileDialog::new().set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string()))),
         read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
-        write: Some(Box::new(|p: &str, b: &[u8]| std::fs::write(p, b).map_err(|e| e.to_string()))),
+        write: Some(Box::new(|p: &str, b: &[u8]| designcraft_engine::atomic::write_atomic(std::path::Path::new(p), b).map_err(|e| e.to_string()))),
+        clipboard_text: Some(Box::new(|| arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok())),
         ..Default::default()
     }
 }
@@ -276,6 +300,15 @@ fn main() -> eframe::Result {
             b.with_x11();
         }));
     }
+    // AppKit Dock Quit otherwise terminates before egui can cancel the close. Route it through
+    // ordinary CloseRequested events, preserving the same transactional Save/Don't Save flow.
+    #[cfg(target_os = "macos")]
+    {
+        options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            builder.with_close_requested_on_terminate(true);
+        }));
+    }
     eframe::run_native(
         "DesignCraft",
         options,
@@ -351,5 +384,170 @@ mod tests {
         assert!(place.iter().any(|filter| filter.extensions.contains(&"png")));
         let documents = super::open_filters("");
         assert!(documents.iter().any(|filter| filter.extensions.contains(&"designcraft")));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod atomic_writer_tests {
+    #[test]
+    fn desktop_write_preserves_an_existing_reader_and_private_symlink_target() {
+        use std::io::Read;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("designcraft-desktop-atomic-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let target = fixture.0.join(format!("{}.png", "a".repeat(243)));
+        let old = b"previous private export";
+        std::fs::write(&target, old).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = fixture.0.join("linked.png");
+        symlink(target.file_name().unwrap(), &alias).unwrap();
+        let mut reader = std::fs::File::open(&target).unwrap();
+        let mut write = super::services().write.unwrap();
+        write(alias.to_str().unwrap(), b"complete new export").unwrap();
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).unwrap();
+        assert!(observed == old, "desktop export changed bytes under an existing reader");
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete new export");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::symlink_metadata(alias).unwrap().file_type().is_symlink());
+    }
+}
+
+#[cfg(test)]
+mod exit_recovery_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dirty_app(label: &str) -> (DesignApp, std::path::PathBuf) {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({})).unwrap();
+        app.run("frame.create", json!({"rect": [20, 20, 120, 120]})).unwrap();
+        let uid = app.session.active().unwrap().uid;
+        let dir = std::env::temp_dir().join(format!("designcraft-exit-{label}-{}-{uid}", std::process::id()));
+        assert!(!dir.exists());
+        app.session.recovery_dir = Some(dir.clone());
+        (app, dir)
+    }
+
+    fn close_frame(app: &mut DesignApp, ctx: &egui::Context, close: bool) {
+        let mut raw = egui::RawInput::default();
+        if close {
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        }
+        let mut out = ctx.run_ui(raw, |ui| app.logic(ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn exit_recovery_preserves_latest_dirty_document_without_mutating_it() {
+        let (mut app, dir) = dirty_app("latest");
+        app.run("file.recovery.save", json!({})).unwrap();
+        app.run("frame.create", json!({"rect": [200, 200, 300, 300]})).unwrap();
+        let d = app.session.active().unwrap();
+        let (uid, revision, saved_revision, doc, selection, undo, redo) =
+            (d.uid, d.revision, d.saved_revision, d.doc.clone(), d.selection.items.clone(), d.history.undo.len(), d.history.redo.len());
+        preserve_documents_on_exit(&mut app).unwrap();
+        let current = app.session.active().unwrap();
+        assert_eq!(
+            (current.uid, current.revision, current.saved_revision, &current.selection.items, current.history.undo.len(), current.history.redo.len()),
+            (uid, revision, saved_revision, &selection, undo, redo)
+        );
+        assert!(std::sync::Arc::ptr_eq(&current.doc, &doc));
+        assert!(current.is_dirty());
+        let recovered = designcraft_engine::cmd::from_bytes(&std::fs::read(dir.join(format!("{uid}.designcraft"))).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&recovered).unwrap(), serde_json::to_value(doc.as_ref()).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exit_recovery_removes_stale_data_after_undo_to_saved_state() {
+        let (mut app, dir) = dirty_app("clean");
+        let uid = app.session.active().unwrap().uid;
+        app.run("file.recovery.save", json!({})).unwrap();
+        let entry = dir.join(format!("{uid}.designcraft"));
+        assert!(entry.exists());
+        app.run("edit.undo", json!({})).unwrap();
+        assert!(!app.session.active().unwrap().is_dirty());
+        let doc = app.session.active().unwrap().doc.clone();
+        preserve_documents_on_exit(&mut app).unwrap();
+        assert!(!entry.exists(), "clean exit must not resurrect the pre-Undo edits");
+        assert!(std::sync::Arc::ptr_eq(&app.session.active().unwrap().doc, &doc));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exit_recovery_reports_unavailable_or_failed_storage_without_changing_documents() {
+        let (mut app, dir) = dirty_app("failure");
+        let doc = app.session.active().unwrap().doc.clone();
+        app.session.recovery_dir = None;
+        assert!(preserve_documents_on_exit(&mut app).unwrap_err().contains("unavailable"));
+        std::fs::create_dir(&dir).unwrap();
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"preserve this file").unwrap();
+        app.session.recovery_dir = Some(blocked.clone());
+        assert!(preserve_documents_on_exit(&mut app).is_err());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve this file");
+        assert!(std::sync::Arc::ptr_eq(&app.session.active().unwrap().doc, &doc));
+        assert!(app.session.active().unwrap().is_dirty());
+        assert_eq!(app.session.documents().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exit_recovery_respects_complete_incomplete_stale_and_new_document_quit_plans() {
+        for case in ["complete", "incomplete", "stale", "new"] {
+            let (mut app, dir) = dirty_app(case);
+            if case == "incomplete" {
+                app.run("file.new", json!({})).unwrap();
+                app.run("frame.create", json!({"rect": [20, 20, 120, 120]})).unwrap();
+            }
+            app.run("file.recovery.save", json!({})).unwrap();
+            let first_uid = app.session.documents()[0].uid;
+            let ctx = egui::Context::default();
+            close_frame(&mut app, &ctx, true);
+            app.ui.dialog.as_mut().unwrap().fields.insert("discard".into(), json!(true));
+            designcraft_ui_egui::dialogs::confirm(&mut app).unwrap();
+            close_frame(&mut app, &ctx, false);
+            if case == "stale" {
+                app.run("frame.create", json!({"rect": [200, 200, 300, 300]})).unwrap();
+            } else if case == "new" {
+                app.run("file.new", json!({})).unwrap();
+                app.run("frame.create", json!({"rect": [20, 20, 120, 120]})).unwrap();
+            }
+            let active = app.session.active().unwrap().uid;
+            let before: Vec<_> = app
+                .session
+                .documents()
+                .iter()
+                .map(|d| (d.uid, d.revision, d.doc.clone(), d.selection.items.clone(), d.history.undo.len(), d.history.redo.len()))
+                .collect();
+            preserve_documents_on_exit(&mut app).unwrap();
+            if case == "complete" {
+                assert!(app.session.documents().is_empty());
+                assert!(!dir.join(format!("{first_uid}.designcraft")).exists(), "accepted Don't Save must not be recovered");
+            } else {
+                assert_eq!(app.session.documents().len(), before.len(), "{case}");
+                assert_eq!(app.session.active().unwrap().uid, active, "{case}");
+                for (d, (uid, revision, doc, selection, undo, redo)) in app.session.documents().iter().zip(before) {
+                    assert_eq!(
+                        (d.uid, d.revision, &d.selection.items, d.history.undo.len(), d.history.redo.len()),
+                        (uid, revision, &selection, undo, redo),
+                        "{case}"
+                    );
+                    assert!(std::sync::Arc::ptr_eq(&d.doc, &doc), "{case}");
+                    let recovered = designcraft_engine::cmd::from_bytes(&std::fs::read(dir.join(format!("{uid}.designcraft"))).unwrap()).unwrap();
+                    assert_eq!(serde_json::to_value(&recovered).unwrap(), serde_json::to_value(doc.as_ref()).unwrap(), "{case}");
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

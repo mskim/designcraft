@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             |s, p| {
                 let parent = StoryId(p.get("story").and_then(Value::as_u64).ok_or_else(|| bad("story.placeAndLink", "missing story"))?);
                 let rect = rect_param(p, "rect").ok_or_else(|| bad("story.placeAndLink", "missing rect"))?;
-                let sr = spread_param(p, "spread");
+                let sr = spread_param(p, "story.placeAndLink")?;
                 let layer = s.doc()?.active_layer;
                 s.edit(|d, sel| {
                     if d.story(parent).is_none() {

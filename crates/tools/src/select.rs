@@ -3,11 +3,13 @@
 //! Click selects the frontmost item (Shift toggles), drag moves (Alt duplicates, Shift constrains),
 //! the 8 bounding-box handles resize (Shift keeps proportions, Alt from centre, Cmd scales content),
 //! empty-canvas drags make a marquee, double-clicking a text frame switches to the Type tool.
+//! A click on a selected text frame's in or out port loads the text cursor (see [`crate::thread`]).
 
 use designcraft_doc::{ItemId, SpreadRef};
 use designcraft_geom::{Affine, Point, Rect, Vec2};
 use serde_json::{Value, json};
 
+use crate::thread::Loaded;
 use crate::{Action, Cursor, Gesture, Mods, Overlay, PointerEvent, PointerKind, SnapRequest, Tool, ToolContext, ToolKey, rect_json, spread_json};
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,16 @@ enum Drag {
         start: Point,
         cur: Point,
     },
+    /// A press with the loaded text cursor.
+    Place {
+        start: Point,
+        cur: Point,
+    },
+    /// Dragging a type-on-a-path bracket along its path (`end`: the end bracket).
+    Bracket {
+        id: ItemId,
+        end: bool,
+    },
     Anchor {
         id: u64,
         si: usize,
@@ -49,6 +61,50 @@ enum Drag {
         /// previous preview, so the snap must not read the anchor from it again.
         at: Option<(SpreadRef, Point)>,
     },
+}
+
+/// Half the length of a path-type bracket, in screen pixels.
+const BRACKET_PX: f64 = 9.0;
+
+/// A selected type-on-a-path item's path (inner space), its inner → canvas transform and its
+/// brackets' arc lengths (start, end).
+fn path_type_of(cx: &ToolContext, id: ItemId) -> Option<(designcraft_geom::warp::PathWarp, designcraft_geom::Affine, f64, f64)> {
+    let it = cx.doc.item(id)?;
+    let pt = it.text_frame()?.options.path.as_ref()?;
+    let warp = designcraft_geom::warp::PathWarp::new(&it.path.to_bezpath(), pt.flip);
+    let end = pt.end.unwrap_or(warp.length()).min(warp.length());
+    Some((warp, cx.item_canvas_xf(id)? * it.xf, pt.start, end))
+}
+
+/// The bracket line at arc length `s`: across the path, `BRACKET_PX` either side (canvas).
+fn bracket_line(cx: &ToolContext, warp: &designcraft_geom::warp::PathWarp, xf: designcraft_geom::Affine, s: f64) -> Option<(Point, Point)> {
+    let (p, a) = warp.at(s)?;
+    let c = xf * p;
+    let t = xf * (p + designcraft_geom::Vec2::new(a.cos(), a.sin())) - c;
+    let n = designcraft_geom::Vec2::new(-t.y, t.x);
+    let n = n / n.hypot().max(1e-9) * cx.tol(BRACKET_PX);
+    Some((c - n, c + n))
+}
+
+/// The bracket of a selected type-on-a-path item under `p` (canvas): (item, whether it is the end
+/// bracket).
+fn bracket_at(cx: &ToolContext, p: Point) -> Option<(ItemId, bool)> {
+    let tol = cx.tol(BRACKET_PX);
+    cx.selection.items.iter().find_map(|id| {
+        let (warp, xf, start, end) = path_type_of(cx, *id)?;
+        if cx.doc.item(*id).is_some_and(|it| it.locked) {
+            return None;
+        }
+        let near = |s: f64| warp.at(s).is_some_and(|(q, _)| (xf * q - p).hypot() <= tol);
+        // The end bracket first: with both brackets at one point, it can still be pulled back.
+        if near(end) {
+            Some((*id, true))
+        } else if near(start) {
+            Some((*id, false))
+        } else {
+            None
+        }
+    })
 }
 
 /// Anchor or handle of a selected item under `p` (canvas): (item, subpath, anchor, handle).
@@ -100,11 +156,57 @@ pub struct SelectionTool {
     guides: Vec<Overlay>,
     /// Selected item to toggle if this Shift press never becomes a drag.
     shift_release: Option<u64>,
+    /// The loaded text cursor.
+    loaded: Option<Loaded>,
 }
 
 impl SelectionTool {
     pub fn new(direct: bool) -> Self {
-        Self { direct, drag: Drag::None, hover_handle: None, guides: vec![], shift_release: None }
+        Self { direct, drag: Drag::None, hover_handle: None, guides: vec![], shift_release: None, loaded: None }
+    }
+
+    /// Ports and the loaded text cursor. None: not a threading event.
+    fn thread_pointer(&mut self, cx: &ToolContext, ev: &PointerEvent) -> Option<Vec<Action>> {
+        let p = ev.pos;
+        let exec = |c: Option<(&'static str, Value)>| c.map(|(id, params)| Action::Exec(id.into(), params)).into_iter().collect::<Vec<_>>();
+        // A double click: sent as such, or the canvas's second press.
+        if matches!(ev.kind, PointerKind::Down | PointerKind::DoubleClick)
+            && ev.click_count() == 2
+            && let Some((frame, out)) = crate::thread::port_at(cx, p)
+        {
+            self.loaded = None;
+            self.drag = Drag::None;
+            return Some(exec(crate::thread::unthread_at_port(cx.doc, frame, out)));
+        }
+        self.loaded = self.loaded.and_then(|l| l.resolve(cx.doc));
+        match (ev.kind, self.loaded) {
+            (PointerKind::Down | PointerKind::DoubleClick, _) if let Some((frame, out)) = crate::thread::port_at(cx, p) => {
+                self.loaded = Some(Loaded::new(frame, out));
+                self.drag = Drag::None;
+                Some(vec![])
+            }
+            (PointerKind::Down | PointerKind::DoubleClick, Some(_)) => {
+                self.drag = Drag::Place { start: p, cur: p };
+                Some(vec![])
+            }
+            (PointerKind::Drag, Some(_)) => {
+                if let Drag::Place { start, .. } = self.drag {
+                    self.drag = Drag::Place { start, cur: p };
+                }
+                Some(vec![])
+            }
+            (PointerKind::Up, Some(l)) => {
+                let Drag::Place { start, .. } = std::mem::replace(&mut self.drag, Drag::None) else { return Some(vec![]) };
+                let clicked = l.click(cx, start, p, ev.mods);
+                // Alt (semi-autoflow) stays loaded with what is left; an invalid target keeps the load.
+                if let Some(c) = &clicked {
+                    self.loaded = c.joins.filter(|_| ev.mods.alt && !ev.mods.shift).map(|j| Loaded { advance: Some(j), ..l });
+                }
+                Some(exec(clicked.map(|c| (c.id, c.params))))
+            }
+            (PointerKind::Move, Some(_)) => Some(vec![]),
+            _ => None,
+        }
     }
 }
 
@@ -371,6 +473,19 @@ impl Tool for SelectionTool {
 
     fn pointer(&mut self, cx: &ToolContext, ev: &PointerEvent) -> Vec<Action> {
         let p = ev.pos;
+        if !self.direct
+            && let Some(actions) = self.thread_pointer(cx, ev)
+        {
+            return actions;
+        }
+        // The second press of a double click on a text frame: edit its text.
+        if matches!(ev.kind, PointerKind::Down | PointerKind::DoubleClick)
+            && ev.click_count() == 2
+            && let Some(actions) = edit_text_at(cx, p)
+        {
+            self.drag = Drag::None;
+            return actions;
+        }
         match ev.kind {
             PointerKind::Move => {
                 self.hover_handle = handle_at(cx, p);
@@ -378,6 +493,13 @@ impl Tool for SelectionTool {
             }
             PointerKind::Down => {
                 self.shift_release = None;
+                // Type on a path: a bracket moves where the text starts or ends.
+                if !ev.mods.shift
+                    && let Some((id, end)) = bracket_at(cx, p)
+                {
+                    self.drag = Drag::Bracket { id, end };
+                    return vec![Action::Begin("Move Bracket".into())];
+                }
                 if self.direct
                     && let Some((id, si, ai, handle)) = anchor_at(cx, p)
                 {
@@ -437,6 +559,14 @@ impl Tool for SelectionTool {
                 }
             }
             PointerKind::Drag => match self.drag.clone() {
+                Drag::Bracket { id, end } => {
+                    let Some((warp, xf, _, _)) = path_type_of(cx, id) else { return vec![] };
+                    if xf.determinant().abs() < 1e-12 {
+                        return vec![];
+                    }
+                    let s = warp.nearest(xf.inverse() * p);
+                    vec![Action::Preview("type.pathOptions".into(), json!({"id": id.0, if end { "end" } else { "start" }: s}))]
+                }
                 Drag::Pending { start, hit } => {
                     if (p - start).hypot() < cx.tol(3.0) {
                         return vec![];
@@ -592,6 +722,7 @@ impl Tool for SelectionTool {
                     self.drag = Drag::Marquee { start, cur: p };
                     vec![]
                 }
+                Drag::Place { .. } => vec![],
                 Drag::Rotate { center, start_angle, start_rotation } => {
                     let mut a = ((p - center).atan2() - start_angle).to_degrees();
                     self.guides.clear();
@@ -682,7 +813,9 @@ impl Tool for SelectionTool {
                 let release = self.shift_release.take();
                 let d = std::mem::replace(&mut self.drag, Drag::None);
                 match d {
-                    Drag::Move { .. } | Drag::Resize { .. } | Drag::Anchor { .. } | Drag::Rotate { .. } => vec![Action::Commit],
+                    Drag::Move { .. } | Drag::Resize { .. } | Drag::Anchor { .. } | Drag::Rotate { .. } | Drag::Bracket { .. } => {
+                        vec![Action::Commit]
+                    }
                     Drag::Pending { .. } => match release {
                         Some(id) => vec![Action::Exec("selection.toggle".into(), json!({"id": id}))],
                         None => vec![],
@@ -703,26 +836,19 @@ impl Tool for SelectionTool {
                         }
                         vec![Action::Exec("selection.set".into(), json!({"ids": ids, "add": ev.mods.shift}))]
                     }
-                    Drag::None => vec![],
+                    Drag::None | Drag::Place { .. } => vec![],
                 }
             }
-            PointerKind::DoubleClick => {
-                if let Some((_, id)) = cx.hit(p)
-                    && cx.doc.item(id).is_some_and(|i| i.is_text_frame())
-                {
-                    let (sr, sp) = cx.layout.spread_at(p).unwrap_or((SpreadRef::Doc(0), p));
-                    let _ = sr;
-                    return vec![
-                        Action::SwitchTool("type".into()),
-                        Action::Exec("text.placeCaret".into(), json!({"frame": id.0, "point": [sp.x, sp.y]})),
-                    ];
-                }
-                vec![]
-            }
+            PointerKind::DoubleClick => vec![],
         }
     }
 
     fn key(&mut self, cx: &ToolContext, key: ToolKey, mods: Mods) -> Vec<Action> {
+        if key == ToolKey::Escape && self.loaded.take().is_some() {
+            // Unload; the selection stays. Cancel (no interaction runs) marks the key handled.
+            self.drag = Drag::None;
+            return vec![Action::Cancel];
+        }
         let inc = cx.doc.settings.keyboard_increment * if mods.shift { 10.0 } else { 1.0 };
         let mv = |dx: f64, dy: f64| vec![Action::Exec("transform.move".into(), json!({"dx": dx, "dy": dy, "copy": mods.alt}))];
         if cx.selection.items.is_empty() {
@@ -739,17 +865,29 @@ impl Tool for SelectionTool {
         }
     }
 
-    fn overlays(&self, _cx: &ToolContext) -> Vec<Overlay> {
+    fn overlays(&self, cx: &ToolContext) -> Vec<Overlay> {
         match &self.drag {
+            Drag::Place { start, cur } if crate::thread::is_drag(cx, *start, *cur) => {
+                let Some((sr, r, guides)) = crate::thread::drag_frame(cx, *start, *cur) else { return vec![] };
+                let r = Rect::from_points(cx.layout.to_canvas(sr, Point::new(r.x0, r.y0)), cx.layout.to_canvas(sr, Point::new(r.x1, r.y1)));
+                std::iter::once(Overlay::Marquee(r)).chain(guides).collect()
+            }
             Drag::Marquee { start, cur } => vec![Overlay::Marquee(Rect::from_points(*start, *cur))],
             Drag::Move { .. } | Drag::Resize { .. } | Drag::Rotate { .. } | Drag::Anchor { .. } => self.guides.clone(),
+            Drag::None | Drag::Bracket { .. } => brackets(cx),
             _ => vec![],
         }
     }
 
     fn cursor(&self, cx: &ToolContext, p: Point, _m: Mods) -> Cursor {
+        if matches!(self.drag, Drag::Bracket { .. }) || (matches!(self.drag, Drag::None) && bracket_at(cx, p).is_some()) {
+            return Cursor::PathBracket;
+        }
         if self.direct {
             return Cursor::ArrowHollow;
+        }
+        if let Some(l) = self.loaded.and_then(|l| l.resolve(cx.doc)) {
+            return if crate::thread::port_at(cx, p).is_some() { Cursor::LoadedText } else { l.cursor(cx, p) };
         }
         match self.drag {
             Drag::Move { .. } => return Cursor::Move,
@@ -769,6 +907,27 @@ impl Tool for SelectionTool {
     }
 }
 
+/// The start and end brackets of the selected type-on-a-path items, in the selection colour: a
+/// line across the path with a short tick pointing at the text between them.
+fn brackets(cx: &ToolContext) -> Vec<Overlay> {
+    let mut out = Vec::new();
+    for id in &cx.selection.items {
+        let Some((warp, xf, start, end)) = path_type_of(cx, *id) else { continue };
+        let color = cx.doc.item(*id).and_then(|it| cx.doc.layer(it.layer)).map_or([43, 155, 255], |l| l.color);
+        for (s, towards) in [(start, end.max(start + 1.0)), (end, start.min(end - 1.0))] {
+            let Some((a, b)) = bracket_line(cx, &warp, xf, s) else { continue };
+            out.push(Overlay::Line { a, b, color, dashed: false });
+            // The tick at the outer end points along the path towards the text.
+            if let (Some((p0, _)), Some((p1, _))) = (warp.at(s), warp.at(towards)) {
+                let dir = xf * p1 - xf * p0;
+                let dir = dir / dir.hypot().max(1e-9) * cx.tol(BRACKET_PX * 0.6);
+                out.push(Overlay::Line { a: b, b: b + dir, color, dashed: false });
+            }
+        }
+    }
+    out
+}
+
 fn handle_cursor(h: usize) -> Cursor {
     match h {
         0 | 4 => Cursor::ResizeNwSe,
@@ -776,4 +935,14 @@ fn handle_cursor(h: usize) -> Cursor {
         1 | 5 => Cursor::ResizeV,
         _ => Cursor::ResizeH,
     }
+}
+
+/// Switch to the Type tool with the caret at `p` when it is over a text frame.
+fn edit_text_at(cx: &ToolContext, p: Point) -> Option<Vec<Action>> {
+    let (_, id) = cx.hit(p)?;
+    if !cx.doc.item(id).is_some_and(|i| i.is_text_frame()) {
+        return None;
+    }
+    let (_, sp) = cx.layout.spread_at(p).unwrap_or((SpreadRef::Doc(0), p));
+    Some(vec![Action::SwitchTool("type".into()), Action::Exec("text.placeCaret".into(), json!({"frame": id.0, "point": [sp.x, sp.y]}))])
 }

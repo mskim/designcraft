@@ -2,7 +2,9 @@
 //! selected frame, or a new frame on the page; with autoflow, pages and threaded frames are added
 //! until the whole story fits (InDesign's Shift-click with a loaded text cursor).
 
-use designcraft_doc::{CharacterStyle, Content, Document, ParaFormat, ParagraphStyle, SpreadRef, Story, StoryId, TextSel};
+use designcraft_doc::{
+    AutoSize, CharacterStyle, Content, Document, ParaFormat, ParagraphStyle, SpreadRef, Story, StoryId, TextFrameOptions, TextSel,
+};
 use designcraft_geom::Rect;
 use serde_json::{Value, json};
 
@@ -141,12 +143,20 @@ pub(crate) fn autoflow(d: &mut Document, sid: StoryId, max_pages: usize) -> Resu
         let parent = d.page_loc(page).and_then(|(si, pi)| d.spreads[si].pages[pi].parent);
         d.insert_pages(Some(page), want, parent)?;
         let layer = d.default_layer();
+        // The new frames continue the last one (columns, gutter, insets, baselines, column rules),
+        // or page 2 of a two-column story runs across the page. They fill their page's margins,
+        // so they don't auto-size, and text on a path doesn't carry over to a rectangle.
+        let options =
+            d.item(last).and_then(|i| i.text_frame()).map(|tf| TextFrameOptions { auto_size: AutoSize::Off, path: None, ..tf.options.clone() });
         let mut prev = last;
         for _ in 0..want {
             page += 1;
             let (si, pi) = d.page_loc(page).ok_or_else(|| bad("file.place", "page insert failed"))?;
             let r = d.spreads[si].pages[pi].margin_rect();
             let (fid, _) = d.add_text_frame(SpreadRef::Doc(si), r, layer, "", ParaFormat::default())?;
+            if let (Some(options), Some(tf)) = (&options, d.item_mut(fid).and_then(|i| i.text_frame_mut())) {
+                tf.options = options.clone();
+            }
             d.thread(prev, fid)?;
             prev = fid;
         }
@@ -372,6 +382,30 @@ mod reflow_tests {
     use serde_json::json;
 
     use crate::Session;
+
+    #[test]
+    fn smart_text_reflow_frames_continue_the_last_frames_options() {
+        // Regression: the frames Smart Text Reflow added had the default options (1 column, 12 pt
+        // gutter), so page 2 of a two-column story ran across the whole page — in the PDF and in
+        // the IDML. A frame added after another continues its columns, gutter and inset; auto
+        // size stays off, since the new frame fills its page's margins.
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1, "primaryTextFrame": true})).unwrap();
+        let sid = s.doc().unwrap().doc.settings.primary_story.expect("primary story").0;
+        let first = s.doc().unwrap().doc.story(designcraft_doc::StoryId(sid)).unwrap().frames[0];
+        s.execute("object.textFrameOptions", &json!({"ids": [first.0], "columns": 2, "gutter": 20, "inset": [4, 6, 4, 6], "autoSize": "heightOnly"}))
+            .unwrap();
+        s.execute("text.select", &json!({"story": sid, "anchor": 0, "focus": 0})).unwrap();
+        s.execute("text.insert", &json!({"text": "Words keep coming and the page fills up quickly with them. ".repeat(250)})).unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let frames = d.story(designcraft_doc::StoryId(sid)).unwrap().frames.clone();
+        assert!(frames.len() >= 2, "pages added: {}", frames.len());
+        for f in &frames[1..] {
+            let o = &d.item(*f).unwrap().text_frame().unwrap().options;
+            assert_eq!((o.columns, o.gutter, o.inset), (2, 20.0, [4.0, 6.0, 4.0, 6.0]), "frame {f:?}");
+            assert_eq!(o.auto_size, designcraft_doc::AutoSize::Off, "frame {f:?}");
+        }
+    }
 
     #[test]
     fn smart_text_reflow_adds_and_removes_pages() {

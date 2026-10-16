@@ -2753,6 +2753,36 @@ fn kept_paragraphs_balance_one_to_a_column_between_spanning_paragraphs() {
     assert_eq!(columns, vec![0, 1, 2], "the paragraphs' columns");
 }
 
+#[test]
+fn a_kept_chain_at_the_top_of_a_band_is_not_split_to_balance_its_columns() {
+    // A 시험지's section band across two columns, then a 문항 — six paragraphs, each kept together
+    // and with the next (a stem, its ①–⑤ rows) — starting at the top of the band's first column,
+    // then the next band. Balancing would
+    // split the 문항 down the middle; a keep moving can't help fails the trial instead, so the 문항
+    // stays whole in the first column (as Chrome sets a break-inside: avoid block above a span).
+    let body = &LOREM[..120];
+    let item = vec![body; 6].join("\n");
+    let text = format!("Band\n{item}\nNext band\n");
+    let (mut d, sid, fid) = doc_with(&text, Rect::new(0.0, 0.0, 400.0, 600.0), ParaAttrs::default());
+    d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 2;
+    let story = d.story_mut(sid).unwrap();
+    for (i, p) in story.paras.iter_mut().enumerate() {
+        if i == 0 || i == 7 {
+            p.para.span_columns = Some(SpanColumns::Span(0));
+        } else if i <= 6 {
+            p.para.keep_lines_together = Some(true);
+            if i < 6 {
+                p.para.keep_with_next = Some(1);
+            }
+        }
+    }
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let columns: Vec<u32> = cs.frames[0].lines.iter().filter(|l| (1..=6).contains(&l.para)).map(|l| l.column).collect();
+    assert!(columns.iter().all(|&c| c == 0), "the 문항's lines are all in the first column: {columns:?}");
+    assert!(cs.frames[0].lines.iter().all(|l| !l.keep_violation), "no keep is broken");
+    assert_span_layout(&cs.frames[0], 7);
+}
+
 /// The line's leading slot (glyph ascent and descent may reach into the neighbouring lines).
 fn line_box(l: &Line) -> (f64, f64) {
     (l.baseline - 0.75 * l.leading, l.baseline + 0.25 * l.leading)

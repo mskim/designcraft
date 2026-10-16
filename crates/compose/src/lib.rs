@@ -962,7 +962,10 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             cur.split = Some(SplitBlock { cfg, sub: 0, sub_lines: 0, part_lines: 0, line0: None, para: pi, start, top: None });
             cur.split_part();
         }
-        let at_top = cur.last_baseline.is_none();
+        // At the top of its column: nothing above it, or the first paragraph of a band, directly
+        // under the spanning paragraph — every column of the band starts there, so moving it to the
+        // next one can't help a keep.
+        let at_top = cur.last_baseline.is_none() || cur.col == 0 && cur.band.para == pi && cur.band.above.is_some() && !spanning;
         let start_at = (cur.fi, cur.col);
         // Rule above / shading track the paragraph's first line.
         let mut g0 = 0usize;
@@ -1101,7 +1104,20 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                         } else {
                             None
                         };
-                        if let Some(action) = action {
+                        // A keep moving can't help, in columns a balancing trial ends short of the
+                        // frame: the trial is too short to keep it (Chrome balances round an unbreakable
+                        // block too), so the band tries taller, or is left unbalanced.
+                        if matches!(action, Some(KeepAction::Stuck))
+                            && trial.as_ref().is_some_and(|t| t.key == cur.band_key())
+                            && cur.col + 1 < cols[cur.fi].len()
+                            && let Some(j) = trial_failed(&mut trial, &mut limits, balance_runs < balance_budget)
+                        {
+                            balance_runs += 1;
+                            rewind_trial(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                            pi = j;
+                            continue 'paras;
+                        }
+                        if let Some(action) = action.filter(|a| !matches!(a, KeepAction::Stuck)) {
                             restores += 1;
                             let j = match action {
                                 KeepAction::Force(j) => {
@@ -1112,6 +1128,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                                     line_cap[j] = Some(n);
                                     j
                                 }
+                                KeepAction::Stuck => unreachable!(),
                             };
                             rewind(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                             pi = j;
@@ -1784,11 +1801,15 @@ enum KeepAction {
     Force(usize),
     /// Re-lay from paragraph `j`, moving to the next column after `n` of its lines.
     Cap(usize, usize),
+    /// A keep this break violates that moving can't help (the chain starts at the top of its
+    /// column, or was moved already). Laid on as before — unless the column's bottom is a
+    /// balancing trial's, which then has to be taller.
+    Stuck,
 }
 
 /// Keep Options (plan: typography §8): keep with next, keep all lines together, keep first/last
-/// lines. Returns how to re-lay, or None to just continue in the next column (also when a keep
-/// can't be satisfied, e.g. a paragraph already at the top of a column).
+/// lines. Returns how to re-lay, Stuck when a keep can't be satisfied (e.g. a paragraph already at
+/// the top of a column), or None when the break violates no keep.
 fn keep_violation(ctx: &KeepCtx, pp: &ParaProps, info: &[ParaInfo], force_col: &[bool], line_cap: &[Option<usize>]) -> Option<KeepAction> {
     // The first paragraph of the chain of keep-with-next paragraphs ending in `pi` that sit in this column.
     let chain_start = |pi: usize| {
@@ -1807,8 +1828,10 @@ fn keep_violation(ctx: &KeepCtx, pp: &ParaProps, info: &[ParaInfo], force_col: &
     let force = |j: usize| -> Option<KeepAction> {
         let top = if j == ctx.pi { ctx.at_top } else { info[j].at_top };
         let starts_here = if j == ctx.pi { ctx.started_here } else { info[j].start == ctx.here };
-        (!(force_col[j] || top && starts_here)).then_some(KeepAction::Force(j))
+        Some(if force_col[j] || top && starts_here { KeepAction::Stuck } else { KeepAction::Force(j) })
     };
+    // A keep-with-next that couldn't be helped: the other keeps are still asked, and Stuck if none acts.
+    let mut stuck = false;
     let total_lines = ctx.line_no + ctx.remaining;
     // Keep with next: the previous paragraph's last line must share a column with our first lines.
     if ctx.started_here && ctx.pi > 0 {
@@ -1825,16 +1848,18 @@ fn keep_violation(ctx: &KeepCtx, pp: &ParaProps, info: &[ParaInfo], force_col: &
                     return Some(KeepAction::Cap(j, prev.lines - keep_last));
                 }
             }
-            if let Some(a) = force(j) {
-                return Some(a);
+            match force(j) {
+                Some(KeepAction::Stuck) => stuck = true,
+                a => return a,
             }
         }
     }
+    let stuck = stuck.then_some(KeepAction::Stuck);
     if !pp.keep_lines_together || ctx.in_col == 0 {
-        return None;
+        return stuck;
     }
     if pp.keep_all_lines {
-        return if ctx.started_here { force(chain_start(ctx.pi)) } else { None };
+        return if ctx.started_here { force(chain_start(ctx.pi)) } else { stuck };
     }
     // Orphan control: at least `keep_first` lines at the bottom of the column.
     if ctx.started_here && ctx.in_col < (pp.keep_first as usize).max(1) {
@@ -1852,7 +1877,7 @@ fn keep_violation(ctx: &KeepCtx, pp: &ParaProps, info: &[ParaInfo], force_col: &
             return force(chain_start(ctx.pi));
         }
     }
-    None
+    stuck
 }
 
 /// The start option a column, frame or page break character stands for.

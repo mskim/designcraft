@@ -595,6 +595,9 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
     };
     let para_ranges = story.para_ranges();
     let np = para_ranges.len();
+    // Consecutive paragraphs whose borders are the same make one box (InDesign's Merge Consecutive
+    // Borders): drawn once, after layout, not paragraph by paragraph. Shading stays each paragraph's.
+    let box_groups = box_groups(doc, story);
     let hyph_exceptions = doc.hyphenation_exception_map();
     let mut list_counter: u32 = 0;
     // Named lists number independently of layout: one pass up front.
@@ -984,7 +987,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                 }
                 out.overset_at = Some(glyphs.get(g0).map(|g| g.byte).unwrap_or(prange.start));
                 // The part of the paragraph that fits keeps its shading and border.
-                para_box_decos(&mut out, pi, &pp);
+                para_box_decos(&mut out, pi..=pi, &pp, true, box_groups[pi].is_none());
                 break 'paras;
             }
             let f = &frames[cur.fi];
@@ -1276,7 +1279,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                 });
             }
         }
-        para_box_decos(&mut out, pi, &pp);
+        para_box_decos(&mut out, pi..=pi, &pp, true, box_groups[pi].is_none());
         if pp.rule_below.on
             && let Some(ft) = out.frames.get_mut(cur.fi.min(frames.len().saturating_sub(1)))
             && let Some(k) = ft.lines.iter().rposition(|l| l.para == pi)
@@ -1411,6 +1414,12 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             last_end = ft.range.end;
         }
     }
+    // Merged borders, once vertical justification has put the lines in place: each group of
+    // consecutive paragraphs that share one, as one box.
+    for &(first, last) in box_groups.iter().flatten().collect::<std::collections::BTreeSet<_>>() {
+        let pp = doc.styles.resolve_para(&story.paras[first]).0;
+        para_box_decos(&mut out, first..=last, &pp, false, true);
+    }
     // Column rules, once vertical justification has put the lines in place.
     for (ft, f) in out.frames.iter_mut().zip(frames) {
         if f.opts.column_rule {
@@ -1477,17 +1486,55 @@ fn mark_keep_violations(doc: &Document, story: &Story, out: &mut ComposedStory) 
     }
 }
 
-/// Paragraph shading and border, per column the paragraph sits in (a split paragraph gets one box
-/// per part; the border's top edge on the first part, its bottom edge on the last).
-fn para_box_decos(out: &mut ComposedStory, pi: usize, pp: &ParaProps) {
-    if !pp.shading_on && !pp.border_on {
+/// For each paragraph, the group of consecutive paragraphs (first, last) whose border it shares —
+/// two or more with the same border settings and the same indents, as InDesign's Merge Consecutive
+/// Borders (on by default) joins them — or None for a paragraph bordered on its own (or not at all).
+fn box_groups(doc: &Document, story: &Story) -> Vec<Option<(usize, usize)>> {
+    let key = |p: &ParaProps| {
+        p.border_on.then(|| {
+            format!(
+                "{:?}",
+                (
+                    p.border_weights.map(f64::to_bits),
+                    &p.border_color,
+                    p.border_tint.to_bits(),
+                    p.border_offsets.map(f64::to_bits),
+                    p.left_indent.to_bits(),
+                    p.right_indent.to_bits(),
+                    &p.span_columns,
+                )
+            )
+        })
+    };
+    let keys: Vec<Option<String>> = story.paras.iter().map(|p| key(&doc.styles.resolve_para(p).0)).collect();
+    let mut groups = vec![None; keys.len()];
+    let mut i = 0;
+    while i < keys.len() {
+        let mut j = i;
+        while keys[i].is_some() && j + 1 < keys.len() && keys[j + 1] == keys[i] {
+            j += 1;
+        }
+        if j > i {
+            groups[i..=j].fill(Some((i, j)));
+        }
+        i = j + 1;
+    }
+    groups
+}
+
+/// Paragraph shading and border round paragraphs `paras` (one, or a group that shares its border),
+/// per column they sit in (a split block gets one box per part; the border's top edge on the first
+/// part, its bottom edge on the last). `shading` / `border`: which of the two to draw.
+fn para_box_decos(out: &mut ComposedStory, paras: std::ops::RangeInclusive<usize>, pp: &ParaProps, shading: bool, border: bool) {
+    let (shading, border) = (shading && pp.shading_on, border && pp.border_on);
+    if !shading && !border {
         return;
     }
     // (frame, its box, the indices of its first and last line in that frame's lines)
     let mut parts: Vec<(usize, Rect, (usize, usize))> = Vec::new();
     for (fi, ft) in out.frames.iter().enumerate() {
         // A part ends where the next line moves to another column or sub-column.
-        let lines: Vec<(usize, &Line)> = ft.lines.iter().enumerate().filter(|(_, l)| l.para == pi).collect();
+        let lines: Vec<(usize, &Line)> = ft.lines.iter().enumerate().filter(|(_, l)| paras.contains(&l.para)).collect();
         for part in lines.chunk_by(|(_, a), (_, b)| a.column == b.column && b.baseline > a.baseline) {
             if let (Some(&(i, a)), Some(&(j, z))) = (part.first(), part.last()) {
                 parts.push((fi, Rect::new(a.x0, a.baseline - a.ascent, a.x1, z.baseline + z.descent), (i, j)));
@@ -1497,12 +1544,12 @@ fn para_box_decos(out: &mut ComposedStory, pi: usize, pp: &ParaProps) {
     let n = parts.len();
     for (k, (fi, r, (top, bottom))) in parts.into_iter().enumerate() {
         let ft = &mut out.frames[fi];
-        if pp.shading_on {
+        if shading {
             let [t, l, b, rr] = pp.shading_offsets;
             let rect = Rect::new(r.x0 - l, r.y0 - t, r.x1 + rr, r.y1 + b);
             ft.decos.insert(0, Deco { rect, color: pp.shading_color.clone(), tint: pp.shading_tint, lines: Some((top, bottom)) });
         }
-        if pp.border_on {
+        if border {
             let [t, l, b, rr] = pp.border_offsets;
             let o = Rect::new(r.x0 - l, r.y0 - t, r.x1 + rr, r.y1 + b);
             let [wt, wl, wb, wr] = pp.border_weights.map(|w| w.max(0.0));

@@ -317,6 +317,30 @@ fn paragraph_rules_and_shading_move_with_vertically_justified_lines() {
 }
 
 #[test]
+fn consecutive_paragraphs_with_the_same_border_share_one_box() {
+    // A 지문 of three paragraphs in a box (InDesign's Merge Consecutive Borders, on by default): one
+    // top edge over the first, one bottom edge under the last, and sides that run the whole height
+    // — not three boxes. A fourth paragraph with a different border keeps a box of its own.
+    let para = ParaAttrs { border_on: Some(true), border_weights: Some([1.0; 4]), border_offsets: Some([4.0; 4]), ..Default::default() };
+    let (mut d, sid, _) = doc_with("One\nTwo\nThree\nFour", Rect::new(0.0, 0.0, 300.0, 400.0), para);
+    d.story_mut(sid).unwrap().paras[3].para.border_weights = Some([2.0; 4]);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let ft = &cs.frames[0];
+    let first = ft.lines.iter().find(|l| l.para == 0).unwrap();
+    let third = ft.lines.iter().find(|l| l.para == 2).unwrap();
+    let thin: Vec<&Deco> = ft.decos.iter().filter(|d| (d.rect.x1 - d.rect.x0 - 1.0).abs() < 1e-6 || (d.rect.y1 - d.rect.y0 - 1.0).abs() < 1e-6).collect();
+    let tops: Vec<f64> = thin.iter().filter(|d| (d.rect.y1 - d.rect.y0 - 1.0).abs() < 1e-6 && d.rect.x1 - d.rect.x0 > 10.0).map(|d| d.rect.y0).collect();
+    assert_eq!(tops.len(), 2, "one top and one bottom edge for the three paragraphs: {tops:?}");
+    assert!((tops[0] - (first.baseline - first.ascent - 4.0 - 1.0)).abs() < 1e-6, "the top edge over the first paragraph");
+    assert!((tops[1] - (third.baseline + third.descent + 4.0)).abs() < 1e-6, "the bottom edge under the third");
+    let sides: Vec<&&Deco> = thin.iter().filter(|d| (d.rect.x1 - d.rect.x0 - 1.0).abs() < 1e-6).collect();
+    assert_eq!(sides.len(), 2, "a left and a right side");
+    assert!(sides.iter().all(|d| d.rect.y1 - d.rect.y0 > third.baseline - first.baseline), "the sides run the whole height");
+    let heavy = ft.decos.iter().filter(|d| (d.rect.x1 - d.rect.x0 - 2.0).abs() < 1e-6 || (d.rect.y1 - d.rect.y0 - 2.0).abs() < 1e-6).count();
+    assert_eq!(heavy, 4, "the fourth paragraph's own box");
+}
+
+#[test]
 fn a_rule_above_is_offset_from_the_baseline_as_in_indesign() {
     // InDesign 2026, measured: a 2 pt Rule Above offset 10 pt over a 40 pt line has its bottom
     // 10 pt above the line's baseline (not 10 pt above the top of the type).

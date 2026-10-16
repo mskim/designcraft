@@ -199,12 +199,14 @@ pub struct Line {
     pub keep_violation: bool,
 }
 
-/// A paragraph rule or shading rectangle in frame inner space.
+/// A paragraph rule or shading rectangle in frame inner space. `lines`: the frame's lines (indices)
+/// its top and its bottom follow when vertical justification moves them; None for one that stays.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Deco {
     pub rect: Rect,
     pub color: String,
     pub tint: f32,
+    pub lines: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -656,7 +658,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             && let Some(j) = trial_failed(&mut trial, &mut limits, balance_runs < balance_budget)
         {
             balance_runs += 1;
-            rewind(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+            rewind_trial(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
             pi = j;
             continue 'paras;
         }
@@ -686,7 +688,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             if !table::place_table(doc, t, anchor, pi, &pp, frames, &cols, &mut cur, &mut out, opts) {
                 if let Some(j) = trial_failed(&mut trial, &mut limits, balance_runs < balance_budget) {
                     balance_runs += 1;
-                    rewind(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                    rewind_trial(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                     pi = j;
                     continue 'paras;
                 }
@@ -937,7 +939,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                     if !t.done {
                         trial = Some(t);
                         balance_runs += 1;
-                        rewind(key.1, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                        rewind_trial(key.1, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                         pi = key.1;
                         continue 'paras;
                     }
@@ -973,7 +975,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             if cur.fi >= frames.len() {
                 if let Some(j) = trial_failed(&mut trial, &mut limits, balance_runs < balance_budget) {
                     balance_runs += 1;
-                    rewind(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                    rewind_trial(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                     pi = j;
                     continue 'paras;
                 }
@@ -1078,7 +1080,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                         };
                         if let Some(j) = j {
                             split_runs += 1;
-                            rewind(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                            rewind_trial(j, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                             pi = j;
                             continue 'paras;
                         }
@@ -1242,28 +1244,29 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             if pp.rule_above.on {
                 let r = &pp.rule_above;
                 let y = bl - asc - r.offset;
-                let col = ft
-                    .lines
-                    .iter()
-                    .find(|l| l.para == pi && l.first_in_para)
+                let first = ft.lines.iter().position(|l| l.para == pi && l.first_in_para);
+                let col = first
+                    .map(|i| &ft.lines[i])
                     .map(|l| if r.column_width { (l.x0, l.x1) } else { (l.x0, l.end_x) })
                     .unwrap_or((0.0, 0.0));
                 ft.decos.push(Deco {
                     rect: Rect::new(col.0 + r.left_indent, y - r.weight, col.1 - r.right_indent, y),
                     color: r.color.clone(),
                     tint: r.tint,
+                    lines: first.map(|i| (i, i)),
                 });
             }
         }
         para_box_decos(&mut out, pi, &pp);
         if pp.rule_below.on
             && let Some(ft) = out.frames.get_mut(cur.fi.min(frames.len().saturating_sub(1)))
-            && let Some(l) = ft.lines.iter().rev().find(|l| l.para == pi)
+            && let Some(k) = ft.lines.iter().rposition(|l| l.para == pi)
         {
-            let r = &pp.rule_below;
+            let (l, r) = (&ft.lines[k], &pp.rule_below);
             let y = l.baseline + r.offset;
             let (x0, x1) = if r.column_width { (l.x0, l.x1) } else { (l.x0, l.end_x) };
-            ft.decos.push(Deco { rect: Rect::new(x0 + r.left_indent, y, x1 - r.right_indent, y + r.weight), color: r.color.clone(), tint: r.tint });
+            let rect = Rect::new(x0 + r.left_indent, y, x1 - r.right_indent, y + r.weight);
+            ft.decos.push(Deco { rect, color: r.color.clone(), tint: r.tint, lines: Some((k, k)) });
         }
         // The end of a split block: text after it continues below its deepest sub-column, which
         // are balanced first. A block that ends the story fills its sub-columns in turn.
@@ -1296,7 +1299,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
                         if !t.done {
                             split_trial = Some(t);
                             split_runs += 1;
-                            rewind(key.2, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
+                            rewind_trial(key.2, &snaps, &note_snaps, &mut notes, &mut out, &mut cur, &mut list_counter, &mut force_col, &mut line_cap);
                             pi = key.2;
                             continue 'paras;
                         }
@@ -1394,7 +1397,7 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
         if f.opts.column_rule {
             let rects = column_rule_rects(&ft.columns, &ft.lines, &f.opts);
             let tint = if f.opts.column_rule_tint.is_finite() { f.opts.column_rule_tint.clamp(0.0, 1.0) } else { 1.0 };
-            ft.decos.extend(rects.into_iter().map(|rect| Deco { rect, color: f.opts.column_rule_color.clone(), tint }));
+            ft.decos.extend(rects.into_iter().map(|rect| Deco { rect, color: f.opts.column_rule_color.clone(), tint, lines: None }));
         }
     }
     out.styles = styles_tab;
@@ -1461,40 +1464,43 @@ fn para_box_decos(out: &mut ComposedStory, pi: usize, pp: &ParaProps) {
     if !pp.shading_on && !pp.border_on {
         return;
     }
-    let mut parts: Vec<(usize, Rect)> = Vec::new();
+    // (frame, its box, the indices of its first and last line in that frame's lines)
+    let mut parts: Vec<(usize, Rect, (usize, usize))> = Vec::new();
     for (fi, ft) in out.frames.iter().enumerate() {
         // A part ends where the next line moves to another column or sub-column.
-        let lines: Vec<&Line> = ft.lines.iter().filter(|l| l.para == pi).collect();
-        for part in lines.chunk_by(|a, b| a.column == b.column && b.baseline > a.baseline) {
-            if let (Some(a), Some(z)) = (part.first(), part.last()) {
-                parts.push((fi, Rect::new(a.x0, a.baseline - a.ascent, a.x1, z.baseline + z.descent)));
+        let lines: Vec<(usize, &Line)> = ft.lines.iter().enumerate().filter(|(_, l)| l.para == pi).collect();
+        for part in lines.chunk_by(|(_, a), (_, b)| a.column == b.column && b.baseline > a.baseline) {
+            if let (Some(&(i, a)), Some(&(j, z))) = (part.first(), part.last()) {
+                parts.push((fi, Rect::new(a.x0, a.baseline - a.ascent, a.x1, z.baseline + z.descent), (i, j)));
             }
         }
     }
     let n = parts.len();
-    for (k, (fi, r)) in parts.into_iter().enumerate() {
+    for (k, (fi, r, (top, bottom))) in parts.into_iter().enumerate() {
         let ft = &mut out.frames[fi];
         if pp.shading_on {
             let [t, l, b, rr] = pp.shading_offsets;
-            ft.decos
-                .insert(0, Deco { rect: Rect::new(r.x0 - l, r.y0 - t, r.x1 + rr, r.y1 + b), color: pp.shading_color.clone(), tint: pp.shading_tint });
+            let rect = Rect::new(r.x0 - l, r.y0 - t, r.x1 + rr, r.y1 + b);
+            ft.decos.insert(0, Deco { rect, color: pp.shading_color.clone(), tint: pp.shading_tint, lines: Some((top, bottom)) });
         }
         if pp.border_on {
             let [t, l, b, rr] = pp.border_offsets;
             let o = Rect::new(r.x0 - l, r.y0 - t, r.x1 + rr, r.y1 + b);
             let [wt, wl, wb, wr] = pp.border_weights.map(|w| w.max(0.0));
-            let mut edge = |rect: Rect| ft.decos.push(Deco { rect, color: pp.border_color.clone(), tint: pp.border_tint });
+            let mut edge = |rect: Rect, lines: (usize, usize)| {
+                ft.decos.push(Deco { rect, color: pp.border_color.clone(), tint: pp.border_tint, lines: Some(lines) })
+            };
             if k == 0 && wt > 0.0 {
-                edge(Rect::new(o.x0 - wl, o.y0 - wt, o.x1 + wr, o.y0));
+                edge(Rect::new(o.x0 - wl, o.y0 - wt, o.x1 + wr, o.y0), (top, top));
             }
             if k + 1 == n && wb > 0.0 {
-                edge(Rect::new(o.x0 - wl, o.y1, o.x1 + wr, o.y1 + wb));
+                edge(Rect::new(o.x0 - wl, o.y1, o.x1 + wr, o.y1 + wb), (bottom, bottom));
             }
             if wl > 0.0 {
-                edge(Rect::new(o.x0 - wl, o.y0, o.x0, o.y1));
+                edge(Rect::new(o.x0 - wl, o.y0, o.x0, o.y1), (top, bottom));
             }
             if wr > 0.0 {
-                edge(Rect::new(o.x1, o.y0, o.x1 + wr, o.y1));
+                edge(Rect::new(o.x1, o.y0, o.x1 + wr, o.y1), (top, bottom));
             }
         }
     }
@@ -1713,6 +1719,31 @@ fn rewind(
         (notes.num, notes.key) = (num, key);
         notes.placed.truncate(placed);
     }
+}
+
+/// Re-lay from paragraph `j`, the first of a band whose columns are being balanced to a new bottom:
+/// as `rewind`, and paragraph `j`'s own keep decisions go too. They were made for the last
+/// bottom tried; kept, a paragraph sent on to the next column under a short bottom stays there
+/// under every taller one, and the band settles with its first column empty.
+#[allow(clippy::too_many_arguments)]
+fn rewind_trial(
+    j: usize,
+    snaps: &[Snapshot],
+    note_snaps: &[(u32, Option<usize>, usize)],
+    notes: &mut Notes,
+    out: &mut ComposedStory,
+    cur: &mut Cursor,
+    list_counter: &mut u32,
+    force_col: &mut [bool],
+    line_cap: &mut [Option<usize>],
+) {
+    if let Some(f) = force_col.get_mut(j) {
+        *f = false;
+    }
+    if let Some(c) = line_cap.get_mut(j) {
+        *c = None;
+    }
+    rewind(j, snaps, note_snaps, notes, out, cur, list_counter, force_col, line_cap);
 }
 
 /// Where a placed paragraph sits (for keep resolution).
@@ -2956,6 +2987,18 @@ fn vertical_justify(ft: &mut FrameText, f: &FrameSpec, spanned: bool) {
     if spanned && f.opts.vertical_justification == VerticalJustification::Justify {
         return;
     }
+    let before: Vec<f64> = ft.lines.iter().map(|l| l.baseline).collect();
+    justify_lines(ft, f, spanned);
+    // Rules and shading follow the lines they were drawn for.
+    for d in &mut ft.decos {
+        let Some((top, bottom)) = d.lines else { continue };
+        let moved = |i: usize| ft.lines.get(i).zip(before.get(i)).map_or(0.0, |(l, b)| l.baseline - b);
+        let (dy0, dy1) = (moved(top), moved(bottom));
+        d.rect = Rect::new(d.rect.x0, d.rect.y0 + dy0, d.rect.x1, d.rect.y1 + dy1);
+    }
+}
+
+fn justify_lines(ft: &mut FrameText, f: &FrameSpec, spanned: bool) {
     // Per column (or all lines together).
     let ncols = if spanned { 1 } else { ft.columns.len().max(1) as u32 };
     for c in 0..ncols {

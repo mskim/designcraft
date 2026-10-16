@@ -295,6 +295,28 @@ fn a_cascade_of_wraps_settles() {
 }
 
 #[test]
+fn paragraph_rules_and_shading_move_with_vertically_justified_lines() {
+    // A title page set at the foot of its frame: each paragraph's rule above stays above its first
+    // line, and its shading round its lines, wherever vertical justification puts them.
+    use designcraft_doc::VerticalJustification as V;
+    for vj in [V::Center, V::Bottom, V::Justify] {
+        let rule = designcraft_doc::Rule { on: true, weight: 1.0, offset: 5.0, ..Default::default() };
+        let para = ParaAttrs { rule_above: Some(rule), shading_on: Some(true), ..Default::default() };
+        let (mut d, sid, fid) = doc_with("Label\nTitle\nOrganisation", Rect::new(0.0, 0.0, 300.0, 400.0), para);
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.vertical_justification = vj;
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let ft = &cs.frames[0];
+        assert!(ft.lines.last().unwrap().baseline > 300.0 || vj == V::Center, "{vj:?}: the lines did not move");
+        for l in ft.lines.iter().filter(|l| l.first_in_para) {
+            let y = l.baseline - l.ascent - 5.0;
+            assert!(ft.decos.iter().any(|d| (d.rect.y1 - y).abs() < 1e-6), "{vj:?}: no rule above the line at {}", l.baseline);
+            let (top, bottom) = (l.baseline - l.ascent, l.baseline + l.descent);
+            assert!(ft.decos.iter().any(|d| (d.rect.y0 - top).abs() < 1e-6 && (d.rect.y1 - bottom).abs() < 1e-6), "{vj:?}: no shading round the line at {}", l.baseline);
+        }
+    }
+}
+
+#[test]
 fn an_inline_object_sets_auto_leading_as_indesign_does() {
     // InDesign 2026, measured on five formulas at 8.5, 10 and 12 pt: a line holding an inline
     // graphic, with auto leading, is its height above the baseline plus (auto leading − 100%) of the
@@ -2693,6 +2715,28 @@ fn span_doc(before: usize, after: usize, rect: Rect) -> (Document, StoryId, Item
     d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 3;
     d.story_mut(sid).unwrap().paras[before].para.span_columns = Some(SpanColumns::Span(0));
     (d, sid, fid, before)
+}
+
+#[test]
+fn kept_paragraphs_balance_one_to_a_column_between_spanning_paragraphs() {
+    // A 해설 page: a heading across three columns, three paragraphs each kept together, and an empty
+    // paragraph across the columns that ends the block, so the columns above it balance. Balanced,
+    // each paragraph takes a column, as Chrome sets them; none is left empty.
+    let body = &LOREM[..200];
+    let text = format!("Heading\n{body}\n{body}\n{body}\n");
+    let (mut d, sid, fid) = doc_with(&text, Rect::new(0.0, 0.0, 450.0, 600.0), ParaAttrs::default());
+    d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 3;
+    let story = d.story_mut(sid).unwrap();
+    for (i, p) in story.paras.iter_mut().enumerate() {
+        if i == 0 || i == 4 {
+            p.para.span_columns = Some(SpanColumns::Span(0));
+        } else {
+            p.para.keep_lines_together = Some(true);
+        }
+    }
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let columns: Vec<u32> = (1..=3).map(|p| cs.frames[0].lines.iter().find(|l| l.para == p).unwrap().column).collect();
+    assert_eq!(columns, vec![0, 1, 2], "the paragraphs' columns");
 }
 
 /// The line's leading slot (glyph ascent and descent may reach into the neighbouring lines).

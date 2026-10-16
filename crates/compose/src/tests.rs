@@ -224,6 +224,32 @@ fn wrap_around_a_second_anchored_object_follows_where_the_first_moved_its_anchor
 }
 
 #[test]
+fn an_inline_object_sets_auto_leading_as_indesign_does() {
+    // InDesign 2026, measured on five formulas at 8.5, 10 and 12 pt: a line holding an inline
+    // graphic, with auto leading, is its height above the baseline plus (auto leading − 100%) of the
+    // type size below the line before — not the graphic's whole height. The next line is unchanged.
+    let text = format!("{LOREM} {LOREM}");
+    let (mut d, sid, _) = doc_with(&text, Rect::new(0.0, 0.0, 300.0, 800.0), ParaAttrs::default());
+    let lid = d.default_layer();
+    let it = designcraft_doc::Item::new(
+        ItemId(d.alloc()),
+        lid,
+        designcraft_doc::Shape::Rectangle,
+        designcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 30.0, 20.0)),
+    );
+    let at = text[..text.len() / 2].rfind(' ').unwrap() + 1;
+    let obj = designcraft_doc::AnchoredObject::new(it, designcraft_doc::AnchorPosition::Inline { y_offset: -5.0 }); // 15 above, 5 below
+    d.story_mut(sid).unwrap().insert_object(at, obj);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let lines = &cs.frames[0].lines;
+    let k = cs.frames[0].objects[0].line;
+    assert!(k > 0 && k + 1 < lines.len());
+
+    assert!((lines[k].baseline - lines[k - 1].baseline - 17.4).abs() < 1e-6, "{}", lines[k].baseline - lines[k - 1].baseline); // 15 + 0.2 × 12
+    assert!((lines[k + 1].baseline - lines[k].baseline - 14.4).abs() < 1e-6); // 120% of 12
+}
+
+#[test]
 fn a_custom_anchored_object_without_wrap_takes_no_room() {
     let (d, sid) = story_with_anchored_figure(WrapMode::None, (80.0, 60.0), [0.0; 4]);
     let cs = compose_story(&d, sid, &ComposeOptions::default());

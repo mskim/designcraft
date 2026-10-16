@@ -596,17 +596,23 @@ fn shape_run_raw(
                     if let Some(o) = sub.objects.get(&i).filter(|o| !o.custom) {
                         let auto = matches!(p.leading, Leading::Auto);
                         match o.y_offset {
-                            // Sits on the baseline like a (big) character.
+                            // Sits on the baseline like a (big) character. With auto leading, its
+                            // line is its height above the baseline plus auto leading's extra
+                            // (120% → 20% of the type size) below the line before, as in InDesign
+                            // (measured in InDesign 2026); what hangs below the baseline adds none.
                             Some(y) => {
                                 g.adv = o.w;
                                 g.ascent = g.ascent.max(o.h + y);
                                 g.descent = g.descent.max(-y);
+                                if auto {
+                                    g.leading = g.leading.max(o.h + y + (auto_leading.auto_leading - 1.0).max(0.0) * g.size);
+                                }
                             }
                             // Pushes its line down by its height and spacing.
-                            None => g.ascent += o.h + o.space,
-                        }
-                        if auto || o.y_offset.is_none() {
-                            g.leading = g.leading.max(g.ascent + g.descent);
+                            None => {
+                                g.ascent += o.h + o.space;
+                                g.leading = g.leading.max(g.ascent + g.descent);
+                            }
                         }
                     }
                     out.push(g);

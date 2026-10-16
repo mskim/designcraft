@@ -146,6 +146,90 @@ fn wrap_pushes_text_aside() {
     assert!(below.x0 < 1.0);
 }
 
+/// A story with a figure anchored at the start of its middle paragraph: custom position, top-right
+/// corner on the column's right edge at the anchor line's baseline, bounding-box wrap
+/// (top, left, bottom, right offsets).
+fn story_with_anchored_figure(wrap: WrapMode, size: (f64, f64), offsets: [f64; 4]) -> (Document, StoryId) {
+    let text = format!("Before {LOREM}\nStem {LOREM} {LOREM}\nAfter {LOREM} {LOREM}");
+    let (mut d, sid, _) = doc_with(&text, Rect::new(0.0, 0.0, 300.0, 800.0), ParaAttrs::default());
+    let lid = d.default_layer();
+    let mut it = designcraft_doc::Item::new(
+        ItemId(d.alloc()),
+        lid,
+        designcraft_doc::Shape::Rectangle,
+        designcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, size.0, size.1)),
+    );
+    it.wrap.mode = wrap;
+    it.wrap.offsets = offsets;
+    let position = designcraft_doc::AnchorPosition::Custom {
+        x_relative: designcraft_doc::anchored::AnchorRelative::ColumnEdge,
+        y_relative: designcraft_doc::anchored::AnchorRelative::Anchor,
+        x_offset: 0.0,
+        y_offset: 0.0,
+        object_point: 2,
+        ref_point: 2,
+        keep_within_column: false,
+    };
+    let at = text.find("Stem").unwrap();
+    d.story_mut(sid).unwrap().insert_object(at, designcraft_doc::AnchoredObject::new(it, position));
+    (d, sid)
+}
+
+#[test]
+fn text_wraps_around_a_custom_anchored_object_below_its_anchor_line() {
+    // As InDesign does (measured in InDesign 2026): the wrap pushes aside the lines after the
+    // anchor's line, not the anchor's line itself nor anything above it.
+    let (d, sid) = story_with_anchored_figure(WrapMode::BoundingBox, (80.0, 60.0), [0.0, 8.0, 6.0, 0.0]);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let ft = &cs.frames[0];
+    let o = &ft.objects[0];
+    assert!((o.origin.x - 220.0).abs() < 1e-6, "{:?}", o.origin); // 300 − 80: at the column's right edge
+    let anchor_line = &ft.lines[o.line];
+    assert!((o.origin.y - anchor_line.baseline).abs() < 1e-6);
+    let (top, bottom, left) = (o.origin.y, o.origin.y + 60.0 + 6.0, o.origin.x - 8.0);
+
+    assert!(anchor_line.x1 > 299.0, "the anchor's own line is not wrapped: {}", anchor_line.x1);
+    for l in &ft.lines[..o.line] {
+        assert!(l.x1 > 299.0, "a line above the anchor was wrapped: {}", l.x1);
+    }
+    let beside: Vec<_> = ft.lines[o.line + 1..].iter().filter(|l| l.baseline - l.ascent < bottom && l.baseline + l.descent > top).collect();
+    assert!(beside.len() >= 3, "{}", beside.len());
+    for l in &beside {
+        assert!(l.x1 <= left + 1e-6, "a line beside the figure runs under it: {} > {left}", l.x1);
+        assert!(l.end_x <= l.x1 + 0.5);
+    }
+    let below = ft.lines[o.line + 1..].iter().find(|l| l.baseline - l.ascent >= bottom).unwrap();
+    assert!(below.x1 > 299.0, "lines below the figure take the whole column again: {}", below.x1);
+}
+
+#[test]
+fn wrap_around_a_second_anchored_object_follows_where_the_first_moved_its_anchor() {
+    // The first figure's wrap lengthens its paragraph, which moves the second figure's anchor line
+    // down: the second wrap must be where the second figure ends up, not where it first was.
+    let (mut d, sid) = story_with_anchored_figure(WrapMode::BoundingBox, (150.0, 60.0), [0.0, 8.0, 6.0, 0.0]);
+    let first = d.story(sid).unwrap().objects[0].as_ref().clone();
+    let at = d.story(sid).unwrap().text.find("After").unwrap();
+    d.story_mut(sid).unwrap().insert_object(at, first);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let ft = &cs.frames[0];
+    assert_eq!(ft.objects.len(), 2);
+    for o in &ft.objects {
+        let anchor_line = &ft.lines[o.line];
+        assert!((o.origin.y - anchor_line.baseline).abs() < 1e-6, "figure {} is not on its anchor's line", o.index);
+        let (top, bottom, left) = (o.origin.y, o.origin.y + 66.0, o.origin.x - 8.0);
+        let beside: Vec<_> = ft.lines[o.line + 1..].iter().filter(|l| l.baseline - l.ascent < bottom && l.baseline + l.descent > top).collect();
+        assert!(beside.len() >= 3, "figure {}: {}", o.index, beside.len());
+        assert!(beside.iter().all(|l| l.x1 <= left + 1e-6), "figure {}: a line runs under it", o.index);
+    }
+}
+
+#[test]
+fn a_custom_anchored_object_without_wrap_takes_no_room() {
+    let (d, sid) = story_with_anchored_figure(WrapMode::None, (80.0, 60.0), [0.0; 4]);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    assert!(cs.frames[0].lines.iter().all(|l| l.x1 > 299.0));
+}
+
 #[test]
 fn paragraph_composer_is_no_worse_than_greedy() {
     // Sum of squared slack over lines (excluding last) should not exceed the greedy result.

@@ -463,7 +463,74 @@ pub fn compose(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Compo
     compose_with_db(doc, story, frames, opts, FontDb::global())
 }
 
+/// Passes a story with wrapping anchored objects gets at most (it usually settles in two).
+const ANCHORED_WRAP_PASSES: usize = 4;
+
+/// Text wraps around custom anchored objects that have text wrap. Where such an object goes
+/// depends on where its anchor's line falls, and the lines after it depend on the object, so the
+/// story is composed again with each object's last place as an exclusion until nothing moves.
+/// Stories without one compose once.
 fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &ComposeOptions, db: &FontDb) -> ComposedStory {
+    let mut out = compose_pass(doc, story, frames, opts, db);
+    if !story.objects.iter().any(|o| wraps_text(o)) {
+        return out;
+    }
+    let mut last: Vec<Vec<Exclusion>> = vec![Vec::new(); frames.len()];
+    for _ in 0..ANCHORED_WRAP_PASSES {
+        let found = anchored_exclusions(story, &out, frames.len());
+        if same_exclusions(&found, &last) {
+            break;
+        }
+        let specs: Vec<FrameSpec> = frames
+            .iter()
+            .zip(&found)
+            .map(|(f, ex)| FrameSpec { exclusions: f.exclusions.iter().chain(ex).cloned().collect(), ..f.clone() })
+            .collect();
+        out = compose_pass(doc, story, &specs, opts, db);
+        last = found;
+    }
+    out
+}
+
+fn wraps_text(o: &designcraft_doc::AnchoredObject) -> bool {
+    matches!(o.position, designcraft_doc::AnchorPosition::Custom { .. }) && o.item.wrap.mode != WrapMode::None && !o.item.hidden
+}
+
+/// Each frame's wrapping anchored objects, as exclusions (with their wrap offsets) that start
+/// below the anchor's line: as in InDesign, the wrap pushes aside the lines after the anchor's
+/// line, not that line itself nor anything above it.
+fn anchored_exclusions(story: &Story, out: &ComposedStory, frames: usize) -> Vec<Vec<Exclusion>> {
+    let mut found = vec![Vec::new(); frames];
+    for (ft, ex) in out.frames.iter().zip(found.iter_mut()) {
+        for o in &ft.objects {
+            let (Some(obj), Some(line)) = (story.objects.get(o.index), ft.lines.get(o.line)) else { continue };
+            if !wraps_text(obj) {
+                continue;
+            }
+            let [top, left, bottom, right] = obj.item.wrap.offsets;
+            let (w, h) = o.size;
+            let below_anchor = line.baseline + line.descent;
+            let rect = Rect::new(o.origin.x - left, (o.origin.y - top).max(below_anchor), o.origin.x + w + right, o.origin.y + h + bottom);
+            if rect.y1 > rect.y0 {
+                ex.push(Exclusion { rect, mode: obj.item.wrap.mode });
+            }
+        }
+    }
+    found
+}
+
+fn same_exclusions(a: &[Vec<Exclusion>], b: &[Vec<Exclusion>]) -> bool {
+    const EPS: f64 = 0.01;
+    let near = |x: &Exclusion, y: &Exclusion| {
+        x.mode == y.mode
+            && [(x.rect.x0, y.rect.x0), (x.rect.y0, y.rect.y0), (x.rect.x1, y.rect.x1), (x.rect.y1, y.rect.y1)]
+                .iter()
+                .all(|(p, q)| (p - q).abs() < EPS)
+    };
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| near(p, q)))
+}
+
+fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &ComposeOptions, db: &FontDb) -> ComposedStory {
     let db = &db.scoped(doc.font_scope);
     let mut out = ComposedStory { story: story.id, rev: story.rev, text_len: story.text.len(), ..Default::default() };
     let mut styles_tab: Vec<RunStyle> = Vec::new();

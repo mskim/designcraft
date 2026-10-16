@@ -308,12 +308,26 @@ fn paragraph_rules_and_shading_move_with_vertically_justified_lines() {
         let ft = &cs.frames[0];
         assert!(ft.lines.last().unwrap().baseline > 300.0 || vj == V::Center, "{vj:?}: the lines did not move");
         for l in ft.lines.iter().filter(|l| l.first_in_para) {
-            let y = l.baseline - l.ascent - 5.0;
+            let y = l.baseline - 5.0;
             assert!(ft.decos.iter().any(|d| (d.rect.y1 - y).abs() < 1e-6), "{vj:?}: no rule above the line at {}", l.baseline);
             let (top, bottom) = (l.baseline - l.ascent, l.baseline + l.descent);
             assert!(ft.decos.iter().any(|d| (d.rect.y0 - top).abs() < 1e-6 && (d.rect.y1 - bottom).abs() < 1e-6), "{vj:?}: no shading round the line at {}", l.baseline);
         }
     }
+}
+
+#[test]
+fn a_rule_above_is_offset_from_the_baseline_as_in_indesign() {
+    // InDesign 2026, measured: a 2 pt Rule Above offset 10 pt over a 40 pt line has its bottom
+    // 10 pt above the line's baseline (not 10 pt above the top of the type).
+    let rule = designcraft_doc::Rule { on: true, weight: 2.0, offset: 10.0, ..Default::default() };
+    let (d, sid, _) = doc_with("Heading", Rect::new(0.0, 0.0, 300.0, 400.0), ParaAttrs { rule_above: Some(rule), ..Default::default() });
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let ft = &cs.frames[0];
+    let line = &ft.lines[0];
+    let r = ft.decos.first().expect("the rule").rect;
+    assert!((r.y1 - (line.baseline - 10.0)).abs() < 1e-6, "rule bottom {} for baseline {}", r.y1, line.baseline);
+    assert!((r.y1 - r.y0 - 2.0).abs() < 1e-6);
 }
 
 #[test]

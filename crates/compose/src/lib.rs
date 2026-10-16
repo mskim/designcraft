@@ -1239,11 +1239,13 @@ fn compose_pass(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &Comp
             cur.band = Band { para: pi + 1, line0: ft.lines.len(), above: Some(above) };
         }
         // Rules and shading for the paragraph.
-        if let Some((fi, bl, asc, _)) = first_line_rect {
+        if let Some((fi, bl, _, _)) = first_line_rect {
             let ft = &mut out.frames[fi];
             if pp.rule_above.on {
                 let r = &pp.rule_above;
-                let y = bl - asc - r.offset;
+                // As InDesign (measured in InDesign 2026): the offset runs from the first line's
+                // baseline to the bottom of the rule, not from the top of the type.
+                let y = bl - r.offset;
                 let first = ft.lines.iter().position(|l| l.para == pi && l.first_in_para);
                 let col = first
                     .map(|i| &ft.lines[i])

@@ -277,6 +277,16 @@ pub(crate) fn page_root_transform(height: f32) -> Transform {
 
 impl Drop for Page<'_> {
     fn drop(&mut self) {
+        // Keep the document poisoned if cleanup unwinds, including an invariant failure
+        // during an explicit finish. Successful cleanup preserves any earlier poison.
+        let poisoned = std::mem::replace(&mut self.sc.poisoned, true);
+        // A drawing panic can leave page state incomplete. Discard it while
+        // unwinding; finalization here could panic again and abort the process.
+        // The caller must discard the whole document after a caught panic.
+        if std::thread::panicking() {
+            return;
+        }
+
         // Since we cannot take ownership in `drop`, just make use `mem::take` to pick
         // what we need.
         let annotations = std::mem::take(&mut self.annotations);
@@ -296,6 +306,7 @@ impl Drop for Page<'_> {
             self.page_index,
         );
         self.sc.register_page(page);
+        self.sc.poisoned = poisoned;
     }
 }
 

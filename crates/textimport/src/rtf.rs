@@ -109,6 +109,8 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
                 if stack.len() > 1 {
                     stack.pop();
                 }
+                // The `\uN` fallback skip ends with the group.
+                pending = 0;
                 fmt = stack.last().map(State::format).unwrap_or_default();
                 i += 1;
             }
@@ -157,7 +159,9 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
                 }
                 let word: String = chars[i + 1..j].iter().collect();
                 let mut k = j;
-                if k < chars.len() && (chars[k] == '-' || chars[k].is_ascii_digit()) {
+                // A '-' only starts the parameter when a digit follows; otherwise it is text.
+                let negative = chars.get(k) == Some(&'-') && chars.get(k + 1).is_some_and(char::is_ascii_digit);
+                if negative || chars.get(k).is_some_and(char::is_ascii_digit) {
                     k += 1;
                     while k < chars.len() && chars[k].is_ascii_digit() {
                         k += 1;
@@ -293,6 +297,14 @@ Caf\'e9 \u8364? price\tab tab\line next\par
         assert!(!st.text.contains("Times"), "font table skipped");
     }
 
+    /// A '-' right after a control word is text unless a digit follows it (then it is a negative
+    /// parameter). It used to be swallowed.
+    #[test]
+    fn hyphen_after_control_word_without_digits_is_text() {
+        let i = import(br"{\rtf1\ansi Rock\emdash-roll, x\tab-y, a\li-720 b}").unwrap();
+        assert_eq!(i.story.text, "Rock\u{2014}-roll, x\t-y, ab");
+    }
+
     /// Characters past U+FFFF are written as two `\uN` words, a UTF-16 surrogate pair (the form
     /// our own exporter and Word write). Each half was converted alone and dropped.
     #[test]
@@ -306,5 +318,13 @@ Caf\'e9 \u8364? price\tab tab\line next\par
         assert_eq!(import(crate::export::rtf(&doc, &st).as_bytes()).unwrap().story.text, st.text);
         // Half a pair is not a character: it is still left out.
         assert_eq!(import(br"{\rtf1 A\u-10179?B\u-8704?C}").unwrap().story.text, "ABC");
+    }
+
+    /// A `\uN` at the end of a group has no fallback character inside it. The skip count must
+    /// end with the group, not eat the text after it.
+    #[test]
+    fn unicode_fallback_skip_ends_with_group() {
+        assert_eq!(import(br"{\rtf1 {\b \u8364} AB}").unwrap().story.text, "\u{20AC} AB");
+        assert_eq!(import(br"{\rtf1 {\uc2\b \u8364} ABC}").unwrap().story.text, "\u{20AC} ABC");
     }
 }

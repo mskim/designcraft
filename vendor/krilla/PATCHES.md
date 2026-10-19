@@ -19,3 +19,11 @@ Still missing upstream as of 2026-10-15 (krilla main). Drop this copy once a rel
 
 `Cargo.toml`: `[lints.rust] deprecated = "allow"`, for upstream's deprecated `std::f32` constants,
 which warn in a path dependency (crates.io builds hide them).
+
+## Base (since the v0.9.0 merge)
+
+Since DesignCraft 0.9.0 the PDF writer is craft-pdf, which requires craft-libs' patched krilla
+(`vendor/krilla` of storytold/craft-libs at the `craft-pdf` revision in the workspace Cargo.toml;
+see its README.craft.md and SOURCE.json). This copy is that one with the CMap patch above applied
+on top. When the workspace bumps craft-pdf, re-copy craft-libs' vendor/krilla and re-apply the
+patch to `src/text/cid.rs` and `src/text/type3.rs`.

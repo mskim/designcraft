@@ -16,7 +16,7 @@
 
 use crate::chunk_container::ChunkContainer;
 use crate::destination::NamedDestination;
-use crate::error::KrillaResult;
+use crate::error::{KrillaError, KrillaResult};
 use crate::interchange::embed::EmbeddedFile;
 use crate::interchange::metadata::Metadata;
 use crate::interchange::outline::Outline;
@@ -141,6 +141,10 @@ impl Document {
 
     /// Attempt to export the document to a PDF file.
     pub fn finish(mut self) -> KrillaResult<Vec<u8>> {
+        if self.serializer_context.poisoned {
+            return Err(KrillaError::Poisoned);
+        }
+
         // Write empty page if none has been created yet.
         if self.serializer_context.page_infos().is_empty() {
             self.start_page();

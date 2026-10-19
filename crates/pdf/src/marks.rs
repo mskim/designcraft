@@ -3,6 +3,7 @@
 //! bars above the trim and a page-information line. All but the colour bars use `[Registration]`
 //! (every plate); the colour bars are process colours.
 
+use craft_pdf::write::backend as krilla;
 use designcraft_color::Color;
 use designcraft_geom::kurbo::{Circle, Shape as _};
 use designcraft_geom::{BezPath, Point, Rect};

@@ -163,7 +163,6 @@ version = "0.8.0"
 
 [dev-dependencies.pretty_assertions]
 version = "1.4.1"
-
 # DesignCraft: upstream's deprecated std::f32 constants (annotation.rs) warn when built from a path,
 # which crates.io builds hide.
 [lints.rust]

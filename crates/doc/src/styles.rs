@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::attrs::{CharAttrs, CharProps, ParaAttrs, ParaProps};
-use crate::item::{Fill, Stroke, TextFrameOptions};
+use crate::item::{Effects, Fill, Item, Stroke, TextFrameOptions};
 use crate::story::{BASIC_PARAGRAPH, CharFormat, NO_CHAR_STYLE, ParaFormat};
 
 pub const NO_PARA_STYLE: &str = "[No Paragraph Style]";
@@ -55,6 +55,28 @@ pub struct ObjectStyle {
     pub paragraph_style: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_frame: Option<TextFrameOptions>,
+    /// Effects (drop shadow, feather, glows…). An item using the style follows them until its own
+    /// effects differ from the style's (a local override).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Effects>,
+}
+
+impl ObjectStyle {
+    /// Gives `it` the fill, stroke, effects and text frame options this style sets.
+    pub fn apply_to(&self, it: &mut Item) {
+        if let Some(f) = &self.fill {
+            it.fill = f.clone();
+        }
+        if let Some(st) = &self.stroke {
+            it.stroke = st.clone();
+        }
+        if let Some(e) = &self.effects {
+            it.effects = e.clone();
+        }
+        if let (Some(tf), Some(o)) = (it.text_frame_mut(), &self.text_frame) {
+            tf.options = o.clone();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,6 +116,12 @@ pub struct ExportTag {
 }
 
 impl Styles {
+    /// Resolve either a display name or a normalized IDML composite-font reference.
+    pub fn composite_font(&self, family: &str) -> Option<&crate::cjk::CompositeFont> {
+        let name = family.strip_prefix("CompositeFont/").unwrap_or(family);
+        self.composite_fonts.iter().find(|f| f.name == name)
+    }
+
     /// Export tagging of a paragraph (`character` false) or character style.
     pub fn export_tag(&self, name: &str, character: bool) -> Option<&ExportTag> {
         self.export_tags.get(&format!("{}:{name}", if character { "c" } else { "p" }))
@@ -163,11 +191,20 @@ pub struct CellStrokeAttrs {
     pub tint: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<crate::item::StrokeType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_tint: Option<f32>,
 }
 
 impl CellStrokeAttrs {
     pub fn is_empty(&self) -> bool {
-        self.weight.is_none() && self.color.is_none() && self.tint.is_none() && self.kind.is_none()
+        self.weight.is_none()
+            && self.color.is_none()
+            && self.tint.is_none()
+            && self.kind.is_none()
+            && self.gap_color.is_none()
+            && self.gap_tint.is_none()
     }
 
     pub fn apply_to(&self, stroke: &mut crate::table::CellStroke) {
@@ -182,6 +219,12 @@ impl CellStrokeAttrs {
         }
         if let Some(v) = &self.kind {
             stroke.kind = v.clone();
+        }
+        if let Some(v) = &self.gap_color {
+            stroke.gap_color = v.clone();
+        }
+        if let Some(v) = self.gap_tint {
+            stroke.gap_tint = v;
         }
     }
 
@@ -198,10 +241,23 @@ impl CellStrokeAttrs {
         if other.kind.is_some() {
             self.kind = other.kind.clone();
         }
+        if other.gap_color.is_some() {
+            self.gap_color = other.gap_color.clone();
+        }
+        if other.gap_tint.is_some() {
+            self.gap_tint = other.gap_tint;
+        }
     }
 
     fn from_stroke(stroke: &crate::table::CellStroke) -> Self {
-        Self { weight: Some(stroke.weight), color: Some(stroke.color.clone()), tint: Some(stroke.tint), kind: Some(stroke.kind.clone()) }
+        Self {
+            weight: Some(stroke.weight),
+            color: Some(stroke.color.clone()),
+            tint: Some(stroke.tint),
+            kind: Some(stroke.kind.clone()),
+            gap_color: Some(stroke.gap_color.clone()),
+            gap_tint: Some(stroke.gap_tint),
+        }
     }
 }
 
@@ -489,7 +545,7 @@ impl CellStyle {
             for p in &mut cell.text.paras {
                 p.style = ps.clone();
             }
-            cell.text.rev += 1;
+            cell.text.rev = cell.text.rev.wrapping_add(1);
         }
         cell.style = if self.name == NO_CELL_STYLE { String::new() } else { self.name.clone() };
     }
@@ -691,6 +747,10 @@ impl Styles {
     pub fn object_style(&self, name: &str) -> Option<&ObjectStyle> {
         self.object.iter().find(|s| s.name == name)
     }
+    /// The effects object style `name` sets, if any (for new items that get a default style).
+    pub fn object_effects(&self, name: &str) -> Option<&Effects> {
+        self.object_style(name)?.effects.as_ref()
+    }
 
     /// The paragraph style chain from root to `name` (cycle-safe): resolution starts at its first.
     pub fn para_chain(&self, name: &str) -> Vec<&ParagraphStyle> {
@@ -824,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn character_style_attrs_include_its_based_on_chain_only() {
+        let mut st = Styles::default();
+        let cs = |name: &str, based_on: Option<&str>, chars| CharacterStyle {
+            name: name.into(),
+            based_on: based_on.map(Into::into),
+            chars,
+            shortcut: String::new(),
+        };
+        st.character.push(cs("Base", None, CharAttrs { font_style: Some("Bold".into()), size: Some(9.0), ..Default::default() }));
+        st.character.push(cs("Strong", Some("Base"), CharAttrs { size: Some(14.0), ..Default::default() }));
+        st.character.push(cs("Loop", Some("Loop"), CharAttrs { tracking: Some(5.0), ..Default::default() }));
+        assert_eq!(st.char_style_attrs("Strong"), CharAttrs { font_style: Some("Bold".into()), size: Some(14.0), ..Default::default() });
+        assert_eq!(st.char_style_attrs("Loop"), CharAttrs { tracking: Some(5.0), ..Default::default() });
+        assert!(st.char_style_attrs(NO_CHAR_STYLE).is_empty());
+        assert!(st.char_style_attrs("Missing").is_empty());
+    }
+
+    #[test]
     fn legacy_cell_and_table_style_json_keep_uniform_values() {
         let cell: CellStyle =
             serde_json::from_str(r#"{"name":"Legacy","insets":[1,2,3,4],"stroke":{"weight":2,"color":"Brand","tint":0.5,"kind":{"kind":"solid"}}}"#)
@@ -919,24 +997,6 @@ mod tests {
         let resolved = styles.resolve_table_style("0");
         assert!(resolved.space_before.is_none());
         assert_eq!(resolved.space_after, Some(15.0));
-    }
-
-    #[test]
-    fn character_style_attrs_include_its_based_on_chain_only() {
-        let mut st = Styles::default();
-        let cs = |name: &str, based_on: Option<&str>, chars| CharacterStyle {
-            name: name.into(),
-            based_on: based_on.map(Into::into),
-            chars,
-            shortcut: String::new(),
-        };
-        st.character.push(cs("Base", None, CharAttrs { font_style: Some("Bold".into()), size: Some(9.0), ..Default::default() }));
-        st.character.push(cs("Strong", Some("Base"), CharAttrs { size: Some(14.0), ..Default::default() }));
-        st.character.push(cs("Loop", Some("Loop"), CharAttrs { tracking: Some(5.0), ..Default::default() }));
-        assert_eq!(st.char_style_attrs("Strong"), CharAttrs { font_style: Some("Bold".into()), size: Some(14.0), ..Default::default() });
-        assert_eq!(st.char_style_attrs("Loop"), CharAttrs { tracking: Some(5.0), ..Default::default() });
-        assert!(st.char_style_attrs(NO_CHAR_STYLE).is_empty());
-        assert!(st.char_style_attrs("Missing").is_empty());
     }
 
     #[test]

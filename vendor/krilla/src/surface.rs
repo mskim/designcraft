@@ -610,6 +610,16 @@ impl<'a> Surface<'a> {
 
 impl Drop for Surface<'_> {
     fn drop(&mut self) {
+        // Keep the document poisoned if cleanup unwinds, including an invariant failure
+        // during an explicit finish. Successful cleanup preserves any earlier poison.
+        let poisoned = std::mem::replace(&mut self.sc.poisoned, true);
+        // A drawing panic can leave surface state incomplete. Discard it while
+        // unwinding; finalization here could panic again and abort the process.
+        // The caller must discard the whole document after a caught panic.
+        if std::thread::panicking() {
+            return;
+        }
+
         let root_builder = std::mem::replace(
             &mut self.bd.root_builder,
             ContentBuilder::new(Transform::identity(), false, self.sc),
@@ -623,7 +633,8 @@ impl Drop for Surface<'_> {
         assert!(self.push_instructions.is_empty());
         assert!(!root_builder.active_marked_content);
 
-        (self.finish_fn)(root_builder.finish(self.sc), num_mcids)
+        (self.finish_fn)(root_builder.finish(self.sc), num_mcids);
+        self.sc.poisoned = poisoned;
     }
 }
 

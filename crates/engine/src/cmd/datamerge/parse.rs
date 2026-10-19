@@ -277,32 +277,23 @@ fn next_slot(col: i32, row: i32, rows_first: bool, fits_col: &impl Fn(i32) -> bo
     (0, 0, true)
 }
 
-/// Files to try for an image cell. `http` and `https` are not candidates. Relative paths are
-/// not resolved against the process working directory.
+/// Files to try for an image cell: an absolute path as it is, a relative one beside the data
+/// file, then beside the document. Relative paths are not resolved against the process working
+/// directory, and paths that may not be followed ([`crate::io::document_path`]: URLs, other
+/// computers, devices) are not candidates.
 pub fn image_candidates(cell: &str, data_dir: Option<&Path>, doc_dir: Option<&Path>) -> Vec<PathBuf> {
     let cell = cell.trim();
     if cell.is_empty() {
         return Vec::new();
     }
-    let lower = cell.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return Vec::new();
-    }
-    let path = Path::new(cell);
-    let mut out = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.iter().any(|e| e == &p) {
+    let found = std::iter::once(crate::io::document_path(cell, None))
+        .chain(data_dir.map(|dir| crate::io::folder_path(cell, dir)))
+        .chain(doc_dir.map(|dir| crate::io::folder_path(cell, dir)));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in found.flatten() {
+        if !out.contains(&p) {
             out.push(p);
         }
-    };
-    if path.is_absolute() {
-        push(path.to_path_buf());
-    }
-    if let Some(dir) = data_dir {
-        push(dir.join(cell));
-    }
-    if let Some(dir) = doc_dir {
-        push(dir.join(cell));
     }
     out
 }
@@ -330,14 +321,18 @@ pub fn relative_between(from_dir: &Path, target: &Path) -> String {
 }
 
 pub fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
-    let meta = std::fs::metadata(path).ok()?;
+    Some(fingerprint_from(&crate::io::metadata(path).ok()?))
+}
+
+/// Size and modification time (whole seconds) from a file's metadata.
+pub fn fingerprint_from(meta: &crate::io::Metadata) -> Fingerprint {
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0);
-    Some(Fingerprint { size: meta.len(), mtime })
+    Fingerprint { size: meta.len(), mtime }
 }
 
 pub fn status_of(path: &Path, previous: Option<Fingerprint>) -> SourceStatus {

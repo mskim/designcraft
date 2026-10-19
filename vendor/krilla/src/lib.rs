@@ -177,3 +177,9 @@ pub use graphics::*;
 pub use interactive::*;
 pub use interchange::*;
 pub use serialize::SerializeSettings;
+
+/// Identifies the local patch that discards unfinished page/surface state during unwind.
+pub const CRAFT_UNWIND_SAFE_DROP: bool = true;
+
+/// Identifies the patch that rejects serialization after failed page/surface cleanup.
+pub const CRAFT_UNWIND_POISONING: bool = true;

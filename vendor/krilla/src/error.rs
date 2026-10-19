@@ -22,6 +22,8 @@ pub type KrillaResult<T> = Result<T, KrillaError>;
 /// An error in krilla.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum KrillaError {
+    /// A page or surface failed during cleanup; discard the complete document.
+    Poisoned,
     /// An error while attempting to embed a font.
     Font(Font, String),
     /// A list of validation errors. Can only occur if you set the `validator` in
@@ -59,6 +61,7 @@ pub enum KrillaError {
 impl Display for KrillaError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            KrillaError::Poisoned => f.write_str("document contains a failed page or surface"),
             KrillaError::Font(_, message) => write!(f, "failed to embed font: {message}"),
             KrillaError::Validation(errors) => {
                 let count = errors.len();

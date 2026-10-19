@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Guide",
             [],
             None,
-            "{orientation: horizontal|vertical, position (spread coordinate), spread?, page? (index in the spread; default: the page under `at` or the position), at? (the other coordinate), spreadGuide?: bool} → {page, index}",
+            "{orientation: horizontal|vertical, position (spread coordinate), spread?, page? (index in the spread; default: the page under `at` or the position), at? (the other coordinate), spreadGuide?: bool, liquid?: bool (a liquid guide, as the Page tool draws from the rulers)} or {orientation: both, point: [x, y], spread?, page?, spreadGuide?: bool, liquid?: bool} → {page, index}; `both` adds a horizontal guide through y and a vertical guide through x as one undo step → {guides: [{page, index}, {page, index}]}",
             has_doc,
             add
         ),
@@ -94,28 +94,59 @@ fn page_at(d: &Document, r: SpreadRef, x: f64) -> usize {
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
-    let o = orientation(p)?;
-    let pos = finite_number(p, "position", "guide.add")?.ok_or_else(|| bad("guide.add", "missing position"))?;
     let r = super::spread_param(p, "guide.add")?;
     let spread_guide = p.get("spreadGuide").and_then(Value::as_bool).unwrap_or(false);
-    let d = &s.doc()?.doc;
-    let pi = match optional_usize(p, "page", "guide.add")? {
-        Some(pi) => pi,
-        None if spread_guide => 0,
-        None => {
-            let x = match o {
-                Orientation::Vertical => pos,
-                Orientation::Horizontal => finite_number(p, "at", "guide.add")?.unwrap_or(0.0),
-            };
-            page_at(d, r, x)
-        }
+    let liquid = p.get("liquid").and_then(Value::as_bool).unwrap_or(false);
+    let page = optional_usize(p, "page", "guide.add")?;
+    // (orientation, position, x used to find the page)
+    let guides: Vec<(Orientation, f64, f64)> = if str_param(p, "orientation") == Some("both") {
+        let point = p.get("point").and_then(Value::as_array).ok_or_else(|| bad("guide.add", "orientation `both` needs point: [x, y]"))?;
+        let coord = |i: usize| point.get(i).and_then(Value::as_f64).filter(|v| v.is_finite());
+        let (Some(x), Some(y), 2) = (coord(0), coord(1), point.len()) else {
+            return Err(bad("guide.add", "`point` must be two finite numbers [x, y]"));
+        };
+        vec![(Orientation::Horizontal, y, x), (Orientation::Vertical, x, x)]
+    } else {
+        let o = orientation(p)?;
+        let pos = finite_number(p, "position", "guide.add")?.ok_or_else(|| bad("guide.add", "missing position"))?;
+        let x = match o {
+            Orientation::Vertical => pos,
+            Orientation::Horizontal => finite_number(p, "at", "guide.add")?.unwrap_or(0.0),
+        };
+        vec![(o, pos, x)]
     };
+    let d = &s.doc()?.doc;
+    let placed: Vec<(Orientation, f64, usize)> = guides
+        .into_iter()
+        .map(|(o, pos, x)| {
+            let pi = match page {
+                Some(pi) => pi,
+                None if spread_guide => 0,
+                None => page_at(d, r, x),
+            };
+            (o, pos, pi)
+        })
+        .collect();
     let layer = s.doc()?.active_layer;
     s.edit(|d, _| {
         let sp = d.spread_mut(r).ok_or_else(|| bad("guide.add", "no such spread"))?;
-        let pg = sp.pages.get_mut(pi).ok_or_else(|| bad("guide.add", "no such page"))?;
-        pg.guides.push(Guide { orientation: o, position: pos, spread: spread_guide, locked: false, layer: Some(layer), liquid: false });
-        Ok(json!({"page": pi, "index": pg.guides.len() - 1}))
+        let mut out = Vec::new();
+        for (o, pos, pi) in placed {
+            let pg = sp.pages.get_mut(pi).ok_or_else(|| bad("guide.add", "no such page"))?;
+            pg.guides.push(Guide {
+                orientation: o,
+                position: pos,
+                spread: spread_guide,
+                locked: false,
+                layer: Some(layer),
+                liquid: liquid && !spread_guide,
+            });
+            out.push(json!({"page": pi, "index": pg.guides.len() - 1}));
+        }
+        match <[Value; 1]>::try_from(out) {
+            Ok([one]) => Ok(one),
+            Err(out) => Ok(json!({"guides": out})),
+        }
     })
 }
 
@@ -315,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn both_orientations_are_one_undo_step() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("guide.add", &json!({"orientation": "both", "point": [120.0, 80.0], "spreadGuide": true})).unwrap();
+        assert_eq!(r["guides"].as_array().unwrap().len(), 2);
+        let l = s.execute("guide.list", &json!({})).unwrap();
+        assert_eq!((l[0]["orientation"].as_str(), l[0]["position"].as_f64()), (Some("horizontal"), Some(80.0)));
+        assert_eq!((l[1]["orientation"].as_str(), l[1]["position"].as_f64()), (Some("vertical"), Some(120.0)));
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.execute("guide.list", &json!({})).unwrap(), json!([]));
+        assert!(s.execute("guide.add", &json!({"orientation": "both", "point": [1.0]})).is_err());
+        assert!(s.execute("guide.add", &json!({"orientation": "both", "position": 1.0})).is_err());
+    }
+
+    #[test]
     fn create_guides_validates_generation_limits() {
         let mut s = Session::new();
         s.execute("file.new", &json!({})).unwrap();
@@ -386,5 +432,53 @@ mod layer_tests {
         s.execute("layer.set", &json!({"id": l, "visible": true, "locked": true})).unwrap();
         let d = s.doc().unwrap().doc.clone();
         assert!(g(&s).visible_in(&d) && !g(&s).editable_in(&d));
+    }
+
+    #[test]
+    fn create_guides_goes_to_the_named_spread_and_page_only() {
+        use designcraft_doc::SpreadRef;
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3})).unwrap();
+        // The UI passes the spread/page being worked on as a serialised SpreadRef (page 3).
+        let spread = serde_json::to_value(SpreadRef::Doc(1)).unwrap();
+        s.execute("layout.createGuides", &json!({"spread": spread, "page": 1, "columns": 2, "columnGutter": 0.0})).unwrap();
+        let l = s.execute("guide.list", &json!({"spread": 1})).unwrap();
+        let l = l.as_array().unwrap();
+        assert!(!l.is_empty() && l.iter().all(|g| g["page"] == 1), "only page 3: {l:?}");
+        let first = s.execute("guide.list", &json!({"spread": 0})).unwrap();
+        assert!(first.as_array().unwrap().is_empty(), "nothing on the first page");
+    }
+
+    #[test]
+    fn guides_on_a_parent_page_show_on_the_pages_that_use_it() {
+        use designcraft_doc::{PageSide, SpreadRef};
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 4, "facingPages": true})).unwrap();
+        // A vertical guide 88 pt inside the parent's right page, and a horizontal one.
+        let parent = serde_json::to_value(SpreadRef::Parent(0)).unwrap();
+        let right_x = s.doc().unwrap().doc.parents[0].pages.last().unwrap().x;
+        s.execute("guide.add", &json!({"spread": parent, "orientation": "vertical", "position": right_x + 88.0})).unwrap();
+        s.execute("guide.add", &json!({"spread": parent, "orientation": "horizontal", "position": 200.0, "at": right_x + 10.0})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let mut seen = 0;
+        for abs in 0..d.page_count() {
+            let page = d.page(abs).unwrap();
+            let (pi, qi) = d.parent_page_for(abs).unwrap();
+            let inherited = d.inherited_guides(abs);
+            if d.parents[pi].pages[qi].guides.is_empty() {
+                assert!(inherited.is_empty(), "page {abs} uses the parent's left page, which has no guides");
+                continue;
+            }
+            seen += 1;
+            assert_eq!(page.side, PageSide::Right);
+            let v = inherited.iter().find(|g| g.orientation == designcraft_doc::Orientation::Vertical).unwrap();
+            // Moved to this page's own place in its spread: still 88 pt inside the page.
+            assert!((v.position - (page.x + 88.0)).abs() < 1e-6, "page {abs}: {v:?} vs x {}", page.x);
+            let h = inherited.iter().find(|g| g.orientation == designcraft_doc::Orientation::Horizontal).unwrap();
+            assert!((h.position - 200.0).abs() < 1e-6);
+        }
+        assert!(seen >= 2, "pages on the parent's right side inherit: {seen}");
+        // The guides stay on the parent: nothing is copied onto document pages.
+        assert!((0..d.page_count()).all(|a| d.page(a).unwrap().guides.is_empty()));
     }
 }

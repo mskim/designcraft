@@ -240,6 +240,8 @@ pub(crate) enum MaybeDeviceColorSpace {
 /// - Annotations used in the document.
 ///   etc.
 pub(crate) struct SerializeContext {
+    /// An unfinished or failed page/surface must never serialize as a complete document.
+    pub(crate) poisoned: bool,
     /// The ref of the page tree.
     page_tree_ref: Ref,
     /// PDF 2.0 namespaces.
@@ -294,6 +296,7 @@ impl SerializeContext {
         };
 
         Self {
+            poisoned: false,
             cached_mappings: HashMap::new(),
             pdf2_ns,
             global_objects: GlobalObjects::default(),

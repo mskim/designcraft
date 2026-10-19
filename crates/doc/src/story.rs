@@ -155,6 +155,40 @@ pub struct Story {
     /// Place and Link: the parent story this one copies, and the parent's revision when copied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<(StoryId, u64)>,
+    /// File › Place with Create Links: the text file the story was placed from (Links panel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_link: Option<TextFileLink>,
+}
+
+/// A linked text file: where a placed story came from, what the file held, and the Word Import
+/// Options that brought it in, so Update Link can import it again the same way.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextFileLink {
+    pub path: String,
+    /// The file's size and FNV-1a hash (hex) when it was placed or last updated.
+    pub size: u64,
+    pub hash: String,
+    /// Its modification time then (seconds since 1970; 0: unknown), as Data Merge keeps for its
+    /// source: while size and time are unchanged, the Links panel doesn't read the file.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub mtime: i64,
+    /// Imported style name → document style (`styleMap`), including the names Auto Rename chose.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub style_map: BTreeMap<String, String>,
+    /// `styleConflicts`: useExisting, redefine or autoRename.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub style_conflicts: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remove_styles: bool,
+    /// Hash of the story's text and formatting right after the import: a different one means it
+    /// was edited in the layout (an update replaces those edits).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub story_hash: String,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 impl Story {
@@ -177,6 +211,7 @@ impl Story {
             objects: Vec::new(),
             editorial: Vec::new(),
             link: None,
+            file_link: None,
         }
     }
 
@@ -227,6 +262,21 @@ impl Story {
         self.chars.last().map_or(&NO_FORMAT, |r| &r.format)
     }
 
+    /// Format of the character starting at byte `pos` (the run containing `pos`), unlike
+    /// [`Self::char_format_at`], which at a run boundary returns the format of the character
+    /// before the caret. Past the end, the last run's format.
+    pub fn char_format_of(&self, pos: usize) -> &CharFormat {
+        let mut start = 0usize;
+        for r in &self.chars {
+            let end = start.saturating_add(r.len);
+            if pos < end {
+                return &r.format;
+            }
+            start = end;
+        }
+        self.chars.last().map_or(&NO_FORMAT, |r| &r.format)
+    }
+
     /// Iterate `(range, format)` of character runs.
     pub fn runs(&self) -> impl Iterator<Item = (std::ops::Range<usize>, &CharFormat)> {
         let mut start = 0;
@@ -237,9 +287,18 @@ impl Story {
         })
     }
 
-    /// Insert `text` at byte `pos` using the format at that position.
+    /// The format text inserted at byte `pos` takes: the run before `pos`
+    /// ([`Story::char_format_at`]), except on an empty paragraph, where it is that paragraph's own
+    /// mark (the line's only character, so its format is the one chosen for that line).
+    pub fn insert_format_at(&self, pos: usize) -> &CharFormat {
+        let b = self.text.as_bytes();
+        let empty_para = b.get(pos) == Some(&b'\n') && pos.checked_sub(1).and_then(|p| b.get(p)) == Some(&b'\n');
+        if empty_para { self.format_after(pos) } else { self.char_format_at(pos) }
+    }
+
+    /// Insert `text` at byte `pos` using the format at that position ([`Story::insert_format_at`]).
     pub fn insert(&mut self, pos: usize, text: &str) {
-        let fmt = self.char_format_at(pos).clone();
+        let fmt = self.insert_format_at(pos).clone();
         self.insert_with(pos, text, fmt);
     }
 
@@ -255,7 +314,8 @@ impl Story {
         self.insert_with_raw(pos, text, fmt);
     }
 
-    fn insert_with_raw(&mut self, pos: usize, text: &str, fmt: CharFormat) {
+    /// [`Story::insert_with`] without the table fix-up.
+    pub(crate) fn insert_with_raw(&mut self, pos: usize, text: &str, fmt: CharFormat) {
         if text.is_empty() {
             return;
         }
@@ -292,7 +352,7 @@ impl Story {
         // Character runs.
         self.splice_runs(pos, 0, text.len(), fmt);
         self.normalize();
-        self.rev += 1;
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// End the paragraph after every break character that isn't followed by a `\n`.
@@ -332,26 +392,31 @@ impl Story {
         self.marks_deleted(a, b);
         let pi = self.para_at(a);
         let removed = self.text[a..b].bytes().filter(|c| *c == b'\n').count();
-        // Merged paragraphs keep a table whose anchor survives the deletion.
+        // Merged paragraphs keep the tables whose anchors survive the deletion (the fix-up gives
+        // each its own paragraph again).
+        let mut claims = Vec::new();
         if removed > 0 && !self.tables.is_empty() {
             let ranges = self.para_ranges();
-            let first = self.paras[pi].table.filter(|_| self.text[ranges[pi].start..a].contains(TABLE_ANCHOR));
-            let last = self.paras[pi + removed]
-                .table
-                .filter(|_| self.text[b.min(ranges[pi + removed].end)..ranges[pi + removed].end].contains(TABLE_ANCHOR));
-            self.paras[pi].table = first.or(last);
+            let anchor = |pi: usize, r: std::ops::Range<usize>| {
+                self.paras[pi].table.and_then(|id| self.text[r.clone()].find(TABLE_ANCHOR).map(|k| (r.start + k, id)))
+            };
+            let first = anchor(pi, ranges[pi].start..a);
+            let end = ranges[pi + removed].end;
+            let last = anchor(pi + removed, b.min(end)..end).map(|(at, id)| (at.saturating_sub(b - a), id));
+            self.paras[pi].table = first.or(last).map(|(_, id)| id);
+            claims.extend(first.into_iter().chain(last));
         }
         self.paras.drain(pi + 1..pi + 1 + removed);
         self.text.replace_range(a..b, "");
         self.remove_run_bytes(a, b - a);
         self.normalize();
-        self.fix_tables();
-        self.rev += 1;
+        self.fix_tables_with(&claims);
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// Replace a range with text (delete + insert using the format at the start of the range).
     pub fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
-        let fmt = if range.start < range.end { self.format_after(range.start).clone() } else { self.char_format_at(range.start).clone() };
+        let fmt = if range.start < range.end { self.format_after(range.start).clone() } else { self.insert_format_at(range.start).clone() };
         self.delete(range.clone());
         self.insert_with(range.start, text, fmt);
     }
@@ -387,7 +452,7 @@ impl Story {
             start = end;
         }
         self.normalize();
-        self.rev += 1;
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// Apply `f` to every paragraph intersecting `range` (an empty range = the paragraph at it).
@@ -399,7 +464,7 @@ impl Story {
             f(p);
             p.table = table;
         }
-        self.rev += 1;
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// Plain text of a range.
@@ -579,6 +644,31 @@ mod tests {
         s.delete(1..2); // inside 'é' (2 bytes): clamps
         s.check().unwrap();
         s.format_chars(0..3, |f| f.over.size = Some(9.0));
+        s.check().unwrap();
+    }
+
+    #[test]
+    fn saved_revision_wraps_without_stopping_edits() {
+        let mut s = st("seed");
+        s.rev = u64::MAX;
+        // Revisions are serialized; a valid saved story can reach the boundary.
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let mut s: Story = serde_json::from_slice(&bytes).unwrap();
+        s.insert(s.len(), " text");
+        assert_eq!(s.rev, 0);
+        assert_eq!(s.text, "seed text");
+        s.rev = u64::MAX;
+        s.delete(4..s.len());
+        assert_eq!(s.rev, 0);
+        assert_eq!(s.text, "seed");
+        s.rev = u64::MAX;
+        s.format_chars(0..s.len(), |f| f.over.size = Some(18.0));
+        assert_eq!(s.rev, 0);
+        assert_eq!(s.char_format_at(0).over.size, Some(18.0));
+        s.rev = u64::MAX;
+        s.format_paras(0..s.len(), |p| p.style = "Heading".into());
+        assert_eq!(s.rev, 0);
+        assert_eq!(s.paras[0].style, "Heading");
         s.check().unwrap();
     }
 

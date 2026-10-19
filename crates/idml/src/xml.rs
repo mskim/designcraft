@@ -194,6 +194,11 @@ pub fn document_with_pi(root: &El, pi: &str) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// How deep elements may nest. InDesign's packages stay under a few dozen levels; the tree is
+/// walked and dropped recursively afterwards, so unbounded nesting is refused here, not left to
+/// run into the stack (#712).
+pub const MAX_DEPTH: usize = 256;
+
 /// Parse a document into its root element.
 pub fn parse(bytes: &[u8]) -> Result<El, String> {
     let mut r = quick_xml::Reader::from_reader(bytes);
@@ -205,6 +210,9 @@ pub fn parse(bytes: &[u8]) -> Result<El, String> {
         let ev = r.read_event_into(&mut buf).map_err(|e| format!("XML error at {}: {e}", pos(&r)))?;
         match ev {
             Event::Start(e) => {
+                if stack.len() > MAX_DEPTH {
+                    return Err(format!("XML elements nested deeper than {MAX_DEPTH} levels at {}", pos(&r)));
+                }
                 let el = start_el(&e)?;
                 stack.push(el);
             }
@@ -283,7 +291,10 @@ fn start_el(e: &quick_xml::events::BytesStart) -> Result<El, String> {
     for a in e.attributes().with_checks(false) {
         let a = a.map_err(|e| e.to_string())?;
         let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
-        let v = a.unescape_value().map(|v| v.to_string()).unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
+        let v = a
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
         el.attrs.push((k, v));
     }
     Ok(el)
@@ -292,6 +303,16 @@ fn start_el(e: &quick_xml::events::BytesStart) -> Result<El, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #712: nesting past the budget is an error from the parser, not a stack overflow later.
+    #[test]
+    fn nesting_past_the_budget_is_refused() {
+        let nested = |n: usize| format!("{}{}", "<A>".repeat(n), "</A>".repeat(n)).into_bytes();
+        assert!(parse(&nested(MAX_DEPTH)).is_ok(), "the budget itself parses");
+        let err = parse(&nested(MAX_DEPTH + 1)).expect_err("one level more is refused");
+        assert!(err.contains("nested deeper"), "{err}");
+        assert!(parse(&nested(100_000)).is_err());
+    }
 
     #[test]
     fn roundtrip_text_pi_and_entities() {

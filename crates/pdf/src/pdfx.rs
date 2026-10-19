@@ -1,4 +1,4 @@
-//! PDF/X-4: the output intent (our Generic CMYK profile), the PDF/X version in the document
+//! PDF/X-4: the output intent (the working CMYK space's profile), the PDF/X version in the document
 //! information and XMP, written as an incremental update of krilla's PDF 1.6 output; and a
 //! check of the requirements this exporter is responsible for.
 
@@ -46,19 +46,19 @@ pub fn make_pdfx4(pdf: &[u8], title: &str) -> Option<Vec<u8>> {
         out.extend_from_slice(b"\nendobj\n");
     };
     // The output profile and the output intent.
-    let icc = designcraft_color::cms::icc_out::generic_cmyk_icc();
+    let intent = designcraft_color::cms::active().output_intent().ok()?;
     let (icc_id, oi_id) = (size, size + 1);
-    let mut s = format!("<</N 4/Length {}>>\nstream\n", icc.len()).into_bytes();
-    s.extend_from_slice(icc);
+    let mut s = format!("<</N 4/Length {}>>\nstream\n", intent.icc.len()).into_bytes();
+    s.extend_from_slice(&intent.icc);
     s.extend_from_slice(b"\nendstream");
     put(&mut out, icc_id, &s);
-    let cond = designcraft_color::cms::GENERIC_CMYK;
+    let cond = &intent.condition;
     put(
         &mut out,
         oi_id,
         format!(
             "<</Type/OutputIntent/S/GTS_PDFX/OutputConditionIdentifier{}/OutputCondition{}/Info{}/RegistryName(http://www.color.org)/DestOutputProfile {icc_id} 0 R>>",
-            lit("Custom"),
+            lit(intent.identifier),
             lit(cond),
             lit(cond)
         )
@@ -452,6 +452,7 @@ impl RgbScan {
 
 #[cfg(test)]
 mod tests {
+    use craft_pdf::write::backend as krilla;
     use std::sync::Arc;
 
     use designcraft_color::{Color, Swatch};
@@ -468,7 +469,7 @@ mod tests {
         let asset = AssetId(d.alloc());
         let mime = designcraft_images::mime(&data).into();
         let pixels = designcraft_images::pixel_size(&data);
-        d.assets.insert(asset, Arc::new(Asset { id: asset, name: name.into(), mime, link: None, data: data.into(), pixels, page: 0 }));
+        d.assets.insert(asset, Arc::new(Asset { id: asset, name: name.into(), mime, data: data.into(), pixels, ..Default::default() }));
         let lid = d.default_layer();
         let id = ItemId(d.alloc());
         let r = Rect::new(at.0, at.1, at.0 + 100.0, at.1 + 50.0);
@@ -477,9 +478,12 @@ mod tests {
             asset,
             size,
             xf: Affine::translate(at) * Affine::scale(100.0 / size.0),
+            clip: None,
             auto_fit: Fitting::FillProportionally,
             fit_align: 4,
             crop: [0.0; 4],
+            wrap: Default::default(),
+            fill: Default::default(),
         });
         d.insert_item(SpreadRef::Doc(0), it, None).unwrap();
     }

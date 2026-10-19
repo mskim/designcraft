@@ -70,7 +70,28 @@
       <key>LSHandlerRank</key>
       <string>Alternate</string>
       <key>LSItemContentTypes</key>
-      <array><string>ai.storyteller.designcraft.idml</string></array>
+      <!-- With InDesign installed, .idml files are typed as its com.adobe.indesign-markup, which
+           wins over our imported type; claim both so Finder offers DesignCraft either way. -->
+      <array>
+        <string>ai.storyteller.designcraft.idml</string>
+        <string>com.adobe.indesign-markup</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>InDesign Document</string>
+      <!-- Converted to IDML on open; saving writes a .designcraft file. -->
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>com.adobe.indesign-document</string></array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>indd</string>
+        <string>indt</string>
+      </array>
     </dict>
   </array>
 

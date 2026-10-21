@@ -269,7 +269,7 @@ pub fn install_fonts(ctx: &egui::Context, lang: &str) -> bool {
     let craft = designcraft_fonts::CRAFT_FONTS;
     let mut defs = font_definitions(craft, lang);
     let system = system_ui_fonts(craft);
-    if let Some(system) = system {
+    if let Some(system) = &system {
         add_system_fallbacks(&mut defs, system, lang);
     }
     ctx.set_fonts(defs);
@@ -350,8 +350,8 @@ const SYSTEM_UI_FONTS: &[(&str, char, &[&str])] = &[
 /// Traditional Chinese (font names in the font menus), Indic, Southeast Asian and other scripts
 /// in any build. egui can't find system fonts itself; the document font scan (not on the web)
 /// does.
-fn system_ui_fonts(craft: &[designcraft_fonts::CraftFont]) -> Option<&'static [SystemFont]> {
-    static FACES: std::sync::OnceLock<Vec<SystemFont>> = std::sync::OnceLock::new();
+fn system_ui_fonts(craft: &[designcraft_fonts::CraftFont]) -> Option<Arc<Vec<SystemFont>>> {
+    static FACES: UiFontCache = std::sync::Mutex::new(None);
     let db = designcraft_fonts::FontDb::global();
     // Never wait for the font scan here (the first frame): it runs in the background, and the
     // faces are read once, when it is done.
@@ -360,7 +360,25 @@ fn system_ui_fonts(craft: &[designcraft_fonts::CraftFont]) -> Option<&'static [S
         db.scan_in_background();
         return None;
     }
-    Some(FACES.get_or_init(|| installed_ui_fonts(db, craft)))
+    Some(cached_ui_fonts(&FACES, db.families().len(), || installed_ui_fonts(db, craft)))
+}
+
+/// The UI faces last read, with the number of font families there were then.
+type UiFontCache = std::sync::Mutex<Option<(usize, Arc<Vec<SystemFont>>)>>;
+
+/// The UI faces (`read`, i.e. `installed_ui_fonts`), read again only when the number of font
+/// families (`families`) changed: fonts added later (an embed's host sends the book's, Noto Sans
+/// KR among them) give the interface their scripts.
+fn cached_ui_fonts(cache: &UiFontCache, families: usize, read: impl FnOnce() -> Vec<SystemFont>) -> Arc<Vec<SystemFont>> {
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((n, faces)) = cached.as_ref()
+        && *n == families
+    {
+        return faces.clone();
+    }
+    let faces = Arc::new(read());
+    *cached = Some((families, faces.clone()));
+    faces
 }
 
 /// The faces of [`SYSTEM_UI_FONTS`] that `db` has, for the scripts `craft` doesn't cover.
@@ -740,6 +758,28 @@ mod japanese_font_tests {
         });
         // And the real installer works with whatever this build has.
         super::install_fonts(&egui::Context::default(), "ja");
+    }
+}
+
+#[cfg(test)]
+mod ui_font_cache_tests {
+    #[test]
+    fn the_ui_faces_are_read_again_when_fonts_are_added() {
+        let cache = std::sync::Mutex::new(None);
+        let mut reads = 0;
+        let mut read = |families| {
+            super::cached_ui_fonts(&cache, families, || {
+                reads += 1;
+                Vec::new()
+            })
+        };
+        let first = read(10);
+        let again = read(10);
+        assert!(std::sync::Arc::ptr_eq(&first, &again), "nothing added: the same faces");
+        let added = read(11);
+        assert!(!std::sync::Arc::ptr_eq(&first, &added), "a family added: read again");
+        drop(read);
+        assert_eq!(reads, 2);
     }
 }
 

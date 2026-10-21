@@ -99,16 +99,52 @@ pub const STUDIO_CHARS: &[&str] = &["fontFamily", "fontStyle", "size", "tracking
 /// The paragraph attributes a studio may change in a paragraph style (exact camelCase keys).
 pub const STUDIO_PARA: &[&str] = &["align", "leftIndent", "rightIndent", "firstLineIndent"];
 
-/// Ids studio mode allows beyond 교정/교열's: switching between its documents' tabs.
-pub const STUDIO_ALLOWED: &[&str] = &["file.activate", "document.list"];
+/// Ids studio mode allows although [`STUDIO_REFUSED`] names them: switching between its
+/// documents' tabs, and the host's own opening and closing of them (`studio_load`; the user's
+/// are refused in `DesignApp::run`).
+pub const STUDIO_ALLOWED: &[&str] = &["file.activate", "file.openBytes", "file.close"];
+
+/// The commands (ids, or prefixes ending in `.`) studio refuses although they leave the document's
+/// undo history alone: opening, closing, creating, saving, exporting, packaging and printing
+/// documents, books and libraries; the app's own state (preferences, colour settings, font
+/// folders, swatch and snippet files); the ones that change a document without an undo step
+/// (the conveyor, Data Merge's preview); and every text command (typing, the caret, text
+/// selections).
+pub const STUDIO_REFUSED: &[&str] = &[
+    "file.",
+    "book.",
+    "app.",
+    "prefs.",
+    "text.",
+    "library.add",
+    "library.close",
+    "library.new",
+    "library.open",
+    "library.remove",
+    "color.loadProfile",
+    "color.settings",
+    "font.addFolder",
+    "swatch.save",
+    "snippet.export",
+    "conveyor.clear",
+    "conveyor.collect",
+    "data.preview",
+];
 
 pub fn studio_tool_allowed(id: &str) -> bool {
     STUDIO_TOOLS.contains(&id)
 }
 
-/// Studio mode's command filter: what 교정/교열 allows that leaves the document as it is (view,
-/// navigation, selection, queries, undo and redo) — no text editing — plus switching documents,
-/// the style queries, and `style.paragraph.edit` that only changes allow-listed attributes.
+/// Whether `id` is one of [`STUDIO_REFUSED`]: the id itself, or under one of its prefixes.
+fn studio_refused(id: &str) -> bool {
+    STUDIO_REFUSED.iter().any(|r| if r.ends_with('.') { id.starts_with(r) } else { id == *r || id.starts_with(&format!("{r}.")) })
+}
+
+/// Studio mode's command filter: every engine command that leaves the undo history alone (view,
+/// navigation, selection, queries such as `font.list` and the style lists, undo and redo) but
+/// [`STUDIO_REFUSED`]'s, plus `style.paragraph.edit` that only changes allow-listed attributes
+/// (directly, or as a live preview). App-level ids (not engine commands) go on as in 교정/교열,
+/// after `studio_ui_command_allowed`.
 pub fn studio_command_allowed(id: &str, params: &Value) -> bool {
     if id == "style.paragraph.edit" {
         return studio_style_edit_allowed(params);
@@ -116,12 +152,20 @@ pub fn studio_command_allowed(id: &str, params: &Value) -> bool {
     if STUDIO_ALLOWED.contains(&id) {
         return true;
     }
-    // Not an engine command (an app-level id): command_allowed and ui_command_allowed decide.
-    let spec = designcraft_engine::find_command(id);
-    if id.starts_with("style.") && spec.is_some_and(|c| !c.journal && !c.undoable) {
-        return true; // a query: listing the styles
+    if studio_refused(id) {
+        return false;
     }
-    !id.starts_with("text.") && !spec.is_some_and(|c| c.undoable) && command_allowed(id, params)
+    // A live preview runs its command: only one studio allows.
+    if id == "edit.preview" {
+        let command = params.get("command").and_then(Value::as_str).unwrap_or_default();
+        return command != "edit.preview"
+            && designcraft_engine::find_command(command).is_some()
+            && studio_command_allowed(command, params.get("params").unwrap_or(&Value::Null));
+    }
+    match designcraft_engine::find_command(id) {
+        Some(spec) => !spec.undoable,
+        None => command_allowed(id, params),
+    }
 }
 
 /// `style.paragraph.edit` params holding just `name` and `chars` / `para` objects whose keys are
@@ -735,6 +779,18 @@ mod tests {
             "file.activate",
             "object.findByLabel",
             "story.links",
+            // the queries the interface runs (Find Font on open, the panels, the status bar)
+            "font.list",
+            "preflight.run",
+            "story.get",
+            "type.selectionAttrs",
+            "strokeStyle.list",
+            "layer.activate",
+            "find.find",
+            "tool.list",
+            "edit.copy",
+            "edit.cancelPreview",
+            "edit.commitPreview",
         ] {
             assert!(studio_command_allowed(id, &none), "{id}");
         }
@@ -769,9 +825,67 @@ mod tests {
             "file.save",
             "file.export",
             "file.new",
+            // what studio refuses although it isn't undoable: files, books, libraries, the app
+            "file.open",
+            "file.saveAs",
+            "file.saveACopy",
+            "file.exportPdf",
+            "file.exportIdml",
+            "file.print",
+            "file.package",
+            "file.serialize",
+            "file.revert",
+            "file.recovery.open",
+            "book.open",
+            "book.exportPdf",
+            "library.open",
+            "library.add",
+            "prefs.set",
+            "app.links",
+            "color.settings",
+            "font.addFolder",
+            "swatch.save",
+            "snippet.export",
+            "conveyor.collect",
+            "data.preview",
+            "data.preview.stop",
+            "text.select",
+            "text.selectWord",
+            "text.exitToFrame",
+            "edit.preview",
         ] {
             assert!(!studio_command_allowed(id, &none), "{id}");
         }
+    }
+
+    #[test]
+    fn studio_allows_every_command_that_leaves_the_history_alone_but_the_refused_ones() {
+        use serde_json::json;
+        let none = json!({});
+        for c in designcraft_engine::cmd::command_specs() {
+            let expected = if c.id == "style.paragraph.edit" {
+                false // with no attributes named: see the allow-list test
+            } else {
+                STUDIO_ALLOWED.contains(&c.id) || (!c.undoable && !studio_refused(c.id) && c.id != "edit.preview")
+            };
+            if c.id != "style.paragraph.edit" {
+                assert_eq!(studio_command_allowed(c.id, &none), expected, "{}", c.id);
+            }
+        }
+    }
+
+    #[test]
+    fn a_studio_live_preview_runs_only_what_studio_allows() {
+        use serde_json::json;
+        let preview =
+            |command: &str, params: Value| studio_command_allowed("edit.preview", &json!({"label": "x", "command": command, "params": params}));
+        assert!(preview("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 12}})));
+        assert!(!preview("style.paragraph.edit", json!({"name": "Body", "chars": {"leading": 18}})));
+        assert!(!preview("style.paragraph.edit", json!({"name": "Body", "rename": "X"})));
+        assert!(!preview("transform.move", json!({"dx": 10})));
+        assert!(!preview("text.insert", json!({"text": "x"})));
+        assert!(!preview("edit.preview", json!({"command": "font.list"})));
+        assert!(!preview("", json!({})));
     }
 
     #[test]
@@ -1329,6 +1443,58 @@ mod tests {
             assert!(app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 12}})).is_ok());
             let events = app.embed_poll(0.0);
             assert!(events.iter().any(|e| matches!(e, EmbedEvent::StyleChanged { document, name, .. } if document == "본문" && name == "Body")));
+        }
+
+        #[test]
+        fn a_studio_load_names_its_tabs_as_the_host_does_and_leaves_them_unmodified() {
+            let Studio { mut app, .. } = studio();
+            let docs: Vec<(String, Vec<u8>)> = served(&mut app).into_iter().map(|(_, b)| ("inner".to_string(), b)).collect();
+            app.studio_load(&docs, studio_config()).unwrap();
+            let tabs: Vec<(String, bool)> = app.session.documents().iter().map(|d| (d.title(), d.is_dirty())).collect();
+            assert_eq!(tabs, vec![("본문".to_string(), false), ("표지".to_string(), false)], "locking every item isn't a change");
+            // A document the config doesn't name keeps the name it was fetched under.
+            let mut config = studio_config();
+            config.documents.truncate(1);
+            app.studio_load(&docs, config).unwrap();
+            let titles: Vec<String> = app.session.documents().iter().map(|d| d.title()).collect();
+            assert_eq!(titles, vec!["본문".to_string(), "inner".to_string()]);
+            // A style edit is.
+            app.session.set_active(0);
+            app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 12}})).unwrap();
+            assert!(app.session.active().unwrap().is_dirty());
+        }
+
+        #[test]
+        fn a_studio_load_and_its_interface_run_nothing_studio_refuses() {
+            let Studio { mut app, .. } = studio();
+            let docs = served(&mut app);
+            app.studio_load(&docs, studio_config()).unwrap();
+            assert!(!app.ui.status.contains("not available"), "{}", app.ui.status);
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+                |ui, app: &mut DesignApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                    let _ = app.embed_poll(0.0);
+                },
+                app,
+            );
+            h.run_steps(6);
+            h.state_mut().run("file.activate", json!({"index": 1})).unwrap();
+            h.run_steps(4);
+            assert!(!h.state().ui.status.contains("not available"), "{}", h.state().ui.status);
+        }
+
+        #[test]
+        fn a_studio_load_after_the_proofread_start_runs_the_queries_on_open() {
+            // The web app begins as 교정/교열 before any load; studio's first load must not
+            // run the documents' opening under 교정/교열's filter (font.list refused).
+            let Studio { mut app, .. } = studio();
+            let docs = served(&mut app);
+            app.embed_begin(EmbedConfig::default());
+            app.ui.status.clear();
+            app.studio_load(&docs, studio_config()).unwrap();
+            assert!(!app.ui.status.contains("not available"), "{}", app.ui.status);
         }
 
         #[test]

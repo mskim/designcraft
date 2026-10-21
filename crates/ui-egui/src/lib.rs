@@ -594,6 +594,8 @@ pub struct DesignApp {
     /// The installed CJK faces are among the UI fonts (false while the system fonts are still
     /// being cataloged: the fonts are installed again when they are).
     fonts_system: bool,
+    /// Fonts were added to the font database since the UI fonts were installed (`ui_fonts_added`).
+    fonts_added: bool,
     pub restyle: bool,
     fonts_ready: bool,
     /// Files the operating system asked to open (macOS Finder, Dock, Open With), opened once the
@@ -686,6 +688,7 @@ impl DesignApp {
             styled: false,
             fonts_lang: String::new(),
             fonts_system: false,
+            fonts_added: false,
             restyle: false,
             fonts_ready: false,
             os_documents: Vec::new(),
@@ -1137,6 +1140,12 @@ impl DesignApp {
         }
     }
 
+    /// Fonts were added to the font database (an embed's host sent the book's): the interface
+    /// takes the scripts they cover (Hangul tab names, font names) from the next frame.
+    pub fn ui_fonts_added(&mut self) {
+        self.fonts_added = true;
+    }
+
     /// Turns this app into an embedded editor for the open document: chrome off, the type and
     /// selection tools only, every frame locked but the labelled movable ones (image:/lead:/table:).
     pub fn embed_begin(&mut self, config: embed::EmbedConfig) {
@@ -1194,9 +1203,11 @@ impl DesignApp {
             self.session.set_active(i);
             self.embed_lock();
             let Some(st) = self.session.active_mut() else { continue };
-            // The lock must not be undoable: the document was just opened.
+            // The lock must not be undoable, nor count as a change: the document was just opened.
             st.history.undo.clear();
             st.history.redo.clear();
+            st.saved_doc = st.doc.clone();
+            st.saved_revision = st.revision;
             let (name, editable) = names.get(i).map_or_else(|| (st.title(), false), |c| (c.name.clone(), c.editable));
             let doc = embed::StudioDoc { name, editable, loaded: embed::paragraph_styles(&st.doc), last: st.doc.clone() };
             let uid = st.uid;
@@ -1229,7 +1240,10 @@ impl DesignApp {
             return Err("no documents".into());
         }
         let embed = self.embed.take();
-        let opened = self.studio_open(documents);
+        // Opening runs the queries studio allows (font.list for Find Font), even when the app
+        // began as 교정/교열, whose filter refuses them.
+        self.session.command_filter = Some(embed::studio_command_allowed);
+        let opened = self.studio_open(documents, &config.documents);
         self.embed = embed;
         let counts = opened?;
         self.session.set_active(0);
@@ -1237,12 +1251,15 @@ impl DesignApp {
         Ok(counts)
     }
 
-    fn studio_open(&mut self, documents: &[(String, Vec<u8>)]) -> Result<Vec<usize>, String> {
+    /// Opens `documents` as tabs, each named as the host names it in `names` (본문, 표지), else
+    /// by the name it was fetched under.
+    fn studio_open(&mut self, documents: &[(String, Vec<u8>)], names: &[embed::DocConfig]) -> Result<Vec<usize>, String> {
         while !self.session.documents().is_empty() {
             self.run("file.close", json!({"index": 0}))?;
         }
         let mut counts = Vec::with_capacity(documents.len());
-        for (name, bytes) in documents {
+        for (i, (fetched, bytes)) in documents.iter().enumerate() {
+            let name = names.get(i).map(|d| d.name.as_str()).filter(|n| !n.is_empty()).unwrap_or(fetched);
             self.run("file.openBytes", json!({"name": name, "base64": designcraft_engine::cmd::base64_encode(bytes)}))
                 .map_err(|e| format!("{name}: {e}"))?;
             // The host brings the book's fonts; a missing one shows in a fallback face.
@@ -1571,9 +1588,10 @@ impl DesignApp {
             self.styled = true;
             self.restyle = true;
         } else {
-            if self.fonts_lang != self.ui.language || (!self.fonts_system && theme::system_fonts_ready()) {
+            if self.fonts_lang != self.ui.language || (!self.fonts_system && theme::system_fonts_ready()) || self.fonts_added {
                 self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
                 self.fonts_lang = self.ui.language.clone();
+                self.fonts_added = false;
             }
             self.fonts_ready = true;
         }
@@ -2223,6 +2241,24 @@ mod tests {
 
     /// The Control panel's two-row groups were centred as if they were one row tall, so the second
     /// row hung below the panel and was cut off.
+    #[test]
+    fn fonts_added_later_are_installed_in_the_interface_on_the_next_frame() {
+        let app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(2);
+        h.state_mut().ui_fonts_added();
+        assert!(h.state().fonts_added);
+        h.run_steps(1);
+        assert!(!h.state().fonts_added, "installed again");
+    }
+
     #[test]
     fn control_bar_shows_its_second_row() {
         let mut app = DesignApp::new(designcraft_engine::Session::new(), Services::default());

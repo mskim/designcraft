@@ -384,7 +384,10 @@ impl WebShell {
         for message in messages {
             match message {
                 HostMessage::Load { document_url, font_urls, spread, config } => {
-                    embed.loading = Some(Loading::start(document_url, font_urls, spread, config, ctx.clone()));
+                    embed.loading = Some(Loading::start(vec![document_url], font_urls, spread, config, ctx.clone()));
+                }
+                HostMessage::LoadStudio { document_urls, font_urls, spread, config } => {
+                    embed.loading = Some(Loading::start(document_urls, font_urls, spread, config, ctx.clone()));
                 }
                 HostMessage::ShowSpread(n) => embed.show = Some(n),
                 // The embed's guard refuses any tool but type and selection.
@@ -394,10 +397,23 @@ impl WebShell {
         if let Some(fetched) = embed.loading.as_ref().and_then(Loading::take)
             && let Some(loading) = embed.loading.take()
         {
-            match fetched.and_then(|(name, bytes)| open_embedded(&mut self.app, &name, &bytes, loading.config)) {
-                Ok(spread_count) => {
+            let studio = loading.config.mode == designcraft_ui_egui::embed::EmbedMode::Studio;
+            let opened = fetched.and_then(|documents| {
+                if studio {
+                    let names: Vec<String> = loading.config.documents.iter().map(|d| d.name.clone()).collect();
+                    let counts = self.app.studio_load(&documents, loading.config)?;
+                    Ok(embed_protocol::studio_loaded(&names.into_iter().zip(counts).collect::<Vec<_>>()))
+                } else {
+                    let (name, bytes) = documents.into_iter().next().ok_or("no document")?;
+                    let spread_count = open_embedded(&mut self.app, &name, &bytes, loading.config)?;
+                    Ok(embed_protocol::event(&designcraft_ui_egui::embed::EmbedEvent::Loaded { spread_count }))
+                }
+            });
+            match opened {
+                Ok(loaded) => {
+                    let spread_count = loaded.get("spreadCount").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
                     embed.show = Some(loading.spread.min(spread_count.saturating_sub(1)));
-                    embed_bridge::post(&embed_protocol::event(&designcraft_ui_egui::embed::EmbedEvent::Loaded { spread_count }));
+                    embed_bridge::post(&loaded);
                 }
                 Err(message) => {
                     log::error!("embed: load failed: {message}");
@@ -422,6 +438,10 @@ impl WebShell {
 
 /// Replaces the open document with `bytes` and makes it the embed's; returns its spread count.
 fn open_embedded(app: &mut DesignApp, name: &str, bytes: &[u8], config: designcraft_ui_egui::embed::EmbedConfig) -> Result<usize, String> {
+    // Studio refuses closing and opening tabs from `run`; a 교정/교열 load after it starts over.
+    if app.embed.as_ref().is_some_and(designcraft_ui_egui::embed::Embed::studio) {
+        app.embed = None;
+    }
     while !app.session.documents().is_empty() {
         app.run("file.close", serde_json::json!({"index": 0}))?;
     }

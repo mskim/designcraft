@@ -14,6 +14,8 @@
     &grid={"columns":6,…}               the grid as JSON (default: none, so frames don't snap)
     &frames={"lead:6":{"v":"line"}}     the movable frames' v, as JSON (default: none)
     &spread=0                           the spread to open on
+    &mode=studio                        studio mode (디자인수정): ?doc= is 본문 (editable) and
+    &doc2=spike/cover.designcraft       ?doc2= (optional) is 표지 (not editable); styleChanged is logged
 -->
 <html lang="en">
 <head>
@@ -82,6 +84,18 @@
     }
 
     function load() {
+      if (query.get("mode") === "studio") {
+        const documents = [{ name: "본문", url: query.get("doc") || "spike/chapter.designcraft", editable: true }];
+        if (query.get("doc2")) documents.push({ name: "표지", url: query.get("doc2"), editable: false });
+        send({
+          type: "load",
+          mode: "studio",
+          documents,
+          fontUrls: query.getAll("font").length ? query.getAll("font") : DEFAULT_FONTS,
+          spread,
+        });
+        return;
+      }
       const message = {
         type: "load",
         documentUrl: query.get("doc") || "spike/chapter.designcraft",
@@ -116,6 +130,7 @@
         case "loaded": spreadCount = message.spreadCount; showCount(); break;
         case "spreads": spreadCount = message.count; showCount(); break;
         case "spread": spread = message.spread; showCount(); break;
+        case "styleChanged": log(`  ${message.document} › ${message.name}: ${JSON.stringify(message.before)} → ${JSON.stringify(message.after)}`); break;
       }
     });
 

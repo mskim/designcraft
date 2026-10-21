@@ -2,8 +2,8 @@
 //!
 //! Host messages arrive as JSON strings on `window`'s `message` event (same origin only) and
 //! queue up for `WebShell::logic`; editor events go to `window.parent()` as JSON strings.
-//! A `load` fetches its fonts into the shared font database, then the document, into a slot
-//! the shell takes from on a later frame.
+//! A `load` fetches its documents (one, or studio's several), then its fonts into the shared
+//! font database, into a slot the shell takes from on a later frame.
 
 use crate::embed_protocol::{self, HostMessage};
 use designcraft_ui_egui::embed::EmbedConfig;
@@ -15,8 +15,8 @@ use wasm_bindgen_futures::JsFuture;
 /// Host messages not yet handled, oldest first.
 pub type Queue = Rc<RefCell<VecDeque<HostMessage>>>;
 
-/// A fetched document (file name, bytes), or why it couldn't be fetched.
-type Fetched = Result<(String, Vec<u8>), String>;
+/// The fetched documents (file name, bytes), in order, or why one couldn't be fetched.
+type Fetched = Result<Vec<(String, Vec<u8>)>, String>;
 
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let window = web_sys::window().ok_or("no window")?;
@@ -79,7 +79,7 @@ pub fn listen(queue: Queue, ctx: egui::Context) -> Result<(), wasm_bindgen::JsVa
     })
 }
 
-/// An in-flight `load`: fonts first, then the document, fetched into `slot`.
+/// An in-flight `load`: the documents, then the fonts, fetched into `slot`.
 pub struct Loading {
     slot: Rc<RefCell<Option<Fetched>>>,
     pub spread: usize,
@@ -87,16 +87,17 @@ pub struct Loading {
 }
 
 impl Loading {
-    pub fn start(document_url: String, font_urls: Vec<String>, spread: usize, config: EmbedConfig, ctx: egui::Context) -> Self {
+    pub fn start(document_urls: Vec<String>, font_urls: Vec<String>, spread: usize, config: EmbedConfig, ctx: egui::Context) -> Self {
         let slot: Rc<RefCell<Option<Fetched>>> = Rc::default();
         let pending = slot.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let fetched = async {
+                let mut documents = Vec::with_capacity(document_urls.len());
+                for url in &document_urls {
+                    documents.push((embed_protocol::file_stem(url), fetch_bytes(url).await?));
+                }
                 load_fonts(&font_urls).await?;
-                let bytes = fetch_bytes(&document_url).await?;
-                let file = document_url.split(['?', '#']).next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
-                let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
-                Ok((if name.is_empty() { "document".to_string() } else { name.to_string() }, bytes))
+                Ok(documents)
             }
             .await;
             *pending.borrow_mut() = Some(fetched);

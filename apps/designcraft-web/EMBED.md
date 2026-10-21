@@ -1,7 +1,8 @@
 # Embedding DesignCraft as a spread editor (`?embed`)
 
 With `?embed` on its URL, the web app runs as an embedded spread editor: book_write's 지면. A
-host page loads one document into it, with the book's fonts. The person reading it can correct
+host page loads one document into it, with the book's fonts. (Studio mode, book_write's
+디자인수정, opens several documents as tabs and changes styles only: see below.) The person reading it can correct
 text and move or resize labelled frames, which snap to the grid. The editor reports each edit to
 the host, and the host saves it.
 
@@ -99,6 +100,70 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
 The editor doesn't save. When the host has saved an edit and laid the unit out again, it sends
 `load` again with the new document and grid, and the **same `spread`**, so the reader stays where
 they were.
+
+## Studio mode (디자인수정)
+
+`load` with `mode: "studio"` opens the editor as book_write's design studio: the full interface
+over several documents, as tabs, where only paragraph-style definitions may change.
+
+```js
+{ type: "load", mode: "studio",                        // "proofread" (the default) is 교정/교열 above
+  documents: [{ name: "본문", url: "/…/body.designcraft", editable: true },
+              { name: "표지", url: "/…/cover.designcraft", editable: false }],
+  fontUrls: [ … ],                                     // as above
+  spread: 0 }                                          // in the first document
+```
+
+- **`documents`** are opened in order, one tab each, and the first is made active. `url` is
+  required; `name` defaults to the URL's file name without its extension, and `editable` to
+  `false`. Without `documents`, `documentUrl` opens as one editable document. An empty list, or
+  a document without a `url`, makes the message unreadable (ignored).
+- Each `load` — the first, one after a save, or one to take changes back (되돌리기) — closes
+  every open document and opens the ones it lists. The styles as they open are what each later
+  `styleChanged` compares against (`before`). `grid` and `frames` aren't used.
+- **`loaded`** lists each document's spread count, in tab order, and the first's as
+  `spreadCount`:
+
+  ```js
+  { type: "loaded", documents: [{ name: "본문", spreadCount: 287 }, { name: "표지", spreadCount: 1 }],
+    spreadCount: 287 }
+  ```
+
+- **`styleChanged`** is sent for each paragraph style whose definition changed, as soon as it
+  changes (including by Undo):
+
+  ```js
+  { type: "styleChanged", document: "본문", name: "Body",
+    before: { … },                                    // the definition as loaded (null: none)
+    after: { … } }                                    // the definition now (equal to before when undone back)
+  ```
+
+  `before` and `after` are the style's stored definition (`paragraph_styles` in `embed.rs`), as
+  the host diffs them against the design it rendered.
+- `spread`, `spreads`, `tool`, `rejected` and `error` are sent as in 교정/교열, for the active
+  tab; `textEdited` and `frameMoved` are not.
+
+### What studio allows
+
+- **The full interface:** menus (without File), panels, rulers, guides, frame edges, the task
+  bar, the document tabs. View toggles, zooming and navigation work; dialogs, loading styles,
+  saving, exporting, opening and screen modes are refused.
+- **Three tools:** selection, hand and zoom. Nothing on the page is typed or drawn, and every
+  item in every document is locked.
+- **Paragraph-style edits only,** through `style.paragraph.edit` with only the allow-listed
+  attributes: characters `fontFamily`, `fontStyle`, `size`, `tracking`, `fill`; paragraph
+  `align`, `leftIndent`, `rightIndent`, `firstLineIndent` (`STUDIO_CHARS` / `STUDIO_PARA`). No
+  rename, `basedOn` or `nextStyle`, and no new or deleted styles. Text and objects can't change.
+- **Only in editable documents.** In one the host didn't make editable (표지) the edit is
+  refused before it commits.
+- **The tabs are the host's.** They have no close button, and `file.close` / `file.openBytes`
+  are refused from the interface; switching tabs works. A document opened any other way is
+  treated as not editable.
+- **A backstop**, as in 교정/교열: after every frame, anything else that changed in the active
+  document is undone and reported as `rejected` (`"change"`).
+- **Fonts not loaded:** changing `fontFamily` to a family the host didn't send in `fontUrls`
+  isn't handled yet — the edit is accepted and reported, and the text shows in a fallback face.
+  Send every font the studio offers.
 
 ## Fonts
 

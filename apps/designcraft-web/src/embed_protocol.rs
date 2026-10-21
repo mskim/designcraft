@@ -1,40 +1,95 @@
 //! book_write ⇄ embedded editor messages (EMBED.md): parsing the host's, writing the editor's.
 
-use designcraft_ui_egui::embed::{EmbedConfig, EmbedEvent, Grid};
+use designcraft_ui_egui::embed::{DocConfig, EmbedConfig, EmbedEvent, EmbedMode, Grid};
 use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub enum HostMessage {
+    /// 교정/교열: one document.
     Load { document_url: String, font_urls: Vec<String>, spread: usize, config: EmbedConfig },
+    /// Studio: the documents' URLs, in tab order; `config.documents` has their names and
+    /// editability in the same order.
+    LoadStudio { document_urls: Vec<String>, font_urls: Vec<String>, spread: usize, config: EmbedConfig },
     ShowSpread(usize),
     SetTool(String),
 }
 
-/// A host message, or None for anything that isn't one (unknown type, missing field).
+/// A host message, or None for anything that isn't one (unknown type or mode, missing field).
 pub fn parse(v: &Value) -> Option<HostMessage> {
     match v.get("type")?.as_str()? {
-        "load" => Some(HostMessage::Load {
-            document_url: v.get("documentUrl")?.as_str()?.to_string(),
-            font_urls: v
-                .get("fontUrls")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect())
-                .unwrap_or_default(),
-            spread: v.get("spread").and_then(Value::as_u64).unwrap_or(0) as usize,
-            config: EmbedConfig {
-                grid: v.get("grid").and_then(Grid::from_json),
-                frames: v
-                    .get("frames")
-                    .and_then(Value::as_object)
-                    .map(|m| m.iter().map(|(k, f)| (k.clone(), f.get("v").and_then(Value::as_str).unwrap_or("").to_string())).collect())
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-        }),
+        "load" => parse_load(v),
         "showSpread" => Some(HostMessage::ShowSpread(v.get("spread")?.as_u64()? as usize)),
         "setTool" => Some(HostMessage::SetTool(v.get("tool")?.as_str()?.to_string())),
         _ => None,
     }
+}
+
+fn parse_load(v: &Value) -> Option<HostMessage> {
+    let mode = match v.get("mode").and_then(Value::as_str) {
+        None | Some("proofread") => EmbedMode::Proofread,
+        Some("studio") => EmbedMode::Studio,
+        Some(_) => return None,
+    };
+    let font_urls = v
+        .get("fontUrls")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let spread = v.get("spread").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let config = EmbedConfig {
+        mode,
+        grid: v.get("grid").and_then(Grid::from_json),
+        frames: v
+            .get("frames")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, f)| (k.clone(), f.get("v").and_then(Value::as_str).unwrap_or("").to_string())).collect())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    if mode == EmbedMode::Proofread {
+        return Some(HostMessage::Load { document_url: v.get("documentUrl")?.as_str()?.to_string(), font_urls, spread, config });
+    }
+    // Studio: `documents`, or just `documentUrl` as one editable document.
+    let documents: Vec<(String, DocConfig)> = match v.get("documents") {
+        Some(docs) => docs
+            .as_array()?
+            .iter()
+            .map(|d| {
+                let url = d.get("url")?.as_str()?.to_string();
+                let name = d.get("name").and_then(Value::as_str).map_or_else(|| file_stem(&url), String::from);
+                let editable = d.get("editable").and_then(Value::as_bool).unwrap_or(false);
+                Some((url, DocConfig { name, editable }))
+            })
+            .collect::<Option<_>>()?,
+        None => {
+            let url = v.get("documentUrl")?.as_str()?.to_string();
+            let name = file_stem(&url);
+            vec![(url, DocConfig { name, editable: true })]
+        }
+    };
+    if documents.is_empty() {
+        return None;
+    }
+    let (document_urls, docs): (Vec<String>, Vec<DocConfig>) = documents.into_iter().unzip();
+    Some(HostMessage::LoadStudio { document_urls, font_urls, spread, config: EmbedConfig { documents: docs, ..config } })
+}
+
+/// A document's name from its URL: the file's name without query, fragment or extension
+/// ("document" when there's none).
+pub fn file_stem(url: &str) -> String {
+    let file = url.split(['?', '#']).next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
+    let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    if name.is_empty() { "document".to_string() } else { name.to_string() }
+}
+
+/// Studio's `loaded`: each document's name and spread count, in tab order, and the first's
+/// `spreadCount` as 교정/교열's `loaded` has it.
+pub fn studio_loaded(documents: &[(String, usize)]) -> Value {
+    json!({
+        "type": "loaded",
+        "documents": documents.iter().map(|(name, n)| json!({"name": name, "spreadCount": n})).collect::<Vec<_>>(),
+        "spreadCount": documents.first().map_or(0, |d| d.1),
+    })
 }
 
 /// Sent once, when the app has started.
@@ -74,7 +129,7 @@ pub fn event(e: &EmbedEvent) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use designcraft_ui_egui::embed::Placement;
+    use designcraft_ui_egui::embed::{DocConfig, EmbedMode, Placement};
 
     #[test]
     fn a_full_load_parses() {
@@ -162,6 +217,78 @@ mod tests {
         assert_eq!(
             event(&cell),
             json!({"type": "textEdited", "story": "table:7", "paragraph": 0, "text": "x", "cell": {"table": 0, "row": 1, "col": 2}})
+        );
+    }
+
+    #[test]
+    fn a_studio_load_parses_its_documents_in_order() {
+        let m = parse(&json!({
+            "type": "load",
+            "mode": "studio",
+            "documents": [{"name": "본문", "url": "a", "editable": true}, {"name": "표지", "url": "b", "editable": false}],
+            "fontUrls": ["/f/a.ttf"],
+            "spread": 1
+        }));
+        let Some(HostMessage::LoadStudio { document_urls, font_urls, spread, config }) = m else {
+            panic!("not a studio load: {m:?}");
+        };
+        assert_eq!(document_urls, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(font_urls, vec!["/f/a.ttf".to_string()]);
+        assert_eq!(spread, 1);
+        assert_eq!(config.mode, EmbedMode::Studio);
+        assert_eq!(
+            config.documents,
+            vec![DocConfig { name: "본문".into(), editable: true }, DocConfig { name: "표지".into(), editable: false }]
+        );
+    }
+
+    #[test]
+    fn a_studio_document_defaults_its_name_and_is_not_editable_unless_said() {
+        let Some(HostMessage::LoadStudio { config, .. }) =
+            parse(&json!({"type": "load", "mode": "studio", "documents": [{"url": "/b/1/cover.designcraft?v=2"}]}))
+        else {
+            panic!("not a studio load");
+        };
+        assert_eq!(config.documents, vec![DocConfig { name: "cover".into(), editable: false }]);
+    }
+
+    #[test]
+    fn a_studio_load_with_only_a_document_url_has_one_editable_document() {
+        let Some(HostMessage::LoadStudio { document_urls, config, .. }) =
+            parse(&json!({"type": "load", "mode": "studio", "documentUrl": "/b/1/body.designcraft"}))
+        else {
+            panic!("not a studio load");
+        };
+        assert_eq!(document_urls, vec!["/b/1/body.designcraft".to_string()]);
+        assert_eq!(config.documents, vec![DocConfig { name: "body".into(), editable: true }]);
+    }
+
+    #[test]
+    fn a_studio_load_without_documents_or_with_a_document_lacking_a_url_is_none() {
+        assert!(parse(&json!({"type": "load", "mode": "studio"})).is_none());
+        assert!(parse(&json!({"type": "load", "mode": "studio", "documents": []})).is_none());
+        assert!(parse(&json!({"type": "load", "mode": "studio", "documents": [{"url": "a"}, {"name": "표지"}]})).is_none());
+    }
+
+    #[test]
+    fn the_old_single_document_url_is_one_editable_document_in_proofread() {
+        let Some(HostMessage::Load { document_url, config, .. }) = parse(&json!({"type": "load", "documentUrl": "/d"})) else {
+            panic!("not a load");
+        };
+        assert_eq!(document_url, "/d");
+        assert_eq!(config.mode, EmbedMode::Proofread);
+        let Some(HostMessage::Load { config, .. }) = parse(&json!({"type": "load", "mode": "proofread", "documentUrl": "/d"})) else {
+            panic!("not a load");
+        };
+        assert_eq!(config.mode, EmbedMode::Proofread);
+        assert!(parse(&json!({"type": "load", "mode": "draw", "documentUrl": "/d"})).is_none());
+    }
+
+    #[test]
+    fn studio_loaded_reports_each_document_and_the_first_ones_spread_count() {
+        assert_eq!(
+            studio_loaded(&[("본문".into(), 287), ("표지".into(), 1)]),
+            json!({"type": "loaded", "documents": [{"name": "본문", "spreadCount": 287}, {"name": "표지", "spreadCount": 1}], "spreadCount": 287})
         );
     }
 

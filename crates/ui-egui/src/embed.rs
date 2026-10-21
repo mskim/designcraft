@@ -1285,6 +1285,59 @@ mod tests {
             assert!(app.ui.rulers && app.ui.frame_edges && app.ui.guides && app.ui.task_bar && app.ui.hidden_panels == 0);
         }
 
+        /// Each open document's file bytes, as the host would serve them, with its tab's name.
+        fn served(app: &mut DesignApp) -> Vec<(String, Vec<u8>)> {
+            let titles: Vec<String> = app.session.documents().iter().map(|d| d.title()).collect();
+            (0..titles.len())
+                .map(|i| {
+                    app.session.set_active(i);
+                    let bytes = designcraft_engine::cmd::to_bytes(&app.session.active().unwrap().doc).unwrap();
+                    (titles[i].clone(), bytes)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_user_cant_close_or_open_a_studio_tab() {
+            let Studio { mut app, .. } = studio();
+            let bytes = designcraft_engine::cmd::to_bytes(&app.session.active().unwrap().doc).unwrap();
+            assert!(refused(app.run("file.close", json!({"index": 1}))));
+            crate::menus::close_document(&mut app, Some(1));
+            let b64 = designcraft_engine::cmd::base64_encode(&bytes);
+            assert!(refused(app.run("file.openBytes", json!({"name": "x", "base64": b64}))));
+            assert_eq!(app.session.documents().len(), 2);
+            assert!(app.run("file.activate", json!({"index": 1})).is_ok(), "switching tabs stays");
+        }
+
+        #[test]
+        fn a_studio_load_opens_each_document_as_a_tab_and_starts_over_when_sent_again() {
+            let Studio { mut app, .. } = studio();
+            let docs = served(&mut app);
+            let counts = app.studio_load(&docs, studio_config()).unwrap();
+            assert_eq!(counts, vec![1, 1]);
+            assert_eq!(app.session.documents().len(), 2, "the old tabs closed");
+            assert_eq!(app.session.active_index(), Some(0), "the first is active");
+            assert!(app.embed.as_ref().is_some_and(Embed::studio));
+            assert!(app.studio_active_editable());
+            app.run("file.activate", json!({"index": 1})).unwrap();
+            assert!(!app.studio_active_editable(), "표지 isn't editable");
+            assert!(refused(app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 12}}))));
+            // Sent again (after a save), it closes everything and opens what it's given.
+            let counts = app.studio_load(&docs[..1], studio_config()).unwrap();
+            assert_eq!(counts, vec![1]);
+            assert_eq!(app.session.documents().len(), 1);
+            assert!(app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 12}})).is_ok());
+            let events = app.embed_poll(0.0);
+            assert!(events.iter().any(|e| matches!(e, EmbedEvent::StyleChanged { document, name, .. } if document == "본문" && name == "Body")));
+        }
+
+        #[test]
+        fn a_studio_load_that_cant_open_a_document_fails() {
+            let Studio { mut app, .. } = studio();
+            assert!(app.studio_load(&[("bad".into(), b"not a document".to_vec())], studio_config()).is_err());
+            assert!(app.studio_load(&[], studio_config()).is_err());
+        }
+
         #[test]
         fn studio_tools_are_selection_hand_and_zoom_only() {
             let Studio { mut app, .. } = studio();

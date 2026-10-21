@@ -788,6 +788,10 @@ impl DesignApp {
             if e.studio() && id == "style.paragraph.edit" && !self.studio_active_editable() {
                 return Err("not available here".into());
             }
+            // The host opens and closes studio's tabs (studio_load); the user can only switch them.
+            if e.studio() && matches!(id, "file.close" | "file.openBytes") {
+                return Err("not available here".into());
+            }
         }
         if let Some(r) = menus::run_ui(self, id, &params) {
             return r;
@@ -1213,6 +1217,42 @@ impl DesignApp {
             e.last_spread = spread;
             e.last_tool = Some(tool);
         }
+    }
+
+    /// Studio mode's `load`: closes every open document, opens each of `documents` (name, file
+    /// bytes) as a tab in order, makes the first active, and begins studio over them with
+    /// `config`. Sent again — after a save, or to take changes back — it starts over the same
+    /// way. Returns each document's spread count, in order. The host's closes and opens run with
+    /// the embed set aside, since studio refuses them from `run`.
+    pub fn studio_load(&mut self, documents: &[(String, Vec<u8>)], config: embed::EmbedConfig) -> Result<Vec<usize>, String> {
+        if documents.is_empty() {
+            return Err("no documents".into());
+        }
+        let embed = self.embed.take();
+        let opened = self.studio_open(documents);
+        self.embed = embed;
+        let counts = opened?;
+        self.session.set_active(0);
+        self.embed_begin(config);
+        Ok(counts)
+    }
+
+    fn studio_open(&mut self, documents: &[(String, Vec<u8>)]) -> Result<Vec<usize>, String> {
+        while !self.session.documents().is_empty() {
+            self.run("file.close", json!({"index": 0}))?;
+        }
+        let mut counts = Vec::with_capacity(documents.len());
+        for (name, bytes) in documents {
+            self.run("file.openBytes", json!({"name": name, "base64": designcraft_engine::cmd::base64_encode(bytes)}))
+                .map_err(|e| format!("{name}: {e}"))?;
+            // The host brings the book's fonts; a missing one shows in a fallback face.
+            if self.ui.dialog.as_ref().is_some_and(|d| d.id == "findFont") {
+                log::warn!("embed: {name} uses fonts the host didn't send");
+                self.ui.dialog = None;
+            }
+            counts.push(self.session.active().map(|st| st.doc.spreads.len()).ok_or_else(|| format!("{name} didn't open"))?);
+        }
+        Ok(counts)
     }
 
     /// Whether the active document is a studio document the host made editable.

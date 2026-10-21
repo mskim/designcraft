@@ -92,6 +92,25 @@ pub fn studio_loaded(documents: &[(String, usize)]) -> Value {
     })
 }
 
+/// Adds one fetched font with `add` (the font database's `add_font`), returning the faces added.
+/// A font that couldn't be fetched (an HTTP error, the network) is skipped and logged, so the
+/// rest of the load goes on; so is one that adds no faces (unparseable, or already loaded).
+pub fn add_font(url: &str, fetched: Result<Vec<u8>, String>, add: impl FnOnce(Vec<u8>) -> usize) -> usize {
+    match fetched {
+        Ok(bytes) => {
+            let added = add(bytes);
+            if added == 0 {
+                log::info!("embed: font {url} added no faces (unparseable or already loaded)");
+            }
+            added
+        }
+        Err(e) => {
+            log::warn!("embed: skipped a font that couldn't be fetched: {e}");
+            0
+        }
+    }
+}
+
 /// Sent once, when the app has started.
 pub fn ready() -> Value {
     json!({"type": "ready"})
@@ -128,6 +147,24 @@ pub fn event(e: &EmbedEvent) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_font_that_cant_be_fetched_is_skipped() {
+        let mut added = Vec::new();
+        let fonts = [("a.ttf", Ok(vec![1u8])), ("b.ttf", Err("b.ttf: HTTP 404".to_string())), ("c.ttf", Ok(vec![3u8, 3]))];
+        let faces: usize = fonts
+            .into_iter()
+            .map(|(url, fetched)| {
+                super::add_font(url, fetched, |bytes| {
+                    added.push(bytes.len());
+                    bytes.len()
+                })
+            })
+            .sum();
+        assert_eq!(faces, 3);
+        assert_eq!(added, vec![1, 2], "the fonts either side of the failed one are added");
+        assert_eq!(super::add_font("d.ttf", Ok(vec![]), |_| 0), 0, "a font that adds no faces is no error");
+    }
+
     use super::*;
     use designcraft_ui_egui::embed::{DocConfig, EmbedMode, Placement};
 

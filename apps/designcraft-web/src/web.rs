@@ -402,6 +402,8 @@ impl WebShell {
                 if studio {
                     let names: Vec<String> = loading.config.documents.iter().map(|d| d.name.clone()).collect();
                     let counts = self.app.studio_load(&documents, loading.config)?;
+                    // The book's fonts (Noto Sans KR) give the interface Hangul: 본문, 표지.
+                    self.app.ui_fonts_added();
                     Ok(embed_protocol::studio_loaded(&names.into_iter().zip(counts).collect::<Vec<_>>()))
                 } else {
                     let (name, bytes) = documents.into_iter().next().ok_or("no document")?;

@@ -148,6 +148,14 @@ over several documents, as tabs, where only paragraph-style definitions may chan
 - **The full interface:** menus (without File), panels, rulers, guides, frame edges, the task
   bar, the document tabs. View toggles, zooming and navigation work; dialogs, loading styles,
   saving, exporting, opening and screen modes are refused.
+- **Every command that leaves the undo history alone** runs — queries (`font.list`, the style
+  and preflight lists …), view, selection and navigation — but those in `STUDIO_REFUSED`:
+  `file.*` (open, close, new, save, export, print, package; switching tabs with `file.activate`
+  stays), `book.*`, `app.*`, `prefs.*`, `text.*`, opening or changing libraries, colour
+  settings, font folders, swatch and snippet files, the conveyor and Data Merge's preview. A
+  live preview (`edit.preview`) runs only a command studio allows.
+- **The tabs** are titled by the documents' `name`s, and loading (which locks every item)
+  doesn't mark them modified.
 - **Three tools:** selection, hand and zoom. Nothing on the page is typed or drawn, and every
   item in every document is locked.
 - **Paragraph-style edits only,** through `style.paragraph.edit` with only the allow-listed
@@ -168,7 +176,8 @@ over several documents, as tabs, where only paragraph-style definitions may chan
 ## Fonts
 
 The host serves the book's fonts and lists them in `fontUrls`. The editor fetches each one and
-adds its faces to the font database in memory (`FontDb::global().add_font`). They stay for the
+adds its faces to the font database in memory (`FontDb::global().add_font`). A font that can't be
+fetched (an HTTP error, the network) is skipped and logged; the rest, and the documents, still load. They stay for the
 life of the page: a face whose family and style is already loaded is skipped (and logged), so
 sending the same fonts with every `load` is cheap. If the document still uses a font the host
 didn't send, the Find Font dialog is closed (there's no chrome to answer it in) and a warning is

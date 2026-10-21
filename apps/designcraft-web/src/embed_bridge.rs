@@ -33,17 +33,14 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Adds every font to the engine's shared font database; returns the faces added. A font that
-/// adds none (unparseable, or already loaded by an earlier `load`) is logged, not an error.
-pub async fn load_fonts(urls: &[String]) -> Result<usize, String> {
+/// can't be fetched, or adds none, is logged and skipped (`embed_protocol::add_font`): the rest
+/// still load.
+pub async fn load_fonts(urls: &[String]) -> usize {
     let mut faces = 0;
     for url in urls {
-        let added = designcraft_fonts::FontDb::global().add_font(fetch_bytes(url).await?);
-        if added == 0 {
-            log::info!("embed: font {url} added no faces (unparseable or already loaded)");
-        }
-        faces += added;
+        faces += embed_protocol::add_font(url, fetch_bytes(url).await, |bytes| designcraft_fonts::FontDb::global().add_font(bytes));
     }
-    Ok(faces)
+    faces
 }
 
 /// Sends `v` to the host page as a JSON string, to this page's own origin only.
@@ -96,7 +93,7 @@ impl Loading {
                 for url in &document_urls {
                     documents.push((embed_protocol::file_stem(url), fetch_bytes(url).await?));
                 }
-                load_fonts(&font_urls).await?;
+                load_fonts(&font_urls).await;
                 Ok(documents)
             }
             .await;

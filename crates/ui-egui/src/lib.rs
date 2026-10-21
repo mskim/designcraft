@@ -553,6 +553,8 @@ pub struct Perf {
 
 pub struct DesignApp {
     pending_pdf: Option<ImportedFile>,
+    /// Embed mode (book_write's 지면): set by [`DesignApp::embed_begin`].
+    pub embed: Option<embed::Embed>,
     pub session: Session,
     pub ui: UiState,
     pub services: Services,
@@ -656,6 +658,7 @@ impl DesignApp {
         designcraft_fonts::FontDb::global().scan_in_background();
         DesignApp {
             pending_pdf: None,
+            embed: None,
             session,
             ui: UiState::default(),
             services,
@@ -770,6 +773,14 @@ impl DesignApp {
 
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if self.embed.is_some() {
+            if id == "tool.select" && !params.get("tool").and_then(Value::as_str).is_some_and(embed::tool_allowed) {
+                return Err("not available here".into());
+            }
+            if !embed::command_allowed(id) {
+                return Err("not available here".into());
+            }
+        }
         if let Some(r) = menus::run_ui(self, id, &params) {
             return r;
         }
@@ -1111,6 +1122,63 @@ impl DesignApp {
         } else {
             let title = file.name.rsplit_once('.').map_or(file.name.as_str(), |(stem, _)| stem);
             self.open_file("file.openBytes", json!({"name": title, "base64": b64}))
+        }
+    }
+
+    /// Turns this app into an embedded editor for the open document: chrome off, the type and
+    /// selection tools only, every frame locked but the labelled movable ones (image:/lead:/table:).
+    pub fn embed_begin(&mut self, config: embed::EmbedConfig) {
+        self.ui.rulers = false;
+        self.ui.frame_edges = false;
+        self.ui.guides = false;
+        self.ui.baseline_grid = false;
+        self.ui.task_bar = false;
+        self.ui.hidden_panels = 1;
+        self.embed = Some(embed::Embed { config, ..Default::default() });
+        self.session.command_filter = Some(embed::command_allowed);
+        self.embed_lock();
+        self.select_tool("selection");
+        // The lock must not be undoable: the document was just opened, so its history holds nothing else.
+        if let Some(st) = self.session.active_mut() {
+            st.history.undo.clear();
+            st.history.redo.clear();
+        }
+        let doc = self.session.active().map(|d| d.doc.clone());
+        if let Some(e) = self.embed.as_mut() {
+            e.last_doc = doc;
+        }
+    }
+
+    /// Locks every item without a movable label (labelled ones stay unlocked), keeping the
+    /// selection and the caret (`object.lock` deselects).
+    fn embed_lock(&mut self) {
+        let Some(st) = self.session.active() else { return };
+        let selection = st.selection.clone();
+        let mut lock = Vec::new();
+        for spread in &st.doc.spreads {
+            for item in &spread.items {
+                item.walk(&mut |i| {
+                    if embed::Kind::of(&i.label).is_none() {
+                        lock.push(i.id.0);
+                    }
+                });
+            }
+        }
+        if lock.is_empty() {
+            return;
+        }
+        if let Err(e) = self.session.execute_trusted("object.lock", &json!({ "ids": lock })) {
+            log::warn!("embed: couldn't lock the page's frames: {e}");
+        }
+        if let Some(st) = self.session.active_mut() {
+            st.selection = selection;
+        }
+    }
+
+    /// Puts the tool back to the selection tool when something switched it to one an embed doesn't allow.
+    pub fn embed_enforce(&mut self) {
+        if self.embed.is_some() && !embed::tool_allowed(self.session.tool_id()) {
+            self.session.set_tool("selection");
         }
     }
 
@@ -1509,7 +1577,8 @@ impl DesignApp {
         if dbg {
             eprintln!("root start {:?}", ui.available_rect_before_wrap());
         }
-        if !presenting {
+        let embedded = self.embed.is_some();
+        if !presenting && !embedded {
             chrome::app_bar(self, ui);
             if dbg {
                 eprintln!("after app bar {:?}", ui.available_rect_before_wrap());
@@ -1530,10 +1599,12 @@ impl DesignApp {
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| {
             if self.session.active().is_none() {
-                chrome::start_screen(self, ui);
+                if !embedded {
+                    chrome::start_screen(self, ui);
+                }
                 return;
             }
-            if !presenting {
+            if !presenting && !embedded {
                 chrome::doc_tabs(self, ui);
             }
             let split_layout = (self.split && !presenting)
@@ -1582,6 +1653,8 @@ impl DesignApp {
                 canvas::show(self, ui);
             }
         });
+        // The V/T keys or a double-click may have picked a tool an embed doesn't allow.
+        self.embed_enforce();
         // New Window: pane 1 in a window of its own.
         if self.second_window
             && !presenting
@@ -1618,7 +1691,7 @@ impl DesignApp {
             self.switch_pane(self.focus_pane);
         }
         // Tab, Shift+Tab and Presentation hide the floating panels with the docked ones.
-        if !presenting && self.ui.hidden_panels == 0 {
+        if !presenting && !embedded && self.ui.hidden_panels == 0 {
             dock::flyout(self, &ctx);
             dock::floating(self, &ctx);
         }

@@ -438,7 +438,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let rot = app.view().map_or(0, |v| v.rotation % 4);
     let presenting = app.ui.screen_mode == ScreenMode::Presentation;
     // Scrollbars sit outside the view (right and bottom); rulers and the view share the rest.
-    let bars = !presenting && app.session.active().is_some();
+    let embedded = app.embed.is_some();
+    let bars = !presenting && !embedded && app.session.active().is_some();
     let full = if bars { Rect::from_min_max(outer.min, outer.max - vec2(SCROLLBAR, SCROLLBAR)) } else { outer };
     // Rulers measure the unrotated layout, so they hide while the view is rotated.
     let rulers = app.ui.rulers && !presenting && rot == 0;
@@ -575,9 +576,12 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         draw_rulers(app, ui, full, rect, &xf, &doc, &layout, &t);
         ruler_units_menus(app, &resp, full, rect, &doc);
     }
-    context_menu(app, ui, &resp);
+    if !embedded {
+        context_menu(app, ui, &resp);
+    }
     if let Some(r) = sel_rect
         && !preview
+        && !embedded
         && r.intersects(screen)
     {
         crate::taskbar::show(app, &ui.ctx().clone(), r, screen);

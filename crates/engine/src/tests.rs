@@ -1650,3 +1650,42 @@ fn a_line_fits_when_its_baseline_does() {
     assert!(!overset(&mut s, 78.5), "the line is set; its descenders hang below the frame");
     assert!(overset(&mut s, 50.0), "a baseline below the frame still oversets the line");
 }
+
+#[test]
+fn a_command_filter_refuses_every_caller_but_trusted_ones() {
+    use designcraft_tools::{CanvasLayout, PointerEvent, PointerKind};
+    let mut s = session();
+    s.execute("frame.create", &json!({"rect": [36, 36, 300, 200], "content": "text", "text": "Hello"})).unwrap();
+    s.command_filter = Some(|id| id != "type.bold");
+    let e = s.execute("type.bold", &json!({})).unwrap_err().to_string();
+    assert!(e.contains("not available here"), "{e}");
+    if let Err(e) = s.execute_trusted("type.bold", &json!({})) {
+        assert!(!e.to_string().contains("not available here"), "{e}");
+    }
+    assert!(s.command_filter.is_some(), "put back after a trusted run");
+    // A trusted run that fails puts the filter back too.
+    assert!(s.execute_trusted("no.such.command", &json!({})).is_err());
+    assert!(s.command_filter.is_some());
+    // A tool's preview is refused too, and leaves no gesture open.
+    s.command_filter = Some(|id| id != "frame.create");
+    let items = s.doc().unwrap().doc.spreads[0].items.len();
+    s.set_tool("type");
+    let v = ViewInfo::at_zoom(1.0);
+    let (x, y) = {
+        let d = &s.doc().unwrap().doc;
+        let r = CanvasLayout::new(d, false).page_rect(d, 0).unwrap();
+        (r.x0 + 350.0, r.y0 + 400.0)
+    };
+    let drag = |s: &mut Session| {
+        let _ = s.pointer(&PointerEvent::new(PointerKind::Down, x, y), v);
+        let _ = s.pointer(&PointerEvent::new(PointerKind::Drag, x + 100.0, y + 80.0), v);
+        let _ = s.pointer(&PointerEvent::new(PointerKind::Up, x + 100.0, y + 80.0), v);
+    };
+    drag(&mut s);
+    assert!(s.doc().unwrap().interaction.is_none());
+    assert_eq!(s.doc().unwrap().doc.spreads[0].items.len(), items, "no frame drawn");
+    // Without the filter the same drag draws one.
+    s.command_filter = None;
+    drag(&mut s);
+    assert_eq!(s.doc().unwrap().doc.spreads[0].items.len(), items + 1);
+}

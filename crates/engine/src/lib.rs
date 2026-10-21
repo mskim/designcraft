@@ -372,6 +372,10 @@ pub struct Session {
     /// Linked text files checked by the Links panel: path → the size and modification time the
     /// file had and the hash of its contents then, so a file touched but not changed is read once.
     pub(crate) text_link_checks: std::collections::HashMap<String, (designcraft_doc::Fingerprint, String)>,
+    /// When set, commands it refuses fail with "not available here": every caller, tool actions
+    /// included. The host's own calls that must pass (an embed's lock, snap and undo) use
+    /// [`Session::execute_trusted`].
+    pub command_filter: Option<fn(&str) -> bool>,
 }
 
 impl Default for Session {
@@ -415,6 +419,7 @@ impl Session {
             book: None,
             untitled: 0,
             new_document_preview: None,
+            command_filter: None,
         }
     }
 
@@ -527,6 +532,7 @@ impl Session {
     /// Run command `id`. A panic inside it becomes [`EngineError::Internal`] and leaves the
     /// document as it was (see [`guard`]).
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        self.check_filter(id)?;
         // A command from outside the IME ends its composition first, keeping the marked text as
         // typed: Undo then takes back that typing, and nothing runs on top of the preview the
         // composition would drop. Queries and recovery saves leave it alone.
@@ -534,6 +540,22 @@ impl Session {
             self.end_composition()?;
         }
         self.guarded(id, |s| s.execute_unguarded(id, params))
+    }
+
+    /// Runs command `id` past [`Session::command_filter`] (the commands it runs too).
+    pub fn execute_trusted(&mut self, id: &str, params: &Value) -> Result<Value> {
+        let filter = self.command_filter.take();
+        let r = self.execute(id, params);
+        self.command_filter = filter;
+        r
+    }
+
+    /// Refuses `id` when the command filter does.
+    pub(crate) fn check_filter(&self, id: &str) -> Result<()> {
+        match self.command_filter {
+            Some(allowed) if !allowed(id) => Err(EngineError::Disabled(id.into(), "not available here".into())),
+            _ => Ok(()),
+        }
     }
 
     fn execute_unguarded(&mut self, id: &str, params: &Value) -> Result<Value> {

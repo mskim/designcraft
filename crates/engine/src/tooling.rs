@@ -260,7 +260,14 @@ impl Session {
         for a in actions {
             match a {
                 Action::Begin(label) => self.begin_interaction(&label)?,
-                Action::Preview(cmd, p) => self.preview(&cmd, p)?,
+                Action::Preview(cmd, p) => {
+                    // A gesture whose command the filter refuses ends here, with nothing changed.
+                    if let Err(e) = self.check_filter(&cmd) {
+                        self.cancel_interaction();
+                        return Err(e);
+                    }
+                    self.preview(&cmd, p)?
+                }
                 Action::Commit => self.commit_interaction()?,
                 Action::Cancel => self.cancel_interaction(),
                 Action::Exec(cmd, p) => {

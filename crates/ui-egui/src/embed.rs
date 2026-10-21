@@ -85,6 +85,38 @@ pub fn command_allowed(id: &str) -> bool {
     ALLOWED.contains(&id) || !DENIED.iter().any(|p| id.starts_with(p))
 }
 
+/// The app-level ids (handled by the UI, never reaching the engine) an embedded editor refuses:
+/// view toggles and screen modes that would bring chrome back, panels, windows, dialogs and help.
+/// Zooming, fitting and going to a page or spread stay.
+pub fn ui_command_allowed(id: &str) -> bool {
+    if let Some(v) = id.strip_prefix("view.") {
+        return v != "rotateSpread"
+            && (v.starts_with("fit") || v.starts_with("zoom") || v.ends_with("Spread") || v.ends_with("Page") || v == "goToPage");
+    }
+    !["panel.", "window.", "app.", "help."].iter().any(|p| id.starts_with(p))
+}
+
+/// What the host gave in `load`: the grid, and each movable frame's vertical position now.
+#[derive(Clone, Debug, Default)]
+pub struct EmbedConfig {
+    pub grid: Option<Grid>,
+    /// label → its v ("line" | "top" | "middle" | "bottom"), as the source has it.
+    pub frames: std::collections::BTreeMap<String, String>,
+}
+
+/// An embedded editor's state between frames (the change tracker's last look).
+#[derive(Default)]
+pub struct Embed {
+    pub config: EmbedConfig,
+    pub(crate) last_doc: Option<std::sync::Arc<designcraft_doc::Document>>,
+    // The change tracker reads these.
+    #[allow(dead_code)]
+    pub(crate) last_spread: Option<usize>,
+    /// (story name, story id, paragraph index, when it was last changed: egui time in seconds)
+    #[allow(dead_code)]
+    pub(crate) pending_text: Option<(String, designcraft_doc::StoryId, usize, f64)>,
+}
+
 /// The text area's 6 × 12 grid and body lines, per page (page coordinates, points).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Grid {
@@ -250,6 +282,16 @@ mod tests {
     }
 
     #[test]
+    fn view_toggles_panels_and_windows_are_refused_navigation_is_not() {
+        for id in ["view.rulers", "view.frameEdges", "view.screenMode", "view.togglePresentation", "view.rotateSpread", "panel.show", "window.panel", "app.preferences"] {
+            assert!(!ui_command_allowed(id), "{id}");
+        }
+        for id in ["view.fitSpread", "view.zoomIn", "view.zoom", "view.nextSpread", "view.firstPage", "view.goToPage", "text.insert", "edit.undo", "tool.select", "file.openBytes"] {
+            assert!(ui_command_allowed(id), "{id}");
+        }
+    }
+
+    #[test]
     fn a_drop_snaps_to_columns_lines_and_the_nearest_position() {
         let p = snap(Kind::Image, [112.0, 108.0, 262.0, 283.0], AREA, 6, 22.0, None); // ~3 columns from col 2, ~8 lines, near the top
         assert_eq!((p.col, p.width, p.lines, p.v), (2, 3, Some(8), "top"));
@@ -283,5 +325,117 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(changed_paragraphs(&a(&["가", "나", "다"]), &a(&["가", "나!", "다"])), Some(vec![1]));
         assert_eq!(changed_paragraphs(&a(&["가", "나"]), &a(&["가", "나", ""])), None);
+    }
+
+    mod app {
+        use super::super::*;
+        use crate::{DesignApp, Inbox, Services};
+        use designcraft_engine::Session;
+        use designcraft_tools::{CanvasLayout, PointerEvent, PointerKind};
+        use serde_json::json;
+
+        /// An app with a document holding an unlabelled text frame and one labelled `image:1`,
+        /// in embed mode. Returns (app, the unlabelled frame, its story, the labelled frame).
+        fn embedded() -> (DesignApp, u64, u64, u64) {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({})).unwrap();
+            let body = app.run("frame.create", json!({"rect": [36, 36, 300, 200], "content": "text", "text": "본문"})).unwrap();
+            let image = app.run("frame.create", json!({"rect": [36, 300, 300, 400], "content": "text"})).unwrap();
+            let image_id = image["id"].as_u64().unwrap();
+            app.run("object.label", json!({"label": "image:1", "ids": [image_id]})).unwrap();
+            app.embed_begin(EmbedConfig::default());
+            (app, body["id"].as_u64().unwrap(), body["story"].as_u64().unwrap(), image_id)
+        }
+
+        fn locked(app: &DesignApp, id: u64) -> bool {
+            let st = app.session.active().unwrap();
+            let mut found = None;
+            for sp in &st.doc.spreads {
+                for item in &sp.items {
+                    item.walk(&mut |i| {
+                        if i.id.0 == id {
+                            found = Some(i.locked);
+                        }
+                    });
+                }
+            }
+            found.unwrap()
+        }
+
+        fn refused(r: Result<serde_json::Value, String>) -> bool {
+            r.is_err_and(|e| e.contains("not available here"))
+        }
+
+        #[test]
+        fn chrome_is_off() {
+            let (app, ..) = embedded();
+            assert!(!app.ui.rulers && !app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
+            assert!(app.embed.is_some());
+        }
+
+        #[test]
+        fn only_the_type_and_selection_tools() {
+            let (mut app, ..) = embedded();
+            assert_eq!(app.session.tool_id(), "selection");
+            assert!(refused(app.run("tool.select", json!({"tool": "directSelection"}))));
+            assert!(app.run("tool.select", json!({"tool": "type"})).is_ok());
+            assert_eq!(app.session.tool_id(), "type");
+            app.session.set_tool("pen");
+            app.embed_enforce();
+            assert_eq!(app.session.tool_id(), "selection");
+        }
+
+        #[test]
+        fn formatting_is_refused_view_and_text_are_not() {
+            let (mut app, _, story, _) = embedded();
+            assert!(refused(app.run("type.bold", json!({}))));
+            assert!(refused(app.run("view.rulers", json!({}))));
+            assert!(!app.ui.rulers);
+            assert!(refused(app.run("app.preferences", json!({}))));
+            assert!(!refused(app.run("view.fitSpread", json!({}))));
+            // Text typed into a locked frame's story, and undone.
+            app.run("text.select", json!({"story": story, "anchor": 0, "focus": 0})).unwrap();
+            app.run("text.insert", json!({"text": "새 "})).unwrap();
+            let text = |app: &mut DesignApp| app.session.execute("story.get", &json!({"story": story})).unwrap()["text"].as_str().unwrap().to_string();
+            assert_eq!(text(&mut app), "새 본문");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(text(&mut app), "본문");
+        }
+
+        #[test]
+        fn the_engine_refuses_formatting_from_every_caller() {
+            let (mut app, body, ..) = embedded();
+            assert!(app.session.execute("type.bold", &json!({})).is_err_and(|e| e.to_string().contains("not available here")));
+            app.session.execute_trusted("object.unlockAll", &json!({})).unwrap();
+            assert!(!locked(&app, body));
+        }
+
+        #[test]
+        fn unlabelled_frames_are_locked_for_good() {
+            let (mut app, body, _, image) = embedded();
+            assert!(locked(&app, body));
+            assert!(!locked(&app, image));
+            let _ = app.run("edit.undo", json!({}));
+            assert!(locked(&app, body), "the lock isn't undoable");
+        }
+
+        #[test]
+        fn a_type_tool_drag_draws_no_frame() {
+            let (mut app, ..) = embedded();
+            app.run("tool.select", json!({"tool": "type"})).unwrap();
+            let count = |app: &DesignApp| app.session.active().unwrap().doc.spreads.iter().map(|s| s.items.len()).sum::<usize>();
+            let before = count(&app);
+            let (x, y) = {
+                let d = &app.session.active().unwrap().doc;
+                let r = CanvasLayout::new(d, false).page_rect(d, 0).unwrap();
+                (r.x0 + 340.0, r.y0 + 450.0)
+            };
+            let v = app.view_info();
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Down, x, y), v);
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Drag, x + 120.0, y + 90.0), v);
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Up, x + 120.0, y + 90.0), v);
+            assert_eq!(count(&app), before);
+            assert!(app.session.active().unwrap().interaction.is_none());
+        }
     }
 }

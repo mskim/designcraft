@@ -974,6 +974,11 @@ pub fn run_ui(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, 
 }
 
 fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
+    // An embedded editor refuses the app-level ids that would bring chrome, panels or windows back;
+    // everything else goes on as usual (the engine's command filter sees the rest).
+    if app.embed.is_some() && !crate::embed::ui_command_allowed(id) {
+        return Some(Err("not available here".into()));
+    }
     if is_window_control(id) && !window_control_available(app, id) {
         return Some(Err("custom window controls are not available in this host".into()));
     }

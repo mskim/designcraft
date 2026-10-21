@@ -36,6 +36,7 @@ pub mod toolbar;
 pub mod widgets;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use designcraft_engine::{Session, SnapView, UiRequest, ViewInfo};
@@ -1144,8 +1145,15 @@ impl DesignApp {
             st.history.redo.clear();
         }
         let doc = self.session.active().map(|d| d.doc.clone());
+        let spread = match canvas::current_spread(self) {
+            Some(designcraft_doc::SpreadRef::Doc(n)) => Some(n),
+            _ => None,
+        };
+        let tool = self.session.tool_id();
         if let Some(e) = self.embed.as_mut() {
             e.last_doc = doc;
+            e.last_spread = spread;
+            e.last_tool = Some(tool);
         }
     }
 
@@ -1153,26 +1161,187 @@ impl DesignApp {
     /// selection and the caret (`object.lock` deselects).
     fn embed_lock(&mut self) {
         let Some(st) = self.session.active() else { return };
-        let selection = st.selection.clone();
         let mut lock = Vec::new();
         for spread in &st.doc.spreads {
             for item in &spread.items {
                 item.walk(&mut |i| {
                     if embed::Kind::of(&i.label).is_none() {
-                        lock.push(i.id.0);
+                        lock.push(i.id);
                     }
                 });
             }
         }
-        if lock.is_empty() {
+        self.embed_lock_ids(&lock);
+    }
+
+    /// Locks `ids` past the command filter, keeping the selection and the caret, and leaves no
+    /// undo step for it (an undone lock would only be locked again).
+    fn embed_lock_ids(&mut self, ids: &[designcraft_doc::ItemId]) {
+        if ids.is_empty() {
             return;
         }
-        if let Err(e) = self.session.execute_trusted("object.lock", &json!({ "ids": lock })) {
-            log::warn!("embed: couldn't lock the page's frames: {e}");
-        }
+        let Some(st) = self.session.active() else { return };
+        let selection = st.selection.clone();
+        let ids: Vec<u64> = ids.iter().map(|i| i.0).collect();
+        self.embed_trusted("object.lock", json!({ "ids": ids }));
         if let Some(st) = self.session.active_mut() {
             st.selection = selection;
         }
+    }
+
+    /// Runs an embed's own edit past the command filter and folds it into the step before it, so
+    /// one undo takes back the user's edit and what the embed did about it together.
+    fn embed_trusted(&mut self, id: &str, params: Value) {
+        let before = self.session.active().map(|st| st.doc.clone());
+        if let Err(e) = self.session.execute_trusted(id, &params) {
+            log::warn!("embed: {id} failed: {e}");
+        }
+        if let (Some(st), Some(before)) = (self.session.active_mut(), before)
+            && st.history.undo.last().is_some_and(|e| Arc::ptr_eq(&e.doc, &before))
+        {
+            st.history.undo.pop();
+        }
+    }
+
+    /// Takes the document back to `last` (what the embed last saw): undoing the steps since, or,
+    /// when the history doesn't lead there, putting it back directly. Leaves nothing to redo.
+    fn embed_revert(&mut self, last: &Arc<designcraft_doc::Document>) {
+        let Some(st) = self.session.active_mut() else { return };
+        let Some(k) = st.history.undo.iter().rposition(|e| Arc::ptr_eq(&e.doc, last)) else {
+            st.doc = last.clone();
+            st.bump_revision();
+            return;
+        };
+        let steps = st.history.undo.len() - k;
+        let redo = st.history.redo.len();
+        for _ in 0..steps {
+            if let Err(e) = self.session.execute_trusted("edit.undo", &json!({})) {
+                log::warn!("embed: undo failed: {e}");
+                break;
+            }
+        }
+        if let Some(st) = self.session.active_mut() {
+            st.history.redo.truncate(redo);
+            if !Arc::ptr_eq(&st.doc, last) {
+                st.doc = last.clone();
+                st.bump_revision();
+            }
+        }
+    }
+
+    /// The change tracker, run once a frame after `ui()`: what the user did since the last look,
+    /// as events for the host. Text corrections are reported per paragraph when the caret leaves
+    /// it or after a second's pause (`now`, seconds); a dropped labelled frame snaps to the grid on
+    /// its own page; any other change is undone (Smart Text Reflow's pages excepted).
+    pub fn embed_poll(&mut self, now: f64) -> Vec<embed::EmbedEvent> {
+        use embed::EmbedEvent as E;
+        let mut events = Vec::new();
+        let Some(last) = self.embed.as_ref().map(|e| e.last_doc.clone()) else { return events };
+        let Some(st) = self.session.active() else { return events };
+        if st.interaction.is_some() {
+            return events;
+        }
+        let cur = st.doc.clone();
+        let last = last.unwrap_or_else(|| cur.clone());
+        if !Arc::ptr_eq(&cur, &last) {
+            let rejected = match (embed::text_changes(&last, &cur), embed::structural_change(&last, &cur)) {
+                (Err(reason), _) => Err(reason),
+                (_, Err(())) => Err("change"),
+                (Ok(text), Ok(added)) => Ok((text, added)),
+            };
+            match rejected {
+                Err(reason) => {
+                    self.embed_revert(&last);
+                    events.push(E::Rejected(reason));
+                }
+                Ok((text, added)) => {
+                    for change in text {
+                        let pending = self.embed.as_mut().and_then(|e| e.pending_text.take());
+                        if let Some(p) = pending.filter(|p| p.change != change) {
+                            events.extend(self.embed_text_event(&p.change));
+                        }
+                        if let Some(e) = self.embed.as_mut() {
+                            e.pending_text = Some(embed::PendingText { change, at: now });
+                        }
+                    }
+                    self.embed_lock_ids(&added);
+                    for m in embed::frame_moves(&last, &cur) {
+                        events.extend(self.embed_snap(&m));
+                    }
+                }
+            }
+        }
+        // The pending edit goes when the caret has left its paragraph, or after a second.
+        let pending = self.embed.as_ref().and_then(|e| e.pending_text.clone());
+        if let Some(p) = pending {
+            let here = self.session.active().and_then(|st| {
+                let t = st.selection.text?;
+                let story = st.doc.text_story(t.story, t.cell)?;
+                Some(t.story == p.change.story && t.cell == p.change.cell && story.para_at(t.focus) == p.change.para)
+            });
+            if here != Some(true) || now - p.at >= 1.0 {
+                events.extend(self.embed_text_event(&p.change));
+                if let Some(e) = self.embed.as_mut() {
+                    e.pending_text = None;
+                }
+            }
+        }
+        let doc = self.session.active().map(|st| st.doc.clone());
+        if let Some(d) = &doc
+            && d.spreads.len() != last.spreads.len()
+        {
+            events.push(E::Spreads(d.spreads.len()));
+        }
+        let spread = match canvas::current_spread(self) {
+            Some(designcraft_doc::SpreadRef::Doc(n)) => Some(n),
+            _ => None,
+        };
+        let tool = self.session.tool_id();
+        if let Some(e) = self.embed.as_mut() {
+            if spread.is_some() && spread != e.last_spread {
+                e.last_spread = spread;
+                events.extend(spread.map(E::Spread));
+            }
+            if e.last_tool != Some(tool) {
+                e.last_tool = Some(tool);
+                events.push(E::Tool(tool));
+            }
+            e.last_doc = doc;
+        }
+        events
+    }
+
+    /// The `TextEdited` for a changed paragraph, with its text as it is now.
+    fn embed_text_event(&self, c: &embed::TextChange) -> Option<embed::EmbedEvent> {
+        let doc = &self.session.active()?.doc;
+        let story = embed::story_names(doc).remove(&c.story)?;
+        let text = embed::paragraph_texts(doc.text_story(c.story, c.cell)?).get(c.para)?.clone();
+        let cell = match c.cell {
+            Some(a) => Some((embed::table_index(doc.story(c.story)?, a.table)?, a.row, a.col)),
+            None => None,
+        };
+        Some(embed::EmbedEvent::TextEdited { story, paragraph: c.para, text, cell })
+    }
+
+    /// Snaps a dropped labelled frame to the grid of the page it was on (back onto it, if it was
+    /// dropped on another) and says where it went.
+    fn embed_snap(&mut self, m: &embed::FrameMove) -> Option<embed::EmbedEvent> {
+        let e = self.embed.as_ref()?;
+        let grid = e.config.grid.as_ref()?;
+        let line_y = (e.config.frames.get(&m.label).map(String::as_str) == Some("line")).then_some(m.was.y0 as f32);
+        let px = m.page_x;
+        let rect = [(m.now.x0 - px) as f32, m.now.y0 as f32, (m.now.x1 - px) as f32, m.now.y1 as f32];
+        let placement = embed::snap(m.kind, rect, grid.area(m.page)?, grid.columns, grid.line_height, line_y);
+        // Dropped on another spread: back onto its own first.
+        if self.session.active()?.doc.find(m.id).map(|l| l.spread) != Some(m.spread) {
+            let to = serde_json::to_value(m.spread).ok()?;
+            self.embed_trusted("transform.move", json!({"ids": [m.id.0], "dx": 0, "dy": 0, "toSpread": to}));
+        }
+        let from = self.session.active()?.doc.item(m.id)?.bounds();
+        let r = placement.rect;
+        let to = [r[0] as f64 + px, r[1] as f64, r[2] as f64 + px, r[3] as f64];
+        self.embed_trusted("transform.resize", json!({"from": [from.x0, from.y0, from.x1, from.y1], "to": to, "ids": [m.id.0]}));
+        Some(embed::EmbedEvent::FrameMoved { label: m.label.clone(), placement })
     }
 
     /// Puts the tool back to the selection tool when something switched it to one an embed doesn't allow.

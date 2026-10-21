@@ -1,6 +1,11 @@
 //! Embed mode (book_write's 지면): the editor reduced to correcting text and moving labelled
 //! frames on a grid, inside a host page that it reports each edit to.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use designcraft_doc::{CellAddr, Content, Document, Item, ItemId, SpreadRef, Story, StoryId};
+use designcraft_geom::Rect;
 use serde_json::Value;
 
 /// The tools an embedded editor may use: the type tool and the selection tool.
@@ -108,13 +113,27 @@ pub struct EmbedConfig {
 #[derive(Default)]
 pub struct Embed {
     pub config: EmbedConfig,
-    pub(crate) last_doc: Option<std::sync::Arc<designcraft_doc::Document>>,
-    // The change tracker reads these.
-    #[allow(dead_code)]
+    pub(crate) last_doc: Option<Arc<Document>>,
     pub(crate) last_spread: Option<usize>,
-    /// (story name, story id, paragraph index, when it was last changed: egui time in seconds)
-    #[allow(dead_code)]
-    pub(crate) pending_text: Option<(String, designcraft_doc::StoryId, usize, f64)>,
+    pub(crate) last_tool: Option<&'static str>,
+    /// The paragraph edit not reported yet.
+    pub(crate) pending_text: Option<PendingText>,
+}
+
+/// A paragraph being corrected, reported when the caret leaves it or after a second's pause.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingText {
+    pub change: TextChange,
+    /// When it last changed (egui time, seconds).
+    pub at: f64,
+}
+
+/// One paragraph whose text changed: in `story`, or in one of its table cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextChange {
+    pub story: StoryId,
+    pub cell: Option<CellAddr>,
+    pub para: usize,
 }
 
 /// The text area's 6 × 12 grid and body lines, per page (page coordinates, points).
@@ -220,6 +239,207 @@ pub fn changed_paragraphs(old: &[String], new: &[String]) -> Option<Vec<usize>> 
     (old.len() == new.len()).then(|| (0..new.len()).filter(|&i| old[i] != new[i]).collect())
 }
 
+/// The name the host knows a story by, from the label of a frame showing it: `story:main` →
+/// "main", `lead:6` / `table:7` → the label itself. None for anything else.
+pub fn story_name(label: &str) -> Option<String> {
+    if let Some(n) = label.strip_prefix("story:") {
+        return (!n.is_empty()).then(|| n.to_string());
+    }
+    matches!(Kind::of(label), Some(Kind::Lead | Kind::Table)).then(|| label.to_string())
+}
+
+/// Every named story of the document's pages (see [`story_name`]).
+pub fn story_names(doc: &Document) -> BTreeMap<StoryId, String> {
+    let mut out = BTreeMap::new();
+    for sp in &doc.spreads {
+        for item in &sp.items {
+            item.walk(&mut |i| {
+                if let (Some(t), Some(n)) = (i.text_frame(), story_name(&i.label)) {
+                    out.entry(t.story).or_insert(n);
+                }
+            });
+        }
+    }
+    out
+}
+
+/// A story's paragraphs as plain text.
+pub fn paragraph_texts(story: &Story) -> Vec<String> {
+    story.para_ranges().into_iter().map(|r| story.slice(r).to_string()).collect()
+}
+
+/// Each movable labelled frame on the document's pages (top level): label → (id, bounds).
+pub fn labelled_bounds(doc: &Document) -> BTreeMap<String, (ItemId, Rect)> {
+    doc.spreads.iter().flat_map(|sp| &sp.items).filter(|i| Kind::of(&i.label).is_some()).map(|i| (i.label.clone(), (i.id, i.bounds()))).collect()
+}
+
+/// A table's place among its story's tables, in text order (as the source map numbers them).
+pub fn table_index(story: &Story, table: u64) -> Option<usize> {
+    let mut order: Vec<(usize, u64)> = story.tables.keys().filter_map(|id| Some((story.table_anchor(*id)?, *id))).collect();
+    order.sort();
+    order.iter().position(|(_, id)| *id == table)
+}
+
+/// The paragraphs whose text changed from `last` to `cur`, stories and their table cells; Err with
+/// the reason the embed refuses the edit: "paragraphs" (one added or removed) or "story" (text that
+/// isn't in a story the host knows).
+pub fn text_changes(last: &Document, cur: &Document) -> Result<Vec<TextChange>, &'static str> {
+    fn diff(old: &Story, new: &Story, story: StoryId, cell: Option<CellAddr>, out: &mut Vec<TextChange>) -> Result<(), &'static str> {
+        if old.text == new.text {
+            return Ok(());
+        }
+        let changed = changed_paragraphs(&paragraph_texts(old), &paragraph_texts(new)).ok_or("paragraphs")?;
+        out.extend(changed.into_iter().map(|para| TextChange { story, cell, para }));
+        Ok(())
+    }
+    let names = story_names(cur);
+    let mut out = Vec::new();
+    for (sid, s) in &cur.stories {
+        // A new story comes with a new frame, which the item check refuses.
+        let Some(old) = last.stories.get(sid) else { continue };
+        if Arc::ptr_eq(old, s) {
+            continue;
+        }
+        let mut changes = Vec::new();
+        diff(old, s, *sid, None, &mut changes)?;
+        for (tid, t) in &s.tables {
+            let Some(ot) = old.tables.get(tid) else { continue };
+            let cols = t.columns.len().max(1);
+            if Arc::ptr_eq(ot, t) || ot.columns.len() != t.columns.len() {
+                continue;
+            }
+            for (k, (oc, c)) in ot.cells.iter().zip(&t.cells).enumerate() {
+                diff(&oc.text, &c.text, *sid, Some(CellAddr { table: *tid, row: k / cols, col: k % cols }), &mut changes)?;
+            }
+        }
+        if !changes.is_empty() && !names.contains_key(sid) {
+            return Err("story");
+        }
+        out.extend(changes);
+    }
+    Ok(out)
+}
+
+fn items(doc: &Document) -> BTreeMap<ItemId, &Item> {
+    let mut out = BTreeMap::new();
+    for sp in &doc.spreads {
+        for item in &sp.items {
+            item.walk(&mut |i| {
+                out.insert(i.id, i);
+            });
+        }
+    }
+    out
+}
+
+fn same_rect(a: Rect, b: Rect) -> bool {
+    (a.x0 - b.x0).abs() < 1e-3 && (a.y0 - b.y0).abs() < 1e-3 && (a.x1 - b.x1).abs() < 1e-3 && (a.y1 - b.y1).abs() < 1e-3
+}
+
+/// An item's rotation, shear and flip (what a move or resize leaves alone).
+fn orientation(i: &Item) -> [f64; 3] {
+    let [a, b, c, d, ..] = i.xf.as_coeffs();
+    let (u, v) = (a.hypot(b), c.hypot(d));
+    let shear = if u * v > 1e-12 { (a * c + b * d) / (u * v) } else { 0.0 };
+    [b.atan2(a), shear, (a * d - b * c).signum()]
+}
+
+fn graphic_xf(i: &Item) -> Option<[f64; 6]> {
+    match &i.content {
+        Content::Graphic(g) => Some(g.xf.as_coeffs()),
+        _ => None,
+    }
+}
+
+/// The stories whose text (or a cell's) changed.
+fn changed_stories(last: &Document, cur: &Document) -> BTreeSet<StoryId> {
+    cur.stories
+        .iter()
+        .filter(|(sid, s)| last.stories.get(sid).is_none_or(|o| !Arc::ptr_eq(o, s) && (o.text != s.text || o.tables != s.tables)))
+        .map(|(sid, _)| *sid)
+        .collect()
+}
+
+/// Whether the items changed only as an embed allows from `last` to `cur`: labelled frames moved
+/// or resized, and Smart Text Reflow's pages and frames of the primary story added or removed.
+/// Ok holds the frames reflow added (to lock); Err(()) is any other change: a new or removed item,
+/// an unlabelled item moved, a label changed, a labelled one rotated, sheared, flipped or re-cropped.
+#[allow(clippy::result_unit_err)]
+pub fn structural_change(last: &Document, cur: &Document) -> Result<Vec<ItemId>, ()> {
+    let primary = cur.settings.primary_story.or(last.settings.primary_story);
+    let reflow = |i: &Item| primary.is_some() && i.text_frame().map(|t| t.story) == primary;
+    let pages = cur.page_count().cmp(&last.page_count());
+    let text = changed_stories(last, cur);
+    let (old, new) = (items(last), items(cur));
+    let mut added = Vec::new();
+    for (id, i) in &new {
+        let Some(o) = old.get(id) else {
+            if reflow(i) && pages.is_gt() {
+                added.push(*id);
+                continue;
+            }
+            return Err(());
+        };
+        if o.label != i.label {
+            return Err(());
+        }
+        let moved = !same_rect(o.bounds(), i.bounds());
+        if Kind::of(&i.label).is_some() {
+            let recropped = !moved && graphic_xf(o) != graphic_xf(i);
+            if orientation(o).iter().zip(orientation(i)).any(|(a, b)| (a - b).abs() > 1e-6) || recropped {
+                return Err(());
+            }
+        } else if moved && !i.text_frame().is_some_and(|t| text.contains(&t.story)) {
+            // An auto-sizing frame grows with its text; nothing else moves an unlabelled item.
+            return Err(());
+        }
+    }
+    let removed: Vec<_> = old.iter().filter(|(id, _)| !new.contains_key(id)).collect();
+    if removed.iter().any(|(_, o)| !(reflow(o) && pages.is_lt())) {
+        return Err(());
+    }
+    if !pages.is_eq() && added.is_empty() && removed.is_empty() {
+        return Err(());
+    }
+    Ok(added)
+}
+
+/// A labelled frame that moved: where it was and where it is (spread coordinates), and the page
+/// it was on (which it snaps back onto).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameMove {
+    pub id: ItemId,
+    pub label: String,
+    pub kind: Kind,
+    pub was: Rect,
+    pub now: Rect,
+    /// Absolute page index, its spread, and the page's left edge in that spread.
+    pub page: usize,
+    pub spread: SpreadRef,
+    pub page_x: f64,
+}
+
+/// The labelled frames whose bounds changed from `last` to `cur`, but for one that only grew or
+/// shrank with its text (auto-size).
+pub fn frame_moves(last: &Document, cur: &Document) -> Vec<FrameMove> {
+    let text = changed_stories(last, cur);
+    let before = labelled_bounds(last);
+    let mut out = Vec::new();
+    for (label, (id, now)) in labelled_bounds(cur) {
+        let Some(&(old_id, was)) = before.get(&label) else { continue };
+        let Some(kind) = Kind::of(&label) else { continue };
+        let autosized = cur.item(id).and_then(Item::text_frame).is_some_and(|t| text.contains(&t.story));
+        if old_id != id || same_rect(was, now) || autosized {
+            continue;
+        }
+        let Some(page) = last.page_of_item(id) else { continue };
+        let Some((si, pi)) = last.page_loc(page) else { continue };
+        let Some(p) = last.spreads.get(si).and_then(|s| s.pages.get(pi)) else { continue };
+        out.push(FrameMove { id, label, kind, was, now, page, spread: SpreadRef::Doc(si), page_x: p.x });
+    }
+    out
+}
+
 /// What an embedded editor tells its host (embed_protocol turns these into messages).
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmbedEvent {
@@ -283,10 +503,30 @@ mod tests {
 
     #[test]
     fn view_toggles_panels_and_windows_are_refused_navigation_is_not() {
-        for id in ["view.rulers", "view.frameEdges", "view.screenMode", "view.togglePresentation", "view.rotateSpread", "panel.show", "window.panel", "app.preferences"] {
+        for id in [
+            "view.rulers",
+            "view.frameEdges",
+            "view.screenMode",
+            "view.togglePresentation",
+            "view.rotateSpread",
+            "panel.show",
+            "window.panel",
+            "app.preferences",
+        ] {
             assert!(!ui_command_allowed(id), "{id}");
         }
-        for id in ["view.fitSpread", "view.zoomIn", "view.zoom", "view.nextSpread", "view.firstPage", "view.goToPage", "text.insert", "edit.undo", "tool.select", "file.openBytes"] {
+        for id in [
+            "view.fitSpread",
+            "view.zoomIn",
+            "view.zoom",
+            "view.nextSpread",
+            "view.firstPage",
+            "view.goToPage",
+            "text.insert",
+            "edit.undo",
+            "tool.select",
+            "file.openBytes",
+        ] {
             assert!(ui_command_allowed(id), "{id}");
         }
     }
@@ -366,6 +606,222 @@ mod tests {
             r.is_err_and(|e| e.contains("not available here"))
         }
 
+        const LINE: f32 = 22.0;
+
+        /// A grid whose text area is each page inside 36 pt margins.
+        fn grid_of(app: &DesignApp) -> Grid {
+            let d = &app.session.active().unwrap().doc;
+            let text_areas = d.pages().map(|(_, _, p)| [36.0, 36.0, p.width as f32 - 36.0, p.height as f32 - 36.0]).collect();
+            Grid { columns: 6, rows: 12, line_height: LINE, text_areas, first_page_top: None }
+        }
+
+        /// A one-page document whose primary text frame is labelled `story:main` and holds two
+        /// paragraphs, in embed mode. Returns (app, the main story).
+        fn text_doc() -> (DesignApp, u64) {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({"pages": 1, "primaryTextFrame": true})).unwrap();
+            let doc = app.session.active().unwrap().doc.clone();
+            let sid = doc.settings.primary_story.unwrap();
+            let frame = doc.story(sid).unwrap().frames[0];
+            app.run("object.label", json!({"label": "story:main", "ids": [frame.0]})).unwrap();
+            app.run("text.select", json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+            app.run("text.insert", json!({"text": "첫 문단\n둘째 문단"})).unwrap();
+            let grid = grid_of(&app);
+            app.embed_begin(EmbedConfig { grid: Some(grid), ..Default::default() });
+            (app, sid.0)
+        }
+
+        /// Three facing pages with an `image:1` frame on page 2 (the left page of spread 1), in
+        /// embed mode. Returns (app, the frame).
+        fn frame_doc() -> (DesignApp, u64) {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({"pages": 3, "facingPages": true})).unwrap();
+            let x = app.session.active().unwrap().doc.spreads[1].pages[0].x;
+            let image = app.run("frame.create", json!({"spread": 1, "rect": [x + 60.0, 80.0, x + 260.0, 260.0], "content": "graphic"})).unwrap();
+            let id = image["id"].as_u64().unwrap();
+            app.run("object.label", json!({"label": "image:1", "ids": [id]})).unwrap();
+            let grid = grid_of(&app);
+            app.embed_begin(EmbedConfig { grid: Some(grid), ..Default::default() });
+            (app, id)
+        }
+
+        fn paragraphs(app: &DesignApp, story: u64) -> Vec<String> {
+            paragraph_texts(app.session.active().unwrap().doc.story(designcraft_doc::StoryId(story)).unwrap())
+        }
+
+        fn bounds(app: &DesignApp, id: u64) -> designcraft_geom::Rect {
+            app.session.active().unwrap().doc.item(designcraft_doc::ItemId(id)).unwrap().bounds()
+        }
+
+        fn close(a: [f64; 4], b: [f32; 4]) -> bool {
+            a.iter().zip(b).all(|(a, b)| (*a as f32 - b).abs() < 0.01)
+        }
+
+        #[test]
+        fn stories_are_named_by_their_frames_labels() {
+            assert_eq!(story_name("story:main").as_deref(), Some("main"));
+            assert_eq!(story_name("lead:6").as_deref(), Some("lead:6"));
+            assert_eq!(story_name("table:7").as_deref(), Some("table:7"));
+            assert_eq!(story_name("image:4"), None);
+            assert_eq!(story_name(""), None);
+            let (app, story) = text_doc();
+            let names = story_names(&app.session.active().unwrap().doc);
+            assert_eq!(names.get(&designcraft_doc::StoryId(story)).map(String::as_str), Some("main"));
+        }
+
+        #[test]
+        fn a_text_edit_is_reported_after_a_pause() {
+            let (mut app, story) = text_doc();
+            let end = "첫 문단".len();
+            app.run("text.select", json!({"story": story, "anchor": end, "focus": end})).unwrap();
+            app.run("text.insert", json!({"text": "!"})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![]);
+            assert_eq!(app.embed_poll(1.5), vec![EmbedEvent::TextEdited { story: "main".into(), paragraph: 0, text: "첫 문단!".into(), cell: None }]);
+            assert_eq!(app.embed_poll(3.0), vec![], "reported once");
+        }
+
+        #[test]
+        fn moving_the_caret_out_flushes_the_edit() {
+            let (mut app, story) = text_doc();
+            let end = "첫 문단".len();
+            app.run("text.select", json!({"story": story, "anchor": end, "focus": end})).unwrap();
+            app.run("text.insert", json!({"text": "!"})).unwrap();
+            let next = "첫 문단!\n".len();
+            app.run("text.select", json!({"story": story, "anchor": next, "focus": next})).unwrap();
+            assert_eq!(app.embed_poll(0.1), vec![EmbedEvent::TextEdited { story: "main".into(), paragraph: 0, text: "첫 문단!".into(), cell: None }]);
+        }
+
+        #[test]
+        fn a_new_paragraph_is_undone() {
+            let (mut app, story) = text_doc();
+            app.run("text.select", json!({"story": story, "anchor": 2, "focus": 2})).unwrap();
+            app.run("text.insert", json!({"text": "\n"})).unwrap();
+            assert_eq!(paragraphs(&app, story).len(), 3);
+            assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::Rejected("paragraphs")]);
+            assert_eq!(paragraphs(&app, story), vec!["첫 문단", "둘째 문단"]);
+            assert_eq!(app.embed_poll(2.0), vec![], "nothing pending");
+        }
+
+        #[test]
+        fn a_move_snaps_to_the_grid() {
+            let (mut app, id) = frame_doc();
+            app.session.execute("transform.move", &json!({"ids": [id], "dx": 37, "dy": 101})).unwrap();
+            let moved = bounds(&app, id);
+            let (page_x, grid) = (app.session.active().unwrap().doc.spreads[1].pages[0].x, grid_of(&app));
+            let rect = [(moved.x0 - page_x) as f32, moved.y0 as f32, (moved.x1 - page_x) as f32, moved.y1 as f32];
+            let expected = snap(Kind::Image, rect, grid.area(1).unwrap(), 6, LINE, None);
+            assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::FrameMoved { label: "image:1".into(), placement: expected.clone() }]);
+            let b = bounds(&app, id);
+            let r = expected.rect;
+            assert!(close([b.x0 - page_x, b.y0, b.x1 - page_x, b.y1], r), "{b:?} vs {r:?}");
+            assert_eq!(app.embed_poll(0.1), vec![], "the snap isn't a move of its own");
+            // One undo takes back the move and its snap.
+            app.run("edit.undo", json!({})).unwrap();
+            assert!((bounds(&app, id).x0 - (page_x + 60.0)).abs() < 0.01);
+        }
+
+        #[test]
+        fn no_events_while_dragging() {
+            let (mut app, id) = frame_doc();
+            {
+                let st = app.session.active_mut().unwrap();
+                st.interaction = Some(designcraft_engine::Interaction {
+                    label: "Move".into(),
+                    doc: st.doc.clone(),
+                    selection: st.selection.clone(),
+                    preview: None,
+                    revision: st.revision,
+                });
+            }
+            app.session.execute("transform.move", &json!({"ids": [id], "dx": 40, "dy": 40})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![]);
+            app.session.active_mut().unwrap().interaction = None;
+            assert!(matches!(app.embed_poll(0.1).as_slice(), [EmbedEvent::FrameMoved { .. }]));
+        }
+
+        #[test]
+        fn the_backstop_undoes_anything_else() {
+            let (mut app, _) = frame_doc();
+            let count = |app: &DesignApp| app.session.active().unwrap().doc.spreads.iter().map(|s| s.items.len()).sum::<usize>();
+            let before = count(&app);
+            app.session.execute_trusted("frame.create", &json!({"rect": [40, 40, 200, 200], "content": "text"})).unwrap();
+            assert_eq!(count(&app), before + 1);
+            assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::Rejected("change")]);
+            assert_eq!(count(&app), before);
+        }
+
+        #[test]
+        fn reflow_is_allowed_both_ways() {
+            let (mut app, story) = text_doc();
+            let spreads = |app: &DesignApp| app.session.active().unwrap().doc.spreads.len();
+            let n = spreads(&app);
+            app.run("text.select", json!({"story": story, "anchor": 0, "focus": 0})).unwrap();
+            app.run("text.insert", json!({"text": "말이 이어지고 지면이 빠르게 찬다. ".repeat(300)})).unwrap();
+            let caret = app.session.active().unwrap().selection.text;
+            let grown = spreads(&app);
+            assert!(grown > n);
+            let events = app.embed_poll(0.0);
+            assert!(events.contains(&EmbedEvent::Spreads(grown)), "{events:?}");
+            assert!(!events.iter().any(|e| matches!(e, EmbedEvent::Rejected(_))), "{events:?}");
+            assert_eq!(app.session.active().unwrap().selection.text, caret, "the caret stays");
+            let doc = app.session.active().unwrap().doc.clone();
+            let frames = &doc.story(designcraft_doc::StoryId(story)).unwrap().frames;
+            assert!(frames.len() > 1 && frames.iter().all(|f| locked(&app, f.0)), "the new frames are locked");
+            // Typing on keeps the frames (no Rejected, and nothing to lock again).
+            app.run("text.insert", json!({"text": "더"})).unwrap();
+            assert!(!app.embed_poll(0.1).iter().any(|e| matches!(e, EmbedEvent::Rejected(_))));
+            // Delete the text again: the pages go.
+            let end = paragraphs(&app, story)[0].len();
+            app.run("text.select", json!({"story": story, "anchor": 0, "focus": end})).unwrap();
+            app.run("text.delete", json!({})).unwrap();
+            assert_eq!(spreads(&app), n);
+            let events = app.embed_poll(0.2);
+            assert!(events.contains(&EmbedEvent::Spreads(n)), "{events:?}");
+            assert!(!events.iter().any(|e| matches!(e, EmbedEvent::Rejected(_))), "{events:?}");
+        }
+
+        #[test]
+        fn a_drop_on_the_next_page_snaps_back() {
+            let (mut app, id) = frame_doc();
+            let (page_x, width) = {
+                let p = &app.session.active().unwrap().doc.spreads[1].pages[0];
+                (p.x, p.width)
+            };
+            app.session.execute("transform.move", &json!({"ids": [id], "dx": width, "dy": 0})).unwrap();
+            assert_eq!(app.session.active().unwrap().doc.page_of_item(designcraft_doc::ItemId(id)), Some(2));
+            let events = app.embed_poll(0.0);
+            let [EmbedEvent::FrameMoved { placement, .. }] = events.as_slice() else { panic!("{events:?}") };
+            let area = grid_of(&app).area(1).unwrap();
+            assert!(placement.rect[0] >= area[0] && placement.rect[2] <= area[2] + 0.01, "{placement:?}");
+            assert_eq!(app.session.active().unwrap().doc.page_of_item(designcraft_doc::ItemId(id)), Some(1));
+            let b = bounds(&app, id);
+            assert!(close([b.x0 - page_x, b.y0, b.x1 - page_x, b.y1], placement.rect));
+        }
+
+        #[test]
+        fn a_table_cell_edit_names_its_table_and_cell() {
+            let (mut app, story) = text_doc();
+            let end = "첫 문단".len();
+            app.run("text.select", json!({"story": story, "anchor": end, "focus": end})).unwrap();
+            app.session.execute_trusted("table.insert", &json!({"rows": 2, "cols": 2})).unwrap();
+            // Accept the table as the document's (as the host's would be).
+            let doc = app.session.active().unwrap().doc.clone();
+            if let Some(e) = app.embed.as_mut() {
+                e.last_doc = Some(doc.clone());
+            }
+            let s = doc.story(designcraft_doc::StoryId(story)).unwrap();
+            let (&tid, _) = s.tables.iter().next().unwrap();
+            let cell = designcraft_doc::CellAddr { table: tid, row: 1, col: 0 };
+            let sel = designcraft_doc::TextSel { story: designcraft_doc::StoryId(story), anchor: 0, focus: 0, frame: None, cell: Some(cell) };
+            app.session.active_mut().unwrap().selection.text = Some(sel);
+            app.run("text.insert", json!({"text": "칸"})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![]);
+            assert_eq!(
+                app.embed_poll(1.5),
+                vec![EmbedEvent::TextEdited { story: "main".into(), paragraph: 0, text: "칸".into(), cell: Some((0, 1, 0)) }]
+            );
+        }
+
         #[test]
         fn chrome_is_off() {
             let (app, ..) = embedded();
@@ -396,7 +852,8 @@ mod tests {
             // Text typed into a locked frame's story, and undone.
             app.run("text.select", json!({"story": story, "anchor": 0, "focus": 0})).unwrap();
             app.run("text.insert", json!({"text": "새 "})).unwrap();
-            let text = |app: &mut DesignApp| app.session.execute("story.get", &json!({"story": story})).unwrap()["text"].as_str().unwrap().to_string();
+            let text =
+                |app: &mut DesignApp| app.session.execute("story.get", &json!({"story": story})).unwrap()["text"].as_str().unwrap().to_string();
             assert_eq!(text(&mut app), "새 본문");
             app.run("edit.undo", json!({})).unwrap();
             assert_eq!(text(&mut app), "본문");

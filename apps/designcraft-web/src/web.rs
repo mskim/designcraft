@@ -1,6 +1,8 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
 use super::browser_policy::{has_query_flag, mime_for};
+use crate::embed_bridge::{self, Loading, Queue};
+use crate::embed_protocol::{self, HostMessage};
 use crate::graphics::{GraphicsState, RecoveryDocument, recovery_documents};
 use designcraft_engine::Session;
 use designcraft_ui_egui::{DesignApp, ImportRequest, ImportedFile, Inbox, Services};
@@ -56,6 +58,7 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
+        let embedding = has_query_flag(&query(), "embed");
         let runner = eframe::WebRunner::new();
         let creator_graphics = graphics.clone();
         let result = runner
@@ -73,10 +76,21 @@ pub fn start() {
                     }
                     let inbox: Inbox = Inbox::default();
                     let mut app = DesignApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
-                    if has_query_flag(&query(), "sample") {
-                        let _ = app.run("file.newSample", serde_json::json!({}));
-                    }
-                    Ok(Box::new(WebShell { app, inbox, graphics: creator_graphics }))
+                    let embed = if embedding {
+                        // Chrome off from the start: the host's `load` brings the document.
+                        app.embed_begin(designcraft_ui_egui::embed::EmbedConfig::default());
+                        let queue = Queue::default();
+                        if let Err(e) = embed_bridge::listen(queue.clone(), cc.egui_ctx.clone()) {
+                            log::error!("embed: couldn't listen for host messages: {e:?}");
+                        }
+                        Some(EmbedShell { queue, loading: None, show: None })
+                    } else {
+                        if has_query_flag(&query(), "sample") {
+                            let _ = app.run("file.newSample", serde_json::json!({}));
+                        }
+                        None
+                    };
+                    Ok(Box::new(WebShell { app, inbox, graphics: creator_graphics, embed }))
                 }),
             )
             .await;
@@ -95,6 +109,9 @@ pub fn start() {
                     && let Some(el) = document.get_element_by_id(LOADING_ID)
                 {
                     el.remove();
+                }
+                if embedding {
+                    embed_bridge::post(&embed_protocol::ready());
                 }
             }
             Err(e) => {
@@ -208,8 +225,9 @@ fn show_error(title: &str, message: &str, detail: &str) -> Result<(), wasm_bindg
     Ok(())
 }
 
-/// Recovery listeners are owned by their DOM targets, independently of WebRunner.
-fn add_dom_event_listener(
+/// Recovery listeners (and the embed's message listener) are owned by their DOM targets,
+/// independently of WebRunner.
+pub(crate) fn add_dom_event_listener(
     target: &web_sys::EventTarget,
     event_name: &str,
     callback: impl FnMut(web_sys::Event) + 'static,
@@ -345,14 +363,86 @@ struct WebShell {
     app: DesignApp,
     inbox: Inbox,
     graphics: GraphicsState,
+    /// `?embed`: hosted by book_write, driven by its messages.
+    embed: Option<EmbedShell>,
+}
+
+/// The embed's state between frames.
+struct EmbedShell {
+    queue: Queue,
+    /// The latest `load`, while its fonts and document are being fetched.
+    loading: Option<Loading>,
+    /// A spread to show once the canvas has a size.
+    show: Option<usize>,
+}
+
+impl WebShell {
+    /// Handles the host's messages, a finished load, and a spread waiting to be shown.
+    fn embed_logic(&mut self, ctx: &egui::Context) {
+        let Some(embed) = self.embed.as_mut() else { return };
+        let messages: Vec<HostMessage> = embed.queue.borrow_mut().drain(..).collect();
+        for message in messages {
+            match message {
+                HostMessage::Load { document_url, font_urls, spread, config } => {
+                    embed.loading = Some(Loading::start(document_url, font_urls, spread, config, ctx.clone()));
+                }
+                HostMessage::ShowSpread(n) => embed.show = Some(n),
+                // The embed's guard refuses any tool but type and selection.
+                HostMessage::SetTool(tool) => self.app.select_tool(&tool),
+            }
+        }
+        if let Some(fetched) = embed.loading.as_ref().and_then(Loading::take)
+            && let Some(loading) = embed.loading.take()
+        {
+            match fetched.and_then(|(name, bytes)| open_embedded(&mut self.app, &name, &bytes, loading.config)) {
+                Ok(spread_count) => {
+                    embed.show = Some(loading.spread.min(spread_count.saturating_sub(1)));
+                    embed_bridge::post(&embed_protocol::event(&designcraft_ui_egui::embed::EmbedEvent::Loaded { spread_count }));
+                }
+                Err(message) => {
+                    log::error!("embed: load failed: {message}");
+                    embed_bridge::post(&embed_protocol::event(&designcraft_ui_egui::embed::EmbedEvent::Error(message)));
+                }
+            }
+        }
+        if let Some(n) = embed.show {
+            // `fit` needs the canvas rect, which the first `ui()` sets.
+            match self.app.canvas_rect {
+                Some(rect) if self.app.session.active().is_some() => {
+                    designcraft_ui_egui::canvas::show_spread(&mut self.app, designcraft_engine::doc::SpreadRef::Doc(n));
+                    designcraft_ui_egui::canvas::fit(&mut self.app, rect, "spread");
+                    embed.show = None;
+                }
+                Some(_) => embed.show = None,
+                None => ctx.request_repaint(),
+            }
+        }
+    }
+}
+
+/// Replaces the open document with `bytes` and makes it the embed's; returns its spread count.
+fn open_embedded(app: &mut DesignApp, name: &str, bytes: &[u8], config: designcraft_ui_egui::embed::EmbedConfig) -> Result<usize, String> {
+    while !app.session.documents().is_empty() {
+        app.run("file.close", serde_json::json!({"index": 0}))?;
+    }
+    app.run("file.openBytes", serde_json::json!({"name": name, "base64": designcraft_engine::cmd::base64_encode(bytes)}))?;
+    // The host brings the book's fonts; a Find Font dialog would have no chrome to answer it in.
+    if app.ui.dialog.as_ref().is_some_and(|d| d.id == "findFont") {
+        log::warn!("embed: the document uses fonts the host didn't send");
+        app.ui.dialog = None;
+    }
+    app.embed_begin(config);
+    app.session.active().map(|st| st.doc.spreads.len()).ok_or_else(|| "the document didn't open".to_string())
 }
 
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let graphics = self.graphics.clone();
         let _ = graphics.run_if_healthy(|| {
+            self.embed_logic(ctx);
             let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
-            for f in dropped {
+            // An embedded editor shows only the host's document: dropped files are ignored.
+            for f in dropped.into_iter().filter(|_| self.embed.is_none()) {
                 let request = self.app.import_request("drop");
                 let inbox = self.inbox.clone();
                 let ctx = ctx.clone();
@@ -379,7 +469,14 @@ impl eframe::App for WebShell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let _ = self.graphics.run_if_healthy(|| self.app.ui(ui));
+        let _ = self.graphics.run_if_healthy(|| {
+            self.app.ui(ui);
+            if self.embed.is_some() {
+                for e in self.app.embed_poll(ui.ctx().input(|i| i.time)) {
+                    embed_bridge::post(&embed_protocol::event(&e));
+                }
+            }
+        });
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

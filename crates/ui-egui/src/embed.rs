@@ -86,7 +86,7 @@ pub fn tool_allowed(id: &str) -> bool {
     TOOLS.contains(&id)
 }
 
-pub fn command_allowed(id: &str) -> bool {
+pub fn command_allowed(id: &str, _params: &Value) -> bool {
     ALLOWED.contains(&id) || !DENIED.iter().any(|p| id.starts_with(p))
 }
 
@@ -483,7 +483,7 @@ mod tests {
             "file.export",
             "layout.overrideParentItems",
         ] {
-            assert!(!command_allowed(id), "{id}");
+            assert!(!command_allowed(id, &Value::Null), "{id}");
         }
         for id in [
             "text.insert",
@@ -497,7 +497,7 @@ mod tests {
             "file.openBytes",
             "file.close",
         ] {
-            assert!(command_allowed(id), "{id}");
+            assert!(command_allowed(id, &Value::Null), "{id}");
         }
     }
 

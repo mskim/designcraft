@@ -1652,11 +1652,24 @@ fn a_line_fits_when_its_baseline_does() {
 }
 
 #[test]
+fn a_command_filter_sees_the_commands_parameters() {
+    let mut s = session();
+    s.execute("style.paragraph.create", &json!({"name": "Body", "chars": {"size": 10}})).unwrap();
+    s.command_filter = Some(|id, p| id != "style.paragraph.edit" || p.get("rename").is_none());
+    s.execute("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 12}})).unwrap();
+    let e = s.execute("style.paragraph.edit", &json!({"name": "Body", "rename": "X"})).unwrap_err().to_string();
+    assert!(e.contains("not available here"), "{e}");
+    s.execute_trusted("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 14}})).unwrap();
+    s.execute_trusted("style.paragraph.edit", &json!({"name": "Body", "rename": "X"})).unwrap();
+    assert!(s.command_filter.is_some());
+}
+
+#[test]
 fn a_command_filter_refuses_every_caller_but_trusted_ones() {
     use designcraft_tools::{CanvasLayout, PointerEvent, PointerKind};
     let mut s = session();
     s.execute("frame.create", &json!({"rect": [36, 36, 300, 200], "content": "text", "text": "Hello"})).unwrap();
-    s.command_filter = Some(|id| id != "type.bold");
+    s.command_filter = Some(|id, _| id != "type.bold");
     let e = s.execute("type.bold", &json!({})).unwrap_err().to_string();
     assert!(e.contains("not available here"), "{e}");
     if let Err(e) = s.execute_trusted("type.bold", &json!({})) {
@@ -1667,7 +1680,7 @@ fn a_command_filter_refuses_every_caller_but_trusted_ones() {
     assert!(s.execute_trusted("no.such.command", &json!({})).is_err());
     assert!(s.command_filter.is_some());
     // A tool's preview is refused too, and leaves no gesture open.
-    s.command_filter = Some(|id| id != "frame.create");
+    s.command_filter = Some(|id, _| id != "frame.create");
     let items = s.doc().unwrap().doc.spreads[0].items.len();
     s.set_tool("type");
     let v = ViewInfo::at_zoom(1.0);

@@ -375,7 +375,7 @@ pub struct Session {
     /// When set, commands it refuses fail with "not available here": every caller, tool actions
     /// included. The host's own calls that must pass (an embed's lock, snap and undo) use
     /// [`Session::execute_trusted`].
-    pub command_filter: Option<fn(&str) -> bool>,
+    pub command_filter: Option<fn(&str, &Value) -> bool>,
 }
 
 impl Default for Session {
@@ -532,7 +532,7 @@ impl Session {
     /// Run command `id`. A panic inside it becomes [`EngineError::Internal`] and leaves the
     /// document as it was (see [`guard`]).
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
-        self.check_filter(id)?;
+        self.check_filter(id, params)?;
         // A command from outside the IME ends its composition first, keeping the marked text as
         // typed: Undo then takes back that typing, and nothing runs on top of the preview the
         // composition would drop. Queries and recovery saves leave it alone.
@@ -550,10 +550,10 @@ impl Session {
         r
     }
 
-    /// Refuses `id` when the command filter does.
-    pub(crate) fn check_filter(&self, id: &str) -> Result<()> {
+    /// Refuses `id` with `params` when the command filter does.
+    pub(crate) fn check_filter(&self, id: &str, params: &Value) -> Result<()> {
         match self.command_filter {
-            Some(allowed) if !allowed(id) => Err(EngineError::Disabled(id.into(), "not available here".into())),
+            Some(allowed) if !allowed(id, params) => Err(EngineError::Disabled(id.into(), "not available here".into())),
             _ => Ok(()),
         }
     }

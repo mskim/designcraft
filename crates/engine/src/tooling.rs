@@ -262,7 +262,7 @@ impl Session {
                 Action::Begin(label) => self.begin_interaction(&label)?,
                 Action::Preview(cmd, p) => {
                     // A gesture whose command the filter refuses ends here, with nothing changed.
-                    if let Err(e) = self.check_filter(&cmd) {
+                    if let Err(e) = self.check_filter(&cmd, &p) {
                         self.cancel_interaction();
                         return Err(e);
                     }

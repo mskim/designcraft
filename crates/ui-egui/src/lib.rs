@@ -778,7 +778,7 @@ impl DesignApp {
             if id == "tool.select" && !params.get("tool").and_then(Value::as_str).is_some_and(embed::tool_allowed) {
                 return Err("not available here".into());
             }
-            if !embed::command_allowed(id) {
+            if !embed::command_allowed(id, &params) {
                 return Err("not available here".into());
             }
         }

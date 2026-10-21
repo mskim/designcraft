@@ -65,6 +65,9 @@ pub fn event(e: &EmbedEvent) -> Value {
         EmbedEvent::Tool(tool) => json!({"type": "tool", "tool": tool}),
         EmbedEvent::Rejected(reason) => json!({"type": "rejected", "reason": reason}),
         EmbedEvent::Error(message) => json!({"type": "error", "message": message}),
+        EmbedEvent::StyleChanged { document, name, before, after } => {
+            json!({"type": "styleChanged", "document": document, "name": name, "before": before, "after": after})
+        }
     }
 }
 
@@ -139,6 +142,16 @@ mod tests {
         assert_eq!(event(&EmbedEvent::Tool("type")), json!({"type": "tool", "tool": "type"}));
         assert_eq!(event(&EmbedEvent::Rejected("paragraphs")), json!({"type": "rejected", "reason": "paragraphs"}));
         assert_eq!(event(&EmbedEvent::Error("boom".into())), json!({"type": "error", "message": "boom"}));
+        let style = EmbedEvent::StyleChanged {
+            document: "본문".into(),
+            name: "Body".into(),
+            before: json!({"name": "Body"}),
+            after: json!({"name": "Body", "chars": {"size": 13.0}}),
+        };
+        assert_eq!(
+            event(&style),
+            json!({"type": "styleChanged", "document": "본문", "name": "Body", "before": {"name": "Body"}, "after": {"name": "Body", "chars": {"size": 13.0}}})
+        );
     }
 
     #[test]

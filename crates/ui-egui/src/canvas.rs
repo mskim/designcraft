@@ -439,7 +439,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let presenting = app.ui.screen_mode == ScreenMode::Presentation;
     // Scrollbars sit outside the view (right and bottom); rulers and the view share the rest.
     let embedded = app.embed.is_some();
-    let bars = !presenting && !embedded && app.session.active().is_some();
+    let chromeless = app.embed.as_ref().is_some_and(|e| !e.studio());
+    let bars = !presenting && !chromeless && app.session.active().is_some();
     let full = if bars { Rect::from_min_max(outer.min, outer.max - vec2(SCROLLBAR, SCROLLBAR)) } else { outer };
     // Rulers measure the unrotated layout, so they hide while the view is rotated.
     let rulers = app.ui.rulers && !presenting && rot == 0;

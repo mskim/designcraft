@@ -251,7 +251,10 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                 // (Drag-scrolling is touch-only by default, so a mouse drag on the bar moves the window.)
                 egui::ScrollArea::horizontal().id_salt("app_bar_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        if icons::button(ui, "home", home, app.session.active().is_none(), crate::i18n::tr(&app.ui.language, "Home")).clicked() {
+                        // An embed's host keeps the documents: no start screen to go home to.
+                        if app.embed.is_none()
+                            && icons::button(ui, "home", home, app.session.active().is_none(), crate::i18n::tr(&app.ui.language, "Home")).clicked()
+                        {
                             app.session_home();
                         }
                         ui.add_space(6.0);
@@ -681,6 +684,7 @@ pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
     let zoom = app.view().map(|v| v.zoom).unwrap_or(1.0);
     let mut activate = None;
     let mut close = None;
+    let embedded = app.embed.is_some();
     let titles: Vec<(String, bool)> = app.session.documents().iter().map(|d| (d.title(), d.is_dirty())).collect();
     for (i, (title, dirty)) in titles.iter().enumerate() {
         let is_active = Some(i) == active;
@@ -705,23 +709,27 @@ pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
             resp
         };
         ui.painter().rect_filled(r, 0.0, if is_active { t.panel } else { t.tab_strip });
-        let cr = egui::Rect::from_center_size(egui::pos2(r.min.x + 18.0, r.center().y), vec2(14.0, 14.0));
-        let cresp = ui.interact(cr, ui.id().with(("docclose", i)), Sense::click());
-        cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{close_label} {title}")));
-        ui.painter().text(
-            cr.center(),
-            egui::Align2::CENTER_CENTER,
-            "×",
-            egui::FontId::proportional(14.0),
-            if cresp.hovered() { t.text_strong } else { t.text_dim },
-        );
+        // An embed's documents are the host's: their tabs don't close.
+        let cresp = (!embedded).then(|| {
+            let cr = egui::Rect::from_center_size(egui::pos2(r.min.x + 18.0, r.center().y), vec2(14.0, 14.0));
+            let cresp = ui.interact(cr, ui.id().with(("docclose", i)), Sense::click());
+            cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{close_label} {title}")));
+            ui.painter().text(
+                cr.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(14.0),
+                if cresp.hovered() { t.text_strong } else { t.text_dim },
+            );
+            cresp
+        });
         let name_w = galley.size().x;
         // Clipped too, for a window narrower than the zoom label.
         let text = ui.painter().with_clip_rect(r);
         text.galley(egui::pos2(r.min.x + 32.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
         text.galley(egui::pos2(r.min.x + 32.0 + name_w, r.center().y - zoom_label.size().y / 2.0), zoom_label, Color32::WHITE);
         ui.painter().line_segment([r.right_top(), r.right_bottom()], Stroke::new(1.0, t.border));
-        if cresp.clicked() {
+        if cresp.as_ref().is_some_and(egui::Response::clicked) {
             close = Some(i);
         } else if resp.clicked() {
             activate = Some(i);

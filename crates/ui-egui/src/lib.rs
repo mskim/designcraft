@@ -774,11 +774,18 @@ impl DesignApp {
 
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        if self.embed.is_some() {
-            if id == "tool.select" && !params.get("tool").and_then(Value::as_str).is_some_and(embed::tool_allowed) {
+        if let Some(e) = &self.embed {
+            let (tool_ok, command_ok): (fn(&str) -> bool, fn(&str, &Value) -> bool) =
+                if e.studio() { (embed::studio_tool_allowed, embed::studio_command_allowed) } else { (embed::tool_allowed, embed::command_allowed) };
+            if id == "tool.select" && !params.get("tool").and_then(Value::as_str).is_some_and(tool_ok) {
                 return Err("not available here".into());
             }
-            if !embed::command_allowed(id, &params) {
+            if !command_ok(id, &params) {
+                return Err("not available here".into());
+            }
+            // A studio document the host didn't make editable (표지) refuses the style edit before it
+            // commits; the backstop would only undo it.
+            if e.studio() && id == "style.paragraph.edit" && !self.studio_active_editable() {
                 return Err("not available here".into());
             }
         }
@@ -1129,6 +1136,10 @@ impl DesignApp {
     /// Turns this app into an embedded editor for the open document: chrome off, the type and
     /// selection tools only, every frame locked but the labelled movable ones (image:/lead:/table:).
     pub fn embed_begin(&mut self, config: embed::EmbedConfig) {
+        if config.mode == embed::EmbedMode::Studio {
+            self.studio_begin(config);
+            return;
+        }
         self.ui.rulers = false;
         self.ui.frame_edges = false;
         self.ui.guides = false;
@@ -1157,15 +1168,146 @@ impl DesignApp {
         }
     }
 
-    /// Locks every item without a movable label (labelled ones stay unlocked), keeping the
+    /// Studio mode: the full interface over the documents the host opened (tabs, in
+    /// `config.documents`' order), changing paragraph-style definitions only. Every document is
+    /// prepared: every item locked, no history; its styles as loaded are each `styleChanged`'s
+    /// `before`. The chrome a 교정/교열 load hid comes back.
+    fn studio_begin(&mut self, config: embed::EmbedConfig) {
+        if self.embed.as_ref().is_some_and(|e| !e.studio()) {
+            let d = UiState::default();
+            self.ui.rulers = d.rulers;
+            self.ui.frame_edges = d.frame_edges;
+            self.ui.guides = d.guides;
+            self.ui.baseline_grid = d.baseline_grid;
+            self.ui.task_bar = d.task_bar;
+            self.ui.hidden_panels = d.hidden_panels;
+        }
+        let names = config.documents.clone();
+        self.embed = Some(embed::Embed { config, ..Default::default() });
+        self.session.command_filter = Some(embed::studio_command_allowed);
+        let active = self.session.active_index();
+        for i in 0..self.session.documents().len() {
+            self.session.set_active(i);
+            self.embed_lock();
+            let Some(st) = self.session.active_mut() else { continue };
+            // The lock must not be undoable: the document was just opened.
+            st.history.undo.clear();
+            st.history.redo.clear();
+            let (name, editable) = names.get(i).map_or_else(|| (st.title(), false), |c| (c.name.clone(), c.editable));
+            let doc = embed::StudioDoc { name, editable, loaded: embed::paragraph_styles(&st.doc), last: st.doc.clone() };
+            let uid = st.uid;
+            if let Some(e) = self.embed.as_mut() {
+                e.studio.insert(uid, doc);
+            }
+        }
+        if let Some(i) = active {
+            self.session.set_active(i);
+        }
+        self.select_tool("selection");
+        let spread = match canvas::current_spread(self) {
+            Some(designcraft_doc::SpreadRef::Doc(n)) => Some(n),
+            _ => None,
+        };
+        let tool = self.session.tool_id();
+        if let Some(e) = self.embed.as_mut() {
+            e.last_spread = spread;
+            e.last_tool = Some(tool);
+        }
+    }
+
+    /// Whether the active document is a studio document the host made editable.
+    fn studio_active_editable(&self) -> bool {
+        let Some(st) = self.session.active() else { return false };
+        self.embed.as_ref().and_then(|e| e.studio.get(&st.uid)).is_some_and(|d| d.editable)
+    }
+
+    /// Studio mode's change tracker: in the active document (against its own last look, so a tab
+    /// switch compares nothing across documents), a paragraph style whose definition changed is
+    /// reported against its loaded definition; anything else — or any change in a document that
+    /// isn't editable — is undone.
+    fn studio_poll(&mut self) -> Vec<embed::EmbedEvent> {
+        use embed::EmbedEvent as E;
+        let mut events = Vec::new();
+        let Some(st) = self.session.active() else { return events };
+        if st.interaction.is_some() {
+            return events;
+        }
+        let (uid, cur) = (st.uid, st.doc.clone());
+        let Some(sd) = self.embed.as_ref().and_then(|e| e.studio.get(&uid)).cloned() else {
+            // Opened after the host's load: not one of its documents, so nothing in it may change.
+            let doc = embed::StudioDoc { name: st.title(), editable: false, loaded: embed::paragraph_styles(&cur), last: cur };
+            if let Some(e) = self.embed.as_mut() {
+                e.studio.insert(uid, doc);
+            }
+            return events;
+        };
+        let last = sd.last.clone();
+        if !Arc::ptr_eq(&cur, &last) {
+            let restyled = last.styles.paragraph != cur.styles.paragraph;
+            match embed::studio_change(&last, &cur) {
+                Ok(added) if sd.editable || !restyled => {
+                    self.embed_lock_ids(&added);
+                    let (was, now) = (embed::paragraph_styles(&last), embed::paragraph_styles(&cur));
+                    let names: std::collections::BTreeSet<&String> = was.keys().chain(now.keys()).collect();
+                    for name in names.into_iter().filter(|n| was.get(*n) != now.get(*n)) {
+                        events.push(E::StyleChanged {
+                            document: sd.name.clone(),
+                            name: name.clone(),
+                            before: sd.loaded.get(name).cloned().unwrap_or(Value::Null),
+                            after: now.get(name).cloned().unwrap_or(Value::Null),
+                        });
+                    }
+                }
+                _ => {
+                    self.embed_revert(&last);
+                    events.push(E::Rejected("change"));
+                }
+            }
+        }
+        let doc = self.session.active().map(|st| st.doc.clone());
+        if let Some(d) = &doc
+            && d.spreads.len() != last.spreads.len()
+        {
+            events.push(E::Spreads(d.spreads.len()));
+        }
+        self.embed_view_events(&mut events);
+        if let (Some(e), Some(doc)) = (self.embed.as_mut(), doc)
+            && let Some(sd) = e.studio.get_mut(&uid)
+        {
+            sd.last = doc;
+        }
+        events
+    }
+
+    /// The spread and tool events: what the user is looking at and holding, when it changed.
+    fn embed_view_events(&mut self, events: &mut Vec<embed::EmbedEvent>) {
+        let spread = match canvas::current_spread(self) {
+            Some(designcraft_doc::SpreadRef::Doc(n)) => Some(n),
+            _ => None,
+        };
+        let tool = self.session.tool_id();
+        if let Some(e) = self.embed.as_mut() {
+            if spread.is_some() && spread != e.last_spread {
+                e.last_spread = spread;
+                events.extend(spread.map(embed::EmbedEvent::Spread));
+            }
+            if e.last_tool != Some(tool) {
+                e.last_tool = Some(tool);
+                events.push(embed::EmbedEvent::Tool(tool));
+            }
+        }
+    }
+
+    /// Locks every item without a movable label (labelled ones stay unlocked; studio: every item), keeping the
     /// selection and the caret (`object.lock` deselects).
     fn embed_lock(&mut self) {
         let Some(st) = self.session.active() else { return };
+        let all = self.embed.as_ref().is_some_and(embed::Embed::studio);
         let mut lock = Vec::new();
         for spread in &st.doc.spreads {
             for item in &spread.items {
                 item.walk(&mut |i| {
-                    if embed::Kind::of(&i.label).is_none() {
+                    if all || embed::Kind::of(&i.label).is_none() {
                         lock.push(i.id);
                     }
                 });
@@ -1235,6 +1377,9 @@ impl DesignApp {
     /// its own page; any other change is undone (Smart Text Reflow's pages excepted).
     pub fn embed_poll(&mut self, now: f64) -> Vec<embed::EmbedEvent> {
         use embed::EmbedEvent as E;
+        if self.embed.as_ref().is_some_and(embed::Embed::studio) {
+            return self.studio_poll();
+        }
         let mut events = Vec::new();
         let Some(last) = self.embed.as_ref().map(|e| e.last_doc.clone()) else { return events };
         let Some(st) = self.session.active() else { return events };
@@ -1346,7 +1491,12 @@ impl DesignApp {
 
     /// Puts the tool back to the selection tool when something switched it to one an embed doesn't allow.
     pub fn embed_enforce(&mut self) {
-        if self.embed.is_some() && !embed::tool_allowed(self.session.tool_id()) {
+        let allowed = match &self.embed {
+            Some(e) if e.studio() => embed::studio_tool_allowed,
+            Some(_) => embed::tool_allowed,
+            None => return,
+        };
+        if !allowed(self.session.tool_id()) {
             self.session.set_tool("selection");
         }
     }
@@ -1747,7 +1897,9 @@ impl DesignApp {
             eprintln!("root start {:?}", ui.available_rect_before_wrap());
         }
         let embedded = self.embed.is_some();
-        if !presenting && !embedded {
+        // 교정/교열 has no chrome; the studio keeps the app's (but the start screen).
+        let chromeless = self.embed.as_ref().is_some_and(|e| !e.studio());
+        if !presenting && !chromeless {
             chrome::app_bar(self, ui);
             if dbg {
                 eprintln!("after app bar {:?}", ui.available_rect_before_wrap());
@@ -1773,7 +1925,7 @@ impl DesignApp {
                 }
                 return;
             }
-            if !presenting && !embedded {
+            if !presenting && !chromeless {
                 chrome::doc_tabs(self, ui);
             }
             let split_layout = (self.split && !presenting)
@@ -1860,7 +2012,7 @@ impl DesignApp {
             self.switch_pane(self.focus_pane);
         }
         // Tab, Shift+Tab and Presentation hide the floating panels with the docked ones.
-        if !presenting && !embedded && self.ui.hidden_panels == 0 {
+        if !presenting && !chromeless && self.ui.hidden_panels == 0 {
             dock::flyout(self, &ctx);
             dock::floating(self, &ctx);
         }

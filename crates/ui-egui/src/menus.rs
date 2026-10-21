@@ -976,7 +976,13 @@ pub fn run_ui(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, 
 fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     // An embedded editor refuses the app-level ids that would bring chrome, panels or windows back;
     // everything else goes on as usual (the engine's command filter sees the rest).
-    if app.embed.is_some() && !crate::embed::ui_command_allowed(id) {
+    // The studio keeps the view toggles, panels and windows (for looking), not files or dialogs.
+    let allowed = match &app.embed {
+        Some(e) if e.studio() => crate::embed::studio_ui_command_allowed(id),
+        Some(_) => crate::embed::ui_command_allowed(id),
+        None => true,
+    };
+    if !allowed {
         return Some(Err("not available here".into()));
     }
     if is_window_control(id) && !window_control_available(app, id) {
@@ -2684,7 +2690,12 @@ pub fn menu_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
     if crate::i18n::is_rtl(&lang) {
         menus.reverse();
     }
+    // An embed's host opens and keeps the documents: no File menu.
+    let embedded = app.embed.is_some();
     for (menu, entries) in menus {
+        if embedded && menu == "File" {
+            continue;
+        }
         menu_button(ui, crate::rtl::widget(ui, crate::i18n::tr(&lang, menu)), |ui| menu_column(app, ui, &[(menu, entries)]));
     }
 }

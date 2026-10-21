@@ -3702,7 +3702,8 @@ fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Resul
     d.fields.insert("new".into(), json!(false));
     d.fields.insert("name".into(), json!(&style));
     d.fields.insert("rename".into(), json!(&style));
-    if d.fields.contains_key("x.tag") {
+    // The studio changes style definitions only: its filter refuses Export Tagging.
+    if d.fields.contains_key("x.tag") && !app.embed.as_ref().is_some_and(crate::embed::Embed::studio) {
         let tag = d.s("x.tag");
         let tag = if tag == "[Automatic]" { String::new() } else { tag };
         app.run("style.exportTag", json!({"style": style, "tag": tag, "class": d.s("x.class")}))?;

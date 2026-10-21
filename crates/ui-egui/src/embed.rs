@@ -155,6 +155,20 @@ pub fn ui_command_allowed(id: &str) -> bool {
     !["panel.", "window.", "app.", "help."].iter().any(|p| id.starts_with(p))
 }
 
+/// The app-level ids studio mode allows: the view toggles (rulers, guides, frame edges …),
+/// zooming and navigation, panels and windows — for looking, as the full interface has them. App
+/// ids (dialogs, loading styles, saving, opening), help, screen modes and closing the window stay
+/// refused; everything else goes on to the command filter.
+pub fn studio_ui_command_allowed(id: &str) -> bool {
+    if let Some(v) = id.strip_prefix("view.") {
+        return !matches!(v, "screenMode" | "togglePresentation" | "togglePreview" | "rotateSpread");
+    }
+    if let Some(w) = id.strip_prefix("window.") {
+        return !matches!(w, "close" | "newWindow");
+    }
+    !["app.", "help."].iter().any(|p| id.starts_with(p))
+}
+
 /// Which embed: 교정/교열 (correct text, move labelled frames) or the studio (the full interface,
 /// changing paragraph-style definitions only).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,6 +206,24 @@ pub struct Embed {
     pub(crate) last_tool: Option<&'static str>,
     /// The paragraph edit not reported yet.
     pub(crate) pending_text: Option<PendingText>,
+    /// Studio mode: each open document's state, by its uid (stable across tab switches).
+    pub(crate) studio: BTreeMap<u64, StudioDoc>,
+}
+
+impl Embed {
+    pub fn studio(&self) -> bool {
+        self.config.mode == EmbedMode::Studio
+    }
+}
+
+/// One studio document: its name and editability (from the host), its paragraph styles as
+/// loaded (each `styleChanged`'s `before`), and the change tracker's last look at it.
+#[derive(Clone, Debug)]
+pub(crate) struct StudioDoc {
+    pub name: String,
+    pub editable: bool,
+    pub loaded: BTreeMap<String, Value>,
+    pub last: Arc<Document>,
 }
 
 /// A paragraph being corrected, reported when the caret leaves it or after a second's pause.
@@ -478,6 +510,88 @@ pub fn structural_change(last: &Document, cur: &Document) -> Result<Vec<ItemId>,
     Ok(added)
 }
 
+/// An item as studio mode compares it: without its children (compared on their own), and, when
+/// `resized` is given, with that item's geometry (a text frame growing with its restyled text).
+fn bare(i: &Item, resized: Option<&Item>) -> Item {
+    let mut b = i.clone();
+    if let Content::Group { items } = &mut b.content {
+        items.clear();
+    }
+    if let Some(r) = resized {
+        b.xf = r.xf;
+        b.shape = r.shape;
+        b.path = r.path.clone();
+    }
+    b
+}
+
+/// Studio mode's backstop: whether `cur` differs from `last` only as a paragraph-style edit
+/// leaves it. Allowed: the paragraph styles; text frames resized when those changed (auto-size);
+/// Smart Text Reflow's pages and frames of the primary story; stories' frame lists and revisions.
+/// Ok holds the frames reflow added (to lock); Err(()) is any other change — items, stories'
+/// text or formatting, swatches, other styles, settings, anything else in the document (but the
+/// id counter and the modification time).
+#[allow(clippy::result_unit_err)]
+pub fn studio_change(last: &Document, cur: &Document) -> Result<Vec<ItemId>, ()> {
+    let restyled = last.styles.paragraph != cur.styles.paragraph;
+    // Everything but the pages, the stories and the paragraph styles is as it was.
+    let mut probe = last.clone();
+    Arc::make_mut(&mut probe.styles).paragraph = cur.styles.paragraph.clone();
+    probe.spreads = cur.spreads.clone();
+    probe.stories = cur.stories.clone();
+    // Reflow's new frames take ids; the items check below says whether they may.
+    probe.next_id = cur.next_id;
+    probe.modified = cur.modified;
+    if probe != *cur {
+        return Err(());
+    }
+    // The stories: the same ones, the same but for the frames they flow through.
+    if last.stories.len() != cur.stories.len() {
+        return Err(());
+    }
+    for (sid, s) in &cur.stories {
+        let o = last.stories.get(sid).ok_or(())?;
+        if Arc::ptr_eq(o, s) {
+            continue;
+        }
+        let mut n = (**s).clone();
+        n.frames = o.frames.clone();
+        n.rev = o.rev;
+        if n != **o {
+            return Err(());
+        }
+    }
+    let primary = cur.settings.primary_story;
+    let reflow = |i: &Item| primary.is_some() && i.text_frame().map(|t| t.story) == primary;
+    let pages = cur.page_count().cmp(&last.page_count());
+    let (old, new) = (items(last), items(cur));
+    let mut added = Vec::new();
+    for (id, i) in &new {
+        let Some(o) = old.get(id) else {
+            if reflow(i) && pages.is_gt() {
+                added.push(*id);
+                continue;
+            }
+            return Err(());
+        };
+        if o == i {
+            continue;
+        }
+        let resized = (restyled && o.text_frame().is_some() && i.text_frame().is_some()).then_some(*o);
+        if bare(o, None) != bare(i, resized) {
+            return Err(());
+        }
+    }
+    let removed: Vec<_> = old.iter().filter(|(id, _)| !new.contains_key(id)).collect();
+    if removed.iter().any(|(_, o)| !(reflow(o) && pages.is_lt())) {
+        return Err(());
+    }
+    if !pages.is_eq() && added.is_empty() && removed.is_empty() {
+        return Err(());
+    }
+    Ok(added)
+}
+
 /// A labelled frame that moved: where it was and where it is (spread coordinates), and the page
 /// it was on (which it snaps back onto).
 #[derive(Clone, Debug, PartialEq)]
@@ -517,14 +631,32 @@ pub fn frame_moves(last: &Document, cur: &Document) -> Vec<FrameMove> {
 /// What an embedded editor tells its host (embed_protocol turns these into messages).
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmbedEvent {
-    Loaded { spread_count: usize },
+    Loaded {
+        spread_count: usize,
+    },
     Spread(usize),
-    TextEdited { story: String, paragraph: usize, text: String, cell: Option<(usize, usize, usize)> },
-    FrameMoved { label: String, placement: Placement },
+    TextEdited {
+        story: String,
+        paragraph: usize,
+        text: String,
+        cell: Option<(usize, usize, usize)>,
+    },
+    FrameMoved {
+        label: String,
+        placement: Placement,
+    },
     Spreads(usize),
     Tool(&'static str),
     Rejected(&'static str),
     Error(String),
+    /// Studio mode: a paragraph style's stored definition changed in `document` — as loaded
+    /// (`before`) and now (`after`; equal to `before` when undone back; Null for none).
+    StyleChanged {
+        document: String,
+        name: String,
+        before: Value,
+        after: Value,
+    },
 }
 
 #[cfg(test)]
@@ -646,7 +778,9 @@ mod tests {
     fn studio_edits_a_paragraph_style_only_through_the_allow_listed_attributes() {
         use serde_json::json;
         let ok = |p: Value| studio_command_allowed("style.paragraph.edit", &p);
-        assert!(ok(json!({"name": "Body", "chars": {"fontFamily": "Noto Serif KR", "fontStyle": "Bold", "size": 11, "tracking": -10, "fill": "[Black]"}})));
+        assert!(ok(
+            json!({"name": "Body", "chars": {"fontFamily": "Noto Serif KR", "fontStyle": "Bold", "size": 11, "tracking": -10, "fill": "[Black]"}})
+        ));
         assert!(ok(json!({"name": "Body", "para": {"align": "center", "leftIndent": 6, "rightIndent": 6, "firstLineIndent": 10}})));
         assert!(ok(json!({"name": "Body", "chars": {"size": 11}, "para": {"align": "left"}})));
         assert!(ok(json!({"name": "Body"})));
@@ -673,6 +807,38 @@ mod tests {
             Value::Null,
         ] {
             assert!(!ok(p.clone()), "{p}");
+        }
+    }
+
+    #[test]
+    fn studio_ui_allows_view_toggles_panels_and_windows_not_files_screen_modes_or_app() {
+        for id in [
+            "view.rulers",
+            "view.frameEdges",
+            "view.guides",
+            "view.fitSpread",
+            "panel.show",
+            "window.panel",
+            "window.workspace",
+            "window.nextDocument",
+        ] {
+            assert!(studio_ui_command_allowed(id), "{id}");
+        }
+        for id in [
+            "view.screenMode",
+            "view.togglePresentation",
+            "view.togglePreview",
+            "view.rotateSpread",
+            "app.loadParagraphStyles",
+            "app.preferences",
+            "app.openDialog",
+            "app.newDocumentDialog",
+            "app.save",
+            "help.about",
+            "window.close",
+            "window.newWindow",
+        ] {
+            assert!(!studio_ui_command_allowed(id), "{id}");
         }
     }
 
@@ -1015,6 +1181,249 @@ mod tests {
                 app.embed_poll(1.5),
                 vec![EmbedEvent::TextEdited { story: "main".into(), paragraph: 0, text: "칸".into(), cell: Some((0, 1, 0)) }]
             );
+        }
+
+        // ---- studio mode ----
+
+        const STUDIO_DOCS: [(&str, bool); 2] = [("본문", true), ("표지", false)];
+
+        fn studio_config() -> EmbedConfig {
+            EmbedConfig {
+                mode: EmbedMode::Studio,
+                documents: STUDIO_DOCS.iter().map(|(n, e)| DocConfig { name: n.to_string(), editable: *e }).collect(),
+                ..Default::default()
+            }
+        }
+
+        struct Studio {
+            app: DesignApp,
+            /// 본문's primary story, an `image:1` frame, and an auto-sizing Body frame.
+            main: u64,
+            image: u64,
+            auto: u64,
+            /// 표지's frame.
+            cover: u64,
+        }
+
+        /// Two documents as studio tabs, 본문 (editable, active) and 표지 (not editable), each with
+        /// a paragraph style Body (10 pt) its text is in. 본문's primary frame (`story:main`) holds `text`.
+        fn studio_with(text: &str) -> Studio {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({"pages": 1, "primaryTextFrame": true})).unwrap();
+            app.run("style.paragraph.create", json!({"name": "Body", "chars": {"size": 10}})).unwrap();
+            let doc = app.session.active().unwrap().doc.clone();
+            let sid = doc.settings.primary_story.unwrap();
+            let frame = doc.story(sid).unwrap().frames[0];
+            app.run("object.label", json!({"label": "story:main", "ids": [frame.0]})).unwrap();
+            app.run("text.select", json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+            app.run("text.insert", json!({"text": text})).unwrap();
+            app.run("selection.set", json!({"ids": [frame.0]})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Body"})).unwrap();
+            let image = app.run("frame.create", json!({"rect": [40, 500, 200, 600], "content": "graphic"})).unwrap()["id"].as_u64().unwrap();
+            app.run("object.label", json!({"label": "image:1", "ids": [image]})).unwrap();
+            let auto = app.run("frame.create", json!({"rect": [300, 500, 500, 520], "content": "text", "text": "자라는 글상자"})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+            app.run("selection.set", json!({"ids": [auto]})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Body"})).unwrap();
+            app.run("object.textFrameOptions", json!({"ids": [auto], "autoSize": "heightOnly"})).unwrap();
+            app.run("file.new", json!({"pages": 1})).unwrap();
+            app.run("style.paragraph.create", json!({"name": "Body", "chars": {"size": 10}})).unwrap();
+            let cover =
+                app.run("frame.create", json!({"rect": [40, 40, 300, 200], "content": "text", "text": "표지 제목"})).unwrap()["id"].as_u64().unwrap();
+            app.run("selection.set", json!({"ids": [cover]})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Body"})).unwrap();
+            app.run("file.activate", json!({"index": 0})).unwrap();
+            app.embed_begin(studio_config());
+            Studio { app, main: sid.0, image, auto, cover }
+        }
+
+        fn studio() -> Studio {
+            studio_with("첫 문단\n둘째 문단")
+        }
+
+        fn body(app: &DesignApp) -> Value {
+            paragraph_styles(&app.session.active().unwrap().doc)["Body"].clone()
+        }
+
+        fn locked_in(app: &mut DesignApp, index: usize, id: u64) -> bool {
+            let before = app.session.active_index();
+            app.session.set_active(index);
+            let l = locked(app, id);
+            app.session.set_active(before.unwrap());
+            l
+        }
+
+        fn rejected(events: &[EmbedEvent]) -> bool {
+            events.iter().any(|e| matches!(e, EmbedEvent::Rejected(_)))
+        }
+
+        #[test]
+        fn studio_keeps_the_chrome_and_locks_every_item_in_every_document() {
+            let Studio { mut app, image, auto, cover, .. } = studio();
+            let d = crate::UiState::default();
+            assert_eq!((app.ui.rulers, app.ui.frame_edges, app.ui.guides, app.ui.task_bar), (d.rulers, d.frame_edges, d.guides, d.task_bar));
+            assert!(app.ui.rulers && app.ui.frame_edges && app.ui.hidden_panels == 0);
+            assert_eq!(app.session.tool_id(), "selection");
+            let f = app.session.command_filter.unwrap();
+            assert!(!f("text.insert", &json!({"text": "x"})));
+            assert!(f("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 12}})));
+            assert!(locked_in(&mut app, 0, image), "labelled frames are locked too");
+            assert!(locked_in(&mut app, 0, auto));
+            assert!(locked_in(&mut app, 1, cover), "every document's");
+            for st in app.session.documents() {
+                assert!(st.history.undo.is_empty() && st.history.redo.is_empty());
+            }
+            assert_eq!(app.session.active_index(), Some(0), "본문 stays active");
+        }
+
+        #[test]
+        fn studio_brings_back_the_chrome_a_proofread_load_hid() {
+            let (mut app, ..) = embedded();
+            assert!(!app.ui.rulers);
+            app.embed_begin(EmbedConfig { mode: EmbedMode::Studio, ..Default::default() });
+            assert!(app.ui.rulers && app.ui.frame_edges && app.ui.guides && app.ui.task_bar && app.ui.hidden_panels == 0);
+        }
+
+        #[test]
+        fn studio_tools_are_selection_hand_and_zoom_only() {
+            let Studio { mut app, .. } = studio();
+            assert!(refused(app.run("tool.select", json!({"tool": "type"}))));
+            assert!(app.run("tool.select", json!({"tool": "hand"})).is_ok());
+            app.session.set_tool("type");
+            app.embed_enforce();
+            assert_eq!(app.session.tool_id(), "selection");
+        }
+
+        #[test]
+        fn a_style_edit_is_reported_against_the_loaded_definition() {
+            let Studio { mut app, .. } = studio();
+            let loaded = body(&app);
+            app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 13}})).unwrap();
+            let events = app.embed_poll(0.0);
+            let [EmbedEvent::StyleChanged { document, name, before, after }] = events.as_slice() else { panic!("{events:?}") };
+            assert_eq!((document.as_str(), name.as_str()), ("본문", "Body"));
+            assert_eq!(before, &loaded);
+            assert_eq!(after["chars"]["size"], 13.0);
+            assert_eq!(app.embed_poll(0.1), vec![], "reported once");
+            // A second edit keeps the loaded definition as `before`.
+            app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 14}})).unwrap();
+            let events = app.embed_poll(0.2);
+            let [EmbedEvent::StyleChanged { before, after, .. }] = events.as_slice() else { panic!("{events:?}") };
+            assert_eq!(before, &loaded);
+            assert_eq!(after["chars"]["size"], 14.0);
+            // Undoing back to the original reports after == before.
+            app.run("edit.undo", json!({})).unwrap();
+            app.run("edit.undo", json!({})).unwrap();
+            let events = app.embed_poll(0.3);
+            let [EmbedEvent::StyleChanged { before, after, .. }] = events.as_slice() else { panic!("{events:?}") };
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn the_cover_refuses_a_style_edit_before_it_commits() {
+            let Studio { mut app, .. } = studio();
+            app.run("file.activate", json!({"index": 1})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![]);
+            let loaded = body(&app);
+            assert!(refused(app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 13}}))));
+            assert_eq!(body(&app), loaded);
+        }
+
+        #[test]
+        fn a_style_change_in_the_cover_is_undone() {
+            let Studio { mut app, .. } = studio();
+            let main_doc = app.session.active().unwrap().doc.clone();
+            app.run("file.activate", json!({"index": 1})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![]);
+            let loaded = body(&app);
+            app.session.execute_trusted("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 13}})).unwrap();
+            assert_eq!(app.embed_poll(0.1), vec![EmbedEvent::Rejected("change")]);
+            assert_eq!(body(&app), loaded);
+            assert!(Arc::ptr_eq(&app.session.documents()[0].doc, &main_doc), "본문 untouched");
+        }
+
+        #[test]
+        fn typing_is_refused_in_studio() {
+            let Studio { mut app, main, .. } = studio();
+            assert!(refused(app.run("text.select", json!({"story": main, "anchor": 0, "focus": 0}))));
+            assert!(refused(app.run("text.insert", json!({"text": "x"}))));
+            assert!(app.session.execute("text.insert", &json!({"text": "x"})).is_err_and(|e| e.to_string().contains("not available here")));
+        }
+
+        #[test]
+        fn a_frame_move_is_undone_in_studio() {
+            let Studio { mut app, image, .. } = studio();
+            let was = bounds(&app, image);
+            app.session.execute_trusted("object.unlockAll", &json!({})).unwrap();
+            app.session.execute_trusted("transform.move", &json!({"ids": [image], "dx": 30, "dy": 30})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::Rejected("change")]);
+            assert_eq!(bounds(&app, image), was);
+            assert!(locked(&app, image));
+        }
+
+        #[test]
+        fn a_tab_switch_is_not_a_change() {
+            let Studio { mut app, .. } = studio();
+            let (main_doc, cover_doc) = (app.session.documents()[0].doc.clone(), app.session.documents()[1].doc.clone());
+            app.run("file.activate", json!({"index": 1})).unwrap();
+            assert!(!rejected(&app.embed_poll(0.0)));
+            app.run("file.activate", json!({"index": 0})).unwrap();
+            assert!(!rejected(&app.embed_poll(0.1)));
+            assert!(Arc::ptr_eq(&app.session.documents()[0].doc, &main_doc));
+            assert!(Arc::ptr_eq(&app.session.documents()[1].doc, &cover_doc));
+        }
+
+        #[test]
+        fn a_size_edit_that_grows_a_frame_is_kept() {
+            let Studio { mut app, auto, .. } = studio();
+            let was = bounds(&app, auto);
+            app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 40}})).unwrap();
+            let grown = bounds(&app, auto);
+            assert!(grown.y1 - grown.y0 > was.y1 - was.y0 + 1.0, "{was:?} → {grown:?}");
+            let events = app.embed_poll(0.0);
+            assert!(!rejected(&events), "{events:?}");
+            assert!(events.iter().any(|e| matches!(e, EmbedEvent::StyleChanged { .. })), "{events:?}");
+            assert_eq!(bounds(&app, auto), grown);
+        }
+
+        #[test]
+        fn a_size_edit_that_reflows_onto_new_pages_is_kept_and_locked() {
+            let Studio { mut app, main, .. } = studio_with(&"말이 이어지고 지면이 빠르게 찬다. ".repeat(60));
+            let spreads = |app: &DesignApp| app.session.active().unwrap().doc.spreads.len();
+            let n = spreads(&app);
+            app.run("style.paragraph.edit", json!({"name": "Body", "chars": {"size": 36}})).unwrap();
+            let grown = spreads(&app);
+            assert!(grown > n, "{n} → {grown}");
+            let events = app.embed_poll(0.0);
+            assert!(!rejected(&events), "{events:?}");
+            assert!(events.contains(&EmbedEvent::Spreads(grown)), "{events:?}");
+            let doc = app.session.active().unwrap().doc.clone();
+            let frames = &doc.story(designcraft_doc::StoryId(main)).unwrap().frames;
+            assert!(frames.len() > 1 && frames.iter().all(|f| locked(&app, f.0)), "the new frames are locked");
+        }
+
+        #[test]
+        fn a_swatch_or_character_style_change_is_undone() {
+            let Studio { mut app, .. } = studio();
+            let swatches = app.session.active().unwrap().doc.swatches.len();
+            app.session.execute_trusted("swatch.create", &json!({"name": "Brand", "color": "#654321"})).unwrap();
+            assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::Rejected("change")]);
+            assert_eq!(app.session.active().unwrap().doc.swatches.len(), swatches);
+            let chars = app.session.active().unwrap().doc.styles.character.len();
+            app.session.execute_trusted("style.character.create", &json!({"name": "Emphasis", "chars": {"underline": true}})).unwrap();
+            assert_eq!(app.embed_poll(0.1), vec![EmbedEvent::Rejected("change")]);
+            assert_eq!(app.session.active().unwrap().doc.styles.character.len(), chars);
+        }
+
+        #[test]
+        fn studio_ui_allows_view_toggles_but_not_app_or_file_ids() {
+            let Studio { mut app, .. } = studio();
+            assert!(app.run("view.rulers", json!({})).is_ok());
+            assert!(!app.ui.rulers);
+            assert!(refused(app.run("app.loadParagraphStyles", json!({}))));
+            assert!(refused(app.run("file.new", json!({}))));
+            assert!(refused(app.run("view.screenMode", json!({"mode": "preview"}))));
         }
 
         #[test]

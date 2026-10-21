@@ -27,3 +27,6 @@ Since DesignCraft 0.9.0 the PDF writer is craft-pdf, which requires craft-libs' 
 see its README.craft.md and SOURCE.json). This copy is that one with the CMap patch above applied
 on top. When the workspace bumps craft-pdf, re-copy craft-libs' vendor/krilla and re-apply the
 patch to `src/text/cid.rs` and `src/text/type3.rs`.
+
+Re-copied at the v0.11.0 merge from craft-libs 89dcbb3060377a26c99a6d80caa16084366704c4 (its
+vendor/krilla is unchanged since c348732, so the copy is the same apart from the patch).

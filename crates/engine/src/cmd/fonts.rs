@@ -1,5 +1,6 @@
 //! Type › Find/Replace Font: the fonts a document uses (missing ones flagged) and replacing one
-//! font with another everywhere — local formatting and style definitions.
+//! font with another everywhere — local formatting and style definitions. Type › Reload Fonts:
+//! the fonts installed, edited or removed since they were read.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use designcraft_doc::{CharAttrs, Document, Story};
 use designcraft_fonts::FontSource;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, cmd, has_doc, str_param};
+use super::{CommandSpec, always, bad, cmd, has_doc, str_param};
 use crate::{Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -33,6 +34,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{path} — loads the font files (.ttf .otf .ttc .otc) in a folder into the fonts every document can use, for this session (not saved with a document) → {faces: added, files, skipped: [notes]}",
             super::always,
             add_folder
+        ),
+        cmd!(
+            noundo "font.reload",
+            "Reload Fonts",
+            ["Type"],
+            None,
+            "{} — scans the font folders again and reads again the installed font files changed or removed since they were read, then recomposes the open documents → {cataloged, changed: [path]}",
+            always,
+            reload
         ),
     ]
 }
@@ -68,6 +78,18 @@ fn add_folder(_: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(target_arch = "wasm32")]
 fn add_folder(_: &mut Session, _: &Value) -> Result<Value> {
     Err(bad("font.addFolder", "not available in the browser"))
+}
+
+/// Fonts installed, edited or removed while the app runs (#328, #547): the font database reads
+/// them again, then every open document is composed again with what is installed now.
+fn reload(s: &mut Session, _: &Value) -> Result<Value> {
+    let reloaded = designcraft_fonts::FontDb::global().reload_fonts();
+    // A new cache: render jobs still holding the old one can't bring back the old fonts' layout.
+    s.cache = Arc::new(designcraft_compose::Cache::new());
+    for st in &mut s.docs {
+        st.bump_revision();
+    }
+    Ok(json!({"cataloged": reloaded.cataloged, "changed": reloaded.changed}))
 }
 
 /// Every story's text, including table cells and footnotes.
@@ -297,6 +319,22 @@ mod tests {
         assert_eq!((&entry["missing"], &entry["source"]), (&json!(false), &json!("added")), "{l}");
         assert!(s.execute("font.addFolder", &json!({"path": dir.join("nope").to_str().unwrap()})).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reload_fonts_recomposes_open_documents_without_editing_them() {
+        let mut s = Session::new();
+        let r = s.execute("font.reload", &json!({})).unwrap();
+        assert!(r["cataloged"].is_u64() && r["changed"].is_array(), "{r}");
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Some text here."})).unwrap();
+        let (revision, undo) = (s.doc().unwrap().revision, s.doc().unwrap().history.undo.len());
+        let cache = Arc::clone(&s.cache);
+        s.execute("font.reload", &json!({})).unwrap();
+        assert!(!Arc::ptr_eq(&cache, &s.cache), "the layout composed with the old fonts is let go");
+        let st = s.doc().unwrap();
+        assert_ne!(st.revision, revision, "the canvas draws the document again");
+        assert_eq!(st.history.undo.len(), undo, "reloading fonts isn't an edit");
     }
 
     #[test]

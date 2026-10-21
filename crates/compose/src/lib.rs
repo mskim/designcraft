@@ -1738,7 +1738,8 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
                     drop_box = Some(DropCapBox {
                         end: dc.end,
                         baseline: baseline + dc.drop,
-                        rect: Rect::new(at, baseline - asc, at + dc.width, baseline + dc.drop + desc),
+                        // From its line's top, or its own top when it rises above that line.
+                        rect: Rect::new(at, (baseline - asc).min(baseline + dc.drop - dc.cap), at + dc.width, baseline + dc.drop + desc),
                     });
                 }
                 ruby::annotate(db, &mut styles_tab, &story.text, &mut placed, doc.settings.glyph_fallback, f.vertical);
@@ -3898,11 +3899,15 @@ struct DropCap {
     /// Its baseline below the first line's: `lines − 1` leadings of the text after it (grid steps
     /// on a baseline grid), wherever line `lines` is set.
     drop: f64,
+    /// Its cap height as set (how far its top sits above its baseline).
+    cap: f64,
 }
 
 /// Take the drop cap (the glyphs before byte `end`) off the front of a paragraph's glyphs and scale
 /// it so its cap height reaches from the first line's cap height down to line `lines`' baseline,
-/// measured in the leading and cap height of the text after it. A one-line drop cap keeps its own
+/// measured in the leading and cap height of the text after it: the size of a cap set at that text's
+/// size. As in InDesign, a cap set larger (or smaller) is scaled by its size over that text's,
+/// keeping its baseline, so it rises above the first line (or falls short of it). A one-line drop cap keeps its own
 /// size when that is smaller. On a baseline grid of increment `grid`, lines are that many grid
 /// steps apart. With `align_left` its ink starts at the indent (see [`DropCap::lsb`]). Tabs inside
 /// it advance to the stops of `tabs` (stops and the start-side indent; in right-to-left paragraphs
@@ -3930,12 +3935,19 @@ fn split_drop_cap(
     let mut after: Vec<Glyph> = glyphs.drain(..spaces).collect();
     let end = after.last().map_or(end, |g| g.byte.saturating_add(g.len).max(end));
     let body = glyphs.iter().find(|g| g.len > 0 && g.cap > 0.0);
-    let (lead, cap) = body.map_or((base_leading, base_cap), |g| (g.leading, g.cap));
+    let (lead, cap, body_size) = body.map_or((base_leading, base_cap, None), |g| (g.leading, g.cap, Some(g.size)));
     let lead = match grid.map(|inc| (lead / inc - 1e-6).ceil().max(1.0) * inc) {
         Some(pitch) if pitch.is_finite() && pitch > 0.0 => pitch,
         _ => lead,
     };
     let drop = (lines - 1) as f64 * lead;
+    // The cap's tallest glyph sets its height; its point size over the body's scales the fit.
+    let (cap_own, own_size) = dc.iter().fold((0.0, 0.0), |(c, s), g| if g.cap > c { (g.cap, g.size) } else { (c, s) });
+    let own_size = if own_size > 0.0 { own_size } else { dc.iter().filter(|g| g.len > 0).map(|g| g.size).fold(0.0, f64::max) };
+    let ratio = match body_size {
+        Some(b) if b > 0.0 && own_size > 0.0 && (own_size / b).is_finite() => own_size / b,
+        _ => 1.0,
+    };
     // A CJK drop cap (hangul, hanja, kana) has no cap height: its ink runs above the cap line and
     // below the baseline. It's sized by its ink instead, from the ink top of the CJK text after it
     // down to line `lines`' baseline, and raised so its ink bottom sits on that baseline.
@@ -3943,9 +3955,9 @@ fn split_drop_cap(
     let (ink_top, ink_bottom) = if cjk { ink_extent(db, &dc) } else { (0.0, 0.0) };
     let body_top = if cjk { ink_extent(db, glyphs.iter().filter(|g| g.len > 0 && upright_in_vertical(g.ch)).take(16)).0 } else { 0.0 };
     let by_ink = cjk && ink_top + ink_bottom > 0.0 && body_top > 0.0;
-    let own = if by_ink { ink_top + ink_bottom } else { dc.iter().map(|g| g.cap).fold(0.0, f64::max) };
+    let own = if by_ink { ink_top + ink_bottom } else { cap_own };
     let target = drop + if by_ink { body_top } else { cap };
-    let k = if own > 0.0 { target / own } else { 1.0 };
+    let k = if own > 0.0 { target / own * ratio } else { 1.0 };
     let k = if lines == 1 { k.min(1.0) } else { k };
     let k = if k.is_finite() && k > 0.0 { k.min(1000.0) } else { 1.0 };
     let raise = if by_ink { ink_bottom * k } else { 0.0 };
@@ -3990,7 +4002,8 @@ fn split_drop_cap(
     }
     let width = dc.iter().map(|g| g.adv).sum();
     dc.append(&mut after);
-    Some(DropCap { glyphs: dc, end, lines, width, drop, lsb })
+    let cap = dc.iter().map(|g| g.cap).fold(0.0, f64::max);
+    Some(DropCap { glyphs: dc, end, lines, width, drop, lsb, cap })
 }
 
 /// How far `glyphs`' ink reaches above and below the baseline, in points (the highest top and the

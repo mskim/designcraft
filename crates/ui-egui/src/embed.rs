@@ -90,6 +90,60 @@ pub fn command_allowed(id: &str, _params: &Value) -> bool {
     ALLOWED.contains(&id) || !DENIED.iter().any(|p| id.starts_with(p))
 }
 
+/// The tools studio mode may use: selecting, panning and zooming. Nothing on the page is typed or drawn.
+pub const STUDIO_TOOLS: &[&str] = &["selection", "hand", "zoom"];
+
+/// The character attributes a studio may change in a paragraph style (exact camelCase keys).
+pub const STUDIO_CHARS: &[&str] = &["fontFamily", "fontStyle", "size", "tracking", "fill"];
+
+/// The paragraph attributes a studio may change in a paragraph style (exact camelCase keys).
+pub const STUDIO_PARA: &[&str] = &["align", "leftIndent", "rightIndent", "firstLineIndent"];
+
+/// Ids studio mode allows beyond 교정/교열's: switching between its documents' tabs.
+pub const STUDIO_ALLOWED: &[&str] = &["file.activate", "document.list"];
+
+pub fn studio_tool_allowed(id: &str) -> bool {
+    STUDIO_TOOLS.contains(&id)
+}
+
+/// Studio mode's command filter: what 교정/교열 allows that leaves the document as it is (view,
+/// navigation, selection, queries, undo and redo) — no text editing — plus switching documents,
+/// the style queries, and `style.paragraph.edit` that only changes allow-listed attributes.
+pub fn studio_command_allowed(id: &str, params: &Value) -> bool {
+    if id == "style.paragraph.edit" {
+        return studio_style_edit_allowed(params);
+    }
+    if STUDIO_ALLOWED.contains(&id) {
+        return true;
+    }
+    // Not an engine command (an app-level id): command_allowed and ui_command_allowed decide.
+    let spec = designcraft_engine::find_command(id);
+    if id.starts_with("style.") && spec.is_some_and(|c| !c.journal && !c.undoable) {
+        return true; // a query: listing the styles
+    }
+    !id.starts_with("text.") && !spec.is_some_and(|c| c.undoable) && command_allowed(id, params)
+}
+
+/// `style.paragraph.edit` params holding just `name` and `chars` / `para` objects whose keys are
+/// all exactly in [`STUDIO_CHARS`] / [`STUDIO_PARA`]: no rename, basedOn or nextStyle.
+fn studio_style_edit_allowed(params: &Value) -> bool {
+    let Some(p) = params.as_object() else { return false };
+    let only = |v: &Value, keys: &[&str]| v.as_object().is_some_and(|o| o.keys().all(|k| keys.contains(&k.as_str())));
+    p.get("name").is_some_and(Value::is_string)
+        && p.iter().all(|(k, v)| match k.as_str() {
+            "name" => true,
+            "chars" => only(v, STUDIO_CHARS),
+            "para" => only(v, STUDIO_PARA),
+            _ => false,
+        })
+}
+
+/// Each paragraph style's own stored definition (`{name, basedOn?, nextStyle?, para, chars,
+/// shortcut}`), not its resolved values, by name: what the host diffs to see a style change.
+pub fn paragraph_styles(doc: &Document) -> BTreeMap<String, Value> {
+    doc.styles.paragraph.iter().filter_map(|st| Some((st.name.clone(), serde_json::to_value(st).ok()?))).collect()
+}
+
 /// The app-level ids (handled by the UI, never reaching the engine) an embedded editor refuses:
 /// view toggles and screen modes that would bring chrome back, panels, windows, dialogs and help.
 /// Zooming, fitting and going to a page or spread stay.
@@ -101,12 +155,32 @@ pub fn ui_command_allowed(id: &str) -> bool {
     !["panel.", "window.", "app.", "help."].iter().any(|p| id.starts_with(p))
 }
 
-/// What the host gave in `load`: the grid, and each movable frame's vertical position now.
+/// Which embed: 교정/교열 (correct text, move labelled frames) or the studio (the full interface,
+/// changing paragraph-style definitions only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmbedMode {
+    #[default]
+    Proofread,
+    Studio,
+}
+
+/// One document the host opened, as a tab: its name, and whether its styles may change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocConfig {
+    pub name: String,
+    pub editable: bool,
+}
+
+/// What the host gave in `load`: the mode, the grid, each movable frame's vertical position
+/// now, and (studio) the documents it opened.
 #[derive(Clone, Debug, Default)]
 pub struct EmbedConfig {
+    pub mode: EmbedMode,
     pub grid: Option<Grid>,
     /// label → its v ("line" | "top" | "middle" | "bottom"), as the source has it.
     pub frames: std::collections::BTreeMap<String, String>,
+    /// Studio mode: the documents, in the order they were opened.
+    pub documents: Vec<DocConfig>,
 }
 
 /// An embedded editor's state between frames (the change tracker's last look).
@@ -502,6 +576,107 @@ mod tests {
     }
 
     #[test]
+    fn studio_tools_are_selection_hand_and_zoom() {
+        for id in ["selection", "hand", "zoom"] {
+            assert!(studio_tool_allowed(id), "{id}");
+        }
+        for id in ["type", "directSelection", "pen", "rectangleFrame", "page", "gap", ""] {
+            assert!(!studio_tool_allowed(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn studio_allows_view_selection_queries_and_undo_but_not_text_or_objects() {
+        use serde_json::json;
+        let none = json!({});
+        for id in [
+            "edit.undo",
+            "edit.redo",
+            "view.fitSpread",
+            "view.zoomIn",
+            "selection.set",
+            "edit.deselectAll",
+            "document.list",
+            "style.list",
+            "file.openBytes",
+            "file.close",
+            "file.activate",
+            "object.findByLabel",
+            "story.links",
+        ] {
+            assert!(studio_command_allowed(id, &none), "{id}");
+        }
+        for id in [
+            "text.insert",
+            "text.delete",
+            "text.placeCaret",
+            "edit.paste",
+            "edit.cut",
+            "transform.move",
+            "transform.resize",
+            "story.setText",
+            "find.change",
+            "changes.accept",
+            "note.new",
+            "style.paragraph.create",
+            "style.paragraph.delete",
+            "style.paragraph.redefine",
+            "style.paragraph.apply",
+            "style.breakLink",
+            "style.character.create",
+            "style.character.edit",
+            "style.character.apply",
+            "swatch.create",
+            "swatch.new",
+            "type.bold",
+            "object.delete",
+            "frame.create",
+            "page.insert",
+            "layout.overrideParentItems",
+            "layer.new",
+            "file.save",
+            "file.export",
+            "file.new",
+        ] {
+            assert!(!studio_command_allowed(id, &none), "{id}");
+        }
+    }
+
+    #[test]
+    fn studio_edits_a_paragraph_style_only_through_the_allow_listed_attributes() {
+        use serde_json::json;
+        let ok = |p: Value| studio_command_allowed("style.paragraph.edit", &p);
+        assert!(ok(json!({"name": "Body", "chars": {"fontFamily": "Noto Serif KR", "fontStyle": "Bold", "size": 11, "tracking": -10, "fill": "[Black]"}})));
+        assert!(ok(json!({"name": "Body", "para": {"align": "center", "leftIndent": 6, "rightIndent": 6, "firstLineIndent": 10}})));
+        assert!(ok(json!({"name": "Body", "chars": {"size": 11}, "para": {"align": "left"}})));
+        assert!(ok(json!({"name": "Body"})));
+        for p in [
+            json!({"chars": {"size": 11}}),
+            json!({"name": 3, "chars": {"size": 11}}),
+            json!({"name": "Body", "rename": "X"}),
+            json!({"name": "Body", "basedOn": "Other"}),
+            json!({"name": "Body", "basedOn": null}),
+            json!({"name": "Body", "nextStyle": "Other"}),
+            json!({"name": "Body", "chars": {"leading": 18}}),
+            json!({"name": "Body", "chars": {"size": 11, "stroke": "[Black]"}}),
+            json!({"name": "Body", "chars": {"font_family": "X"}}),
+            json!({"name": "Body", "chars": {"FontFamily": "X"}}),
+            json!({"name": "Body", "chars": {"fontfamily": "X"}}),
+            json!({"name": "Body", "para": {"left_indent": 6}}),
+            json!({"name": "Body", "para": {"spaceBefore": 6}}),
+            json!({"name": "Body", "para": {"spaceAfter": 6}}),
+            json!({"name": "Body", "para": {"hyphenate": false}}),
+            json!({"name": "Body", "para": {"keepWithNext": 2}}),
+            json!({"name": "Body", "chars": "size"}),
+            json!({"name": "Body", "para": ["align"]}),
+            json!("Body"),
+            Value::Null,
+        ] {
+            assert!(!ok(p.clone()), "{p}");
+        }
+    }
+
+    #[test]
     fn view_toggles_panels_and_windows_are_refused_navigation_is_not() {
         for id in [
             "view.rulers",
@@ -585,6 +760,26 @@ mod tests {
             app.run("object.label", json!({"label": "image:1", "ids": [image_id]})).unwrap();
             app.embed_begin(EmbedConfig::default());
             (app, body["id"].as_u64().unwrap(), body["story"].as_u64().unwrap(), image_id)
+        }
+
+        #[test]
+        fn paragraph_styles_are_the_stored_definitions_and_diff_by_one_edit() {
+            let mut app = DesignApp::new(Session::new(), Services::default());
+            app.run("file.new", json!({})).unwrap();
+            app.run("style.paragraph.create", json!({"name": "Body", "chars": {"size": 10}})).unwrap();
+            app.run("style.paragraph.create", json!({"name": "Head", "basedOn": "Body", "chars": {"size": 20}})).unwrap();
+            let before = paragraph_styles(&app.session.active().unwrap().doc);
+            assert_eq!(before["Body"]["name"], "Body");
+            assert_eq!(before["Head"]["basedOn"], "Body");
+            assert_eq!(before["Head"]["chars"]["size"], 20.0);
+            // The stored definition, not the resolved one: Head names no font of its own.
+            assert!(before["Head"]["chars"].get("fontFamily").is_none());
+            app.run("style.paragraph.edit", json!({"name": "Body", "para": {"align": "center"}})).unwrap();
+            let after = paragraph_styles(&app.session.active().unwrap().doc);
+            let changed: Vec<&String> = after.keys().filter(|k| before.get(*k) != after.get(*k)).collect();
+            assert_eq!(changed, ["Body"]);
+            assert_eq!(after["Body"]["para"]["align"], "center");
+            assert_eq!(after["Body"]["chars"], before["Body"]["chars"]);
         }
 
         fn locked(app: &DesignApp, id: u64) -> bool {

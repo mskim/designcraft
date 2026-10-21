@@ -28,6 +28,7 @@ pub fn parse(v: &Value) -> Option<HostMessage> {
                     .and_then(Value::as_object)
                     .map(|m| m.iter().map(|(k, f)| (k.clone(), f.get("v").and_then(Value::as_str).unwrap_or("").to_string())).collect())
                     .unwrap_or_default(),
+                ..Default::default()
             },
         }),
         "showSpread" => Some(HostMessage::ShowSpread(v.get("spread")?.as_u64()? as usize)),

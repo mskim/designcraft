@@ -15,6 +15,7 @@ pub mod cursors;
 pub mod dialogs;
 pub mod dock;
 pub mod effects_dialog;
+pub mod embed;
 pub mod i18n;
 pub mod icons;
 pub mod menus;

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<!--
+  A host page for trying ?embed by hand (apps/designcraft-web/EMBED.md).
+
+  Put it in a folder inside the built site, so that ../index.html is the app, e.g.
+    mkdir -p dist/web/harness && cp packaging/web/embed-harness.html dist/web/harness/
+  and the spike's files beside the app (dist/web/spike/chapter.designcraft, dist/web/spike/fonts/).
+  Serve dist/web (python3 -m http.server 8765 -d dist/web) and open
+    http://localhost:8765/harness/embed-harness.html
+
+  Query string (URLs resolve against the app's page, ../index.html):
+    ?doc=spike/chapter.designcraft      the document (default)
+    &font=spike/fonts/A.ttf&font=…      the fonts, repeated (default: the spike's 7)
+    &grid={"columns":6,…}               the grid as JSON (default: none, so frames don't snap)
+    &frames={"lead:6":{"v":"line"}}     the movable frames' v, as JSON (default: none)
+    &spread=0                           the spread to open on
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Embed Harness</title>
+  <style>
+    html, body { margin: 0; height: 100%; font: 13px system-ui, sans-serif; background: #1e1e1e; color: #ddd; }
+    body { display: grid; grid-template-columns: 1fr 360px; grid-template-rows: auto 1fr; }
+    header { grid-column: 1 / 3; display: flex; gap: 6px; align-items: center; padding: 6px 8px; background: #2a2a2a; }
+    header button { font: inherit; padding: 3px 10px; }
+    header .sep { width: 12px; }
+    #spread { min-width: 6em; text-align: center; }
+    iframe { width: 100%; height: 100%; border: 0; display: block; background: #262626; }
+    #log { margin: 0; padding: 6px 8px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+      font: 12px ui-monospace, monospace; border-left: 1px solid #333; }
+    #log .out { color: #8ab4f8; }
+    #log .bad { color: #f28b82; }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="prev" title="Previous spread">&lsaquo;</button>
+    <span id="spread">–</span>
+    <button id="next" title="Next spread">&rsaquo;</button>
+    <span class="sep"></span>
+    <button id="type">Type</button>
+    <button id="selection">Select</button>
+    <span class="sep"></span>
+    <button id="reload" title="Send load again, on the spread in view">Reload</button>
+    <button id="clear">Clear log</button>
+  </header>
+  <iframe id="app" src="../index.html?embed" title="DesignCraft spread editor"></iframe>
+  <pre id="log"></pre>
+  <script>
+    const DEFAULT_FONTS = [
+      "NotoSerifKR-Regular.ttf", "NotoSerifKR-Bold.ttf", "NotoSerifKR-Light.ttf",
+      "NotoSansKR-Regular.ttf", "NotoSansKR-Bold.ttf", "NotoSansKR-Light.ttf",
+      "smShinShinMyungjoP-30.ttf",
+    ].map((f) => "spike/fonts/" + f);
+
+    const query = new URLSearchParams(location.search);
+    const frame = document.getElementById("app");
+    const logEl = document.getElementById("log");
+    let spread = Number(query.get("spread") || 0);
+    let spreadCount = 0;
+
+    function log(text, cls) {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = new Date().toLocaleTimeString() + " " + text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function json(name) {
+      const v = query.get(name);
+      if (!v) return undefined;
+      try { return JSON.parse(v); } catch (e) { log(`?${name} isn't JSON: ${e.message}`, "bad"); return undefined; }
+    }
+
+    function send(message) {
+      log("→ " + JSON.stringify(message), "out");
+      // The editor reads JSON strings, from its own origin only.
+      frame.contentWindow.postMessage(JSON.stringify(message), location.origin);
+    }
+
+    function load() {
+      const message = {
+        type: "load",
+        documentUrl: query.get("doc") || "spike/chapter.designcraft",
+        fontUrls: query.getAll("font").length ? query.getAll("font") : DEFAULT_FONTS,
+        spread,
+      };
+      const grid = json("grid"), frames = json("frames");
+      if (grid) message.grid = grid;
+      if (frames) message.frames = frames;
+      send(message);
+    }
+
+    function showSpread(n) {
+      if (spreadCount) n = Math.max(0, Math.min(spreadCount - 1, n));
+      send({ type: "showSpread", spread: n });
+    }
+
+    function showCount() {
+      document.getElementById("spread").textContent = spreadCount ? `${spread + 1} / ${spreadCount}` : "–";
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.origin !== location.origin || event.source !== frame.contentWindow) {
+        log(`ignored a message from ${event.origin}`, "bad");
+        return;
+      }
+      let message;
+      try { message = JSON.parse(event.data); } catch (e) { log("← (not JSON) " + String(event.data), "bad"); return; }
+      log("← " + JSON.stringify(message), message.type === "error" || message.type === "rejected" ? "bad" : "");
+      switch (message.type) {
+        case "ready": load(); break;
+        case "loaded": spreadCount = message.spreadCount; showCount(); break;
+        case "spreads": spreadCount = message.count; showCount(); break;
+        case "spread": spread = message.spread; showCount(); break;
+      }
+    });
+
+    document.getElementById("prev").onclick = () => showSpread(spread - 1);
+    document.getElementById("next").onclick = () => showSpread(spread + 1);
+    document.getElementById("type").onclick = () => send({ type: "setTool", tool: "type" });
+    document.getElementById("selection").onclick = () => send({ type: "setTool", tool: "selection" });
+    document.getElementById("reload").onclick = load;
+    document.getElementById("clear").onclick = () => { logEl.textContent = ""; };
+  </script>
+</body>
+</html>

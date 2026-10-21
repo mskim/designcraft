@@ -25,6 +25,9 @@ mod web;
 #[cfg(any(target_arch = "wasm32", test))]
 mod graphics;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod embed_protocol;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     web::start();

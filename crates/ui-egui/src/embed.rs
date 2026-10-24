@@ -168,6 +168,14 @@ pub fn studio_command_allowed(id: &str, params: &Value) -> bool {
     }
 }
 
+/// Studio mode without chrome (`chrome: false`, book_write's 디자인수정 that shows only the pages):
+/// [`studio_command_allowed`] but nothing edits a style either — `style.paragraph.edit` is refused,
+/// directly or as a live preview. The host edits the styles itself and lays the pages out again.
+pub fn studio_bare_command_allowed(id: &str, params: &Value) -> bool {
+    let command = if id == "edit.preview" { params.get("command").and_then(Value::as_str).unwrap_or_default() } else { id };
+    command != "style.paragraph.edit" && studio_command_allowed(id, params)
+}
+
 /// `style.paragraph.edit` params holding just `name` and `chars` / `para` objects whose keys are
 /// all exactly in [`STUDIO_CHARS`] / [`STUDIO_PARA`]: no rename, basedOn or nextStyle.
 fn studio_style_edit_allowed(params: &Value) -> bool {
@@ -230,8 +238,8 @@ pub struct DocConfig {
 }
 
 /// What the host gave in `load`: the mode, the grid, each movable frame's vertical position
-/// now, and (studio) the documents it opened.
-#[derive(Clone, Debug, Default)]
+/// now, and (studio) the documents it opened and whether to show the interface.
+#[derive(Clone, Debug)]
 pub struct EmbedConfig {
     pub mode: EmbedMode,
     pub grid: Option<Grid>,
@@ -239,6 +247,15 @@ pub struct EmbedConfig {
     pub frames: std::collections::BTreeMap<String, String>,
     /// Studio mode: the documents, in the order they were opened.
     pub documents: Vec<DocConfig>,
+    /// Studio mode: the full interface (true, the default), or only the pages (false: 교정/교열's
+    /// hidden chrome, no style edits, a click reports the paragraph style under it).
+    pub chrome: bool,
+}
+
+impl Default for EmbedConfig {
+    fn default() -> Self {
+        Self { mode: EmbedMode::default(), grid: None, frames: BTreeMap::new(), documents: Vec::new(), chrome: true }
+    }
 }
 
 /// An embedded editor's state between frames (the change tracker's last look).
@@ -252,11 +269,32 @@ pub struct Embed {
     pub(crate) pending_text: Option<PendingText>,
     /// Studio mode: each open document's state, by its uid (stable across tab switches).
     pub(crate) studio: BTreeMap<u64, StudioDoc>,
+    /// Events raised outside the poll (a paragraph picked by a click), sent with the next one.
+    pub(crate) outbox: Vec<EmbedEvent>,
 }
 
 impl Embed {
     pub fn studio(&self) -> bool {
         self.config.mode == EmbedMode::Studio
+    }
+
+    /// Studio mode without its interface (`chrome: false`): only the pages.
+    pub fn studio_bare(&self) -> bool {
+        self.studio() && !self.config.chrome
+    }
+
+    /// No chrome: 교정/교열, or a studio loaded with `chrome: false`.
+    pub fn chromeless(&self) -> bool {
+        !self.studio() || !self.config.chrome
+    }
+
+    /// The engine's command filter for this embed.
+    pub fn command_filter(&self) -> fn(&str, &Value) -> bool {
+        match (self.studio(), self.config.chrome) {
+            (false, _) => command_allowed,
+            (true, true) => studio_command_allowed,
+            (true, false) => studio_bare_command_allowed,
+        }
     }
 }
 
@@ -700,6 +738,12 @@ pub enum EmbedEvent {
         name: String,
         before: Value,
         after: Value,
+    },
+    /// Studio mode without chrome: a click picked the paragraph under it in `document`; `name`
+    /// is its paragraph style (None: no text there).
+    ParagraphSelected {
+        document: String,
+        name: Option<String>,
     },
 }
 
@@ -1716,6 +1760,161 @@ mod tests {
             let _ = app.session.pointer(&PointerEvent::new(PointerKind::Up, x + 120.0, y + 90.0), v);
             assert_eq!(count(&app), before);
             assert!(app.session.active().unwrap().interaction.is_none());
+        }
+
+        // ---- studio without chrome (`chrome: false`) ----
+
+        fn bare_config() -> EmbedConfig {
+            EmbedConfig { chrome: false, ..studio_config() }
+        }
+
+        /// A studio without chrome over one document, 본문: its primary frame holds "첫 문단" in
+        /// Body and "둘째 문단" in Lead; a frame holds just a 1 × 1 table whose cell's "칸" is in
+        /// Cell; the parent page's running head "머리글" (Head) shows above the primary frame.
+        /// Returns (app, the primary frame, the table's frame, the head's frame).
+        fn bare_studio() -> (DesignApp, u64, u64, u64) {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({"pages": 1, "primaryTextFrame": true})).unwrap();
+            for name in ["Body", "Lead", "Cell", "Head"] {
+                app.run("style.paragraph.create", json!({"name": name, "chars": {"size": 10}})).unwrap();
+            }
+            let doc = app.session.active().unwrap().doc.clone();
+            let sid = doc.settings.primary_story.unwrap();
+            let frame = doc.story(sid).unwrap().frames[0];
+            app.run("text.select", json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+            app.run("text.insert", json!({"text": "첫 문단\n둘째 문단"})).unwrap();
+            app.run("text.select", json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Body"})).unwrap();
+            let end = "첫 문단\n둘째 문단".len();
+            app.run("text.select", json!({"story": sid.0, "anchor": end, "focus": end})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Lead"})).unwrap();
+            // The table, alone in its frame (below the primary frame's text, over its empty part).
+            let b = bounds(&app, frame.0);
+            let table = app.run("frame.create", json!({"rect": [b.x0, b.y1 - 120.0, b.x0 + 200.0, b.y1 - 20.0], "content": "text"})).unwrap();
+            let tsid = table["story"].as_u64().unwrap();
+            app.run("text.select", json!({"story": tsid, "anchor": 0, "focus": 0})).unwrap();
+            app.run("table.insert", json!({"rows": 1, "cols": 1})).unwrap();
+            let doc = app.session.active().unwrap().doc.clone();
+            let (&tid, _) = doc.story(designcraft_doc::StoryId(tsid)).unwrap().tables.iter().next().unwrap();
+            let cell = designcraft_doc::CellAddr { table: tid, row: 0, col: 0 };
+            let sel = designcraft_doc::TextSel { story: designcraft_doc::StoryId(tsid), anchor: 0, focus: 0, frame: None, cell: Some(cell) };
+            app.session.active_mut().unwrap().selection.text = Some(sel);
+            app.run("text.insert", json!({"text": "칸"})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Cell"})).unwrap();
+            // The running head, on the parent page document page 1 shows.
+            let px = doc.parents[0].pages.last().unwrap().x;
+            let head = app
+                .run("frame.create", json!({"spread": {"kind": "parent", "index": 0}, "rect": [px + b.x0 - doc.spreads[0].pages[0].x, b.y0 - 30.0, px + b.x0 - doc.spreads[0].pages[0].x + 200.0, b.y0 - 6.0], "content": "text", "text": "머리글"}))
+                .unwrap();
+            app.run("text.select", json!({"story": head["story"], "anchor": 0, "focus": 0})).unwrap();
+            app.run("style.paragraph.apply", json!({"name": "Head"})).unwrap();
+            app.run("selection.set", json!({"ids": []})).unwrap();
+            app.embed_begin(bare_config());
+            (app, frame.0, table["id"].as_u64().unwrap(), head["id"].as_u64().unwrap())
+        }
+
+        /// The canvas point of a point on 본문's first spread.
+        fn on_canvas(app: &DesignApp, x: f64, y: f64) -> designcraft_geom::Point {
+            let d = &app.session.active().unwrap().doc;
+            CanvasLayout::new(d, false).xf(SpreadRef::Doc(0)) * designcraft_geom::Point::new(x, y)
+        }
+
+        #[test]
+        fn a_click_in_body_text_names_its_paragraphs_style_though_every_item_is_locked() {
+            let (app, frame, ..) = bare_studio();
+            assert!(locked(&app, frame));
+            let b = bounds(&app, frame);
+            assert_eq!(app.embed_paragraph_at(on_canvas(&app, b.x0 + 4.0, b.y0 + 4.0)).as_deref(), Some("Body"));
+            // Past the text's end, in the same frame: the last paragraph.
+            assert_eq!(app.embed_paragraph_at(on_canvas(&app, b.x1 - 4.0, b.y0 + 200.0)).as_deref(), Some("Lead"));
+        }
+
+        #[test]
+        fn a_click_in_a_table_cell_names_the_cells_paragraph_style() {
+            let (app, _, table, _) = bare_studio();
+            let t = bounds(&app, table);
+            assert_eq!(app.embed_paragraph_at(on_canvas(&app, t.x0 + 6.0, t.y0 + 4.0)).as_deref(), Some("Cell"));
+        }
+
+        #[test]
+        fn a_click_on_a_running_head_from_the_parent_page_names_its_style() {
+            let (app, frame, _, head) = bare_studio();
+            let doc = app.session.active().unwrap().doc.clone();
+            assert!(doc.spreads[0].items.iter().all(|i| i.id.0 != head), "the head is the parent page's");
+            let b = bounds(&app, frame);
+            assert_eq!(app.embed_paragraph_at(on_canvas(&app, b.x0 + 6.0, b.y0 - 18.0)).as_deref(), Some("Head"));
+        }
+
+        #[test]
+        fn a_click_where_there_is_no_text_names_nothing() {
+            let (app, frame, ..) = bare_studio();
+            let b = bounds(&app, frame);
+            assert_eq!(app.embed_paragraph_at(on_canvas(&app, b.x1 + 400.0, b.y0 + 4.0)), None);
+        }
+
+        #[test]
+        fn a_pick_reports_paragraph_selected_and_changes_nothing() {
+            let (mut app, frame, ..) = bare_studio();
+            let _ = app.embed_poll(0.0);
+            let (doc, sel) = {
+                let st = app.session.active().unwrap();
+                (st.doc.clone(), st.selection.clone())
+            };
+            let b = bounds(&app, frame);
+            app.embed_pick_paragraph(on_canvas(&app, b.x0 + 4.0, b.y0 + 4.0));
+            app.embed_pick_paragraph(on_canvas(&app, b.x1 + 400.0, b.y0));
+            assert_eq!(
+                app.embed_poll(0.0),
+                vec![
+                    EmbedEvent::ParagraphSelected { document: "본문".into(), name: Some("Body".into()) },
+                    EmbedEvent::ParagraphSelected { document: "본문".into(), name: None },
+                ]
+            );
+            let st = app.session.active().unwrap();
+            assert!(Arc::ptr_eq(&st.doc, &doc) && st.selection == sel);
+            assert_eq!(app.embed_poll(0.0), vec![], "sent once");
+        }
+
+        #[test]
+        fn with_chrome_a_pick_reports_nothing() {
+            let Studio { mut app, .. } = studio();
+            let _ = app.embed_poll(0.0);
+            app.embed_pick_paragraph(on_canvas(&app, 60.0, 60.0));
+            assert_eq!(app.embed_poll(0.0), vec![]);
+        }
+
+        #[test]
+        fn without_chrome_the_studio_keeps_the_chrome_hidden_and_refuses_bringing_it_back() {
+            let (mut app, ..) = embedded();
+            let Studio { app: mut studio_app, .. } = studio();
+            let docs = served(&mut studio_app);
+            app.studio_load(&docs, bare_config()).unwrap();
+            assert!(app.embed.as_ref().is_some_and(Embed::studio_bare));
+            assert!(!app.ui.rulers && !app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
+            assert_eq!(app.ui.hidden_panels, 1);
+            for id in ["view.rulers", "view.frameEdges", "panel.show", "window.panel"] {
+                assert!(refused(app.run(id, json!({}))), "{id}");
+            }
+            assert!(!app.ui.rulers && app.ui.hidden_panels == 1);
+            app.run("view.fitSpread", json!({})).unwrap();
+            assert_eq!(app.session.tool_id(), "selection");
+            assert!(app.run("tool.select", json!({"tool": "hand"})).is_ok());
+            assert!(refused(app.run("tool.select", json!({"tool": "type"}))));
+            // A load with the chrome brings it back.
+            app.studio_load(&docs, studio_config()).unwrap();
+            assert!(app.ui.rulers && app.ui.hidden_panels == 0);
+        }
+
+        #[test]
+        fn without_chrome_no_style_is_edited_not_even_as_a_preview() {
+            let (mut app, ..) = bare_studio();
+            let edit = json!({"name": "Body", "chars": {"size": 12}});
+            assert!(refused(app.run("style.paragraph.edit", edit.clone())));
+            assert!(refused(app.run("edit.preview", json!({"label": "x", "command": "style.paragraph.edit", "params": edit}))));
+            let f = app.session.command_filter.unwrap();
+            assert!(!f("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 12}})));
+            assert!(f("font.list", &json!({})), "queries still run");
+            assert!(!app.session.active().unwrap().is_dirty());
         }
     }
 }

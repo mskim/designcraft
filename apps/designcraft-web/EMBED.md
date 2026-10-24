@@ -111,7 +111,8 @@ over several documents, as tabs, where only paragraph-style definitions may chan
   documents: [{ name: "본문", url: "/…/body.designcraft", editable: true },
               { name: "표지", url: "/…/cover.designcraft", editable: false }],
   fontUrls: [ … ],                                     // as above
-  spread: 0 }                                          // in the first document
+  spread: 0,                                           // in the first document
+  chrome: true }                                       // default true; false: only the pages (below)
 ```
 
 - **`documents`** are opened in order, one tab each, and the first is made active. `url` is
@@ -142,6 +143,12 @@ over several documents, as tabs, where only paragraph-style definitions may chan
   the host diffs them against the design it rendered.
 - `spread`, `spreads`, `tool`, `rejected` and `error` are sent as in 교정/교열, for the active
   tab; `textEdited` and `frameMoved` are not.
+- **`paragraphSelected`** (only with `chrome: false`, below) names the paragraph style under a
+  click:
+
+  ```js
+  { type: "paragraphSelected", document: "본문", name: "Body" }   // name: null where there's no text
+  ```
 
 ### What studio allows
 
@@ -172,6 +179,31 @@ over several documents, as tabs, where only paragraph-style definitions may chan
 - **Fonts not loaded:** changing `fontFamily` to a family the host didn't send in `fontUrls`
   isn't handled yet — the edit is accepted and reported, and the text shows in a fallback face.
   Send every font the studio offers.
+
+### Without chrome (`chrome: false`)
+
+book_write's 디자인수정 shows only the pages and edits the styles in its own settings column.
+`load` with `mode: "studio"` and `chrome: false` opens the documents as above, but:
+
+- **No chrome,** as in 교정/교열: menus, panels, document tabs, the task bar, rulers, guides, frame
+  edges, the baseline grid, scrollbars and the context menu stay off (also after a load that
+  follows one with the chrome), and the app-level filter is 교정/교열's (`ui_command_allowed`):
+  panel, window, app and help ids and the view toggles that bring chrome back are refused;
+  zooming, fitting and going to a page or spread stay. A later `load` without `chrome: false`
+  brings the chrome back.
+- **No style edits:** `style.paragraph.edit` is refused too, directly or as a live preview
+  (`studio_bare_command_allowed`), so no `styleChanged` is sent. The host edits the style
+  itself, lays the pages out again and sends `load` again.
+- **Three tools,** as in studio: selection, hand and zoom. The first document is the one shown
+  (there are no tabs to switch).
+- **Picking a paragraph:** a primary click on the page with the selection tool sends
+  `paragraphSelected` with the active document's `name` and the paragraph style of the text
+  under the pointer, or `name: null` where there's no text. Every item is locked, so the hit test
+  is the embed's own (`DesignApp::embed_paragraph_at`, `Session::paragraph_at`): the frontmost
+  text frame under the pointer whatever the locks (inside groups, past objects without text),
+  else a text frame of the parent page showing there (running heads, folios), then the character
+  there → its paragraph (in a table cell or footnote when it's in one) → its style. The click
+  changes nothing: not the document, not the selection.
 
 ## Fonts
 

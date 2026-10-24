@@ -6,10 +6,20 @@ use serde_json::{Value, json};
 #[derive(Debug)]
 pub enum HostMessage {
     /// 교정/교열: one document.
-    Load { document_url: String, font_urls: Vec<String>, spread: usize, config: EmbedConfig },
+    Load {
+        document_url: String,
+        font_urls: Vec<String>,
+        spread: usize,
+        config: EmbedConfig,
+    },
     /// Studio: the documents' URLs, in tab order; `config.documents` has their names and
     /// editability in the same order.
-    LoadStudio { document_urls: Vec<String>, font_urls: Vec<String>, spread: usize, config: EmbedConfig },
+    LoadStudio {
+        document_urls: Vec<String>,
+        font_urls: Vec<String>,
+        spread: usize,
+        config: EmbedConfig,
+    },
     ShowSpread(usize),
     SetTool(String),
 }
@@ -30,11 +40,8 @@ fn parse_load(v: &Value) -> Option<HostMessage> {
         Some("studio") => EmbedMode::Studio,
         Some(_) => return None,
     };
-    let font_urls = v
-        .get("fontUrls")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let font_urls =
+        v.get("fontUrls").and_then(Value::as_array).map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect()).unwrap_or_default();
     let spread = v.get("spread").and_then(Value::as_u64).unwrap_or(0) as usize;
     let config = EmbedConfig {
         mode,
@@ -71,7 +78,8 @@ fn parse_load(v: &Value) -> Option<HostMessage> {
         return None;
     }
     let (document_urls, docs): (Vec<String>, Vec<DocConfig>) = documents.into_iter().unzip();
-    Some(HostMessage::LoadStudio { document_urls, font_urls, spread, config: EmbedConfig { documents: docs, ..config } })
+    let chrome = v.get("chrome").and_then(Value::as_bool).unwrap_or(true);
+    Some(HostMessage::LoadStudio { document_urls, font_urls, spread, config: EmbedConfig { documents: docs, chrome, ..config } })
 }
 
 /// A document's name from its URL: the file's name without query, fragment or extension
@@ -142,6 +150,7 @@ pub fn event(e: &EmbedEvent) -> Value {
         EmbedEvent::StyleChanged { document, name, before, after } => {
             json!({"type": "styleChanged", "document": document, "name": name, "before": before, "after": after})
         }
+        EmbedEvent::ParagraphSelected { document, name } => json!({"type": "paragraphSelected", "document": document, "name": name}),
     }
 }
 
@@ -247,6 +256,31 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_selected_names_the_style_or_null() {
+        let picked = EmbedEvent::ParagraphSelected { document: "본문".into(), name: Some("Body".into()) };
+        assert_eq!(event(&picked), json!({"type": "paragraphSelected", "document": "본문", "name": "Body"}));
+        let none = EmbedEvent::ParagraphSelected { document: "본문".into(), name: None };
+        assert_eq!(event(&none), json!({"type": "paragraphSelected", "document": "본문", "name": null}));
+    }
+
+    #[test]
+    fn a_studio_load_shows_the_chrome_unless_told_not_to() {
+        let chrome = |extra: Value| {
+            let mut m = json!({"type": "load", "mode": "studio", "documentUrl": "/b.designcraft"});
+            if let (Some(o), Some(e)) = (m.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            match parse(&m) {
+                Some(HostMessage::LoadStudio { config, .. }) => Some(config.chrome),
+                _ => None,
+            }
+        };
+        assert_eq!(chrome(json!({})), Some(true));
+        assert_eq!(chrome(json!({"chrome": true})), Some(true));
+        assert_eq!(chrome(json!({"chrome": false})), Some(false));
+    }
+
+    #[test]
     fn text_edited_with_and_without_a_cell() {
         let main = EmbedEvent::TextEdited { story: "main".into(), paragraph: 4, text: "고친 문단".into(), cell: None };
         assert_eq!(event(&main), json!({"type": "textEdited", "story": "main", "paragraph": 4, "text": "고친 문단"}));
@@ -273,10 +307,7 @@ mod tests {
         assert_eq!(font_urls, vec!["/f/a.ttf".to_string()]);
         assert_eq!(spread, 1);
         assert_eq!(config.mode, EmbedMode::Studio);
-        assert_eq!(
-            config.documents,
-            vec![DocConfig { name: "본문".into(), editable: true }, DocConfig { name: "표지".into(), editable: false }]
-        );
+        assert_eq!(config.documents, vec![DocConfig { name: "본문".into(), editable: true }, DocConfig { name: "표지".into(), editable: false }]);
     }
 
     #[test]

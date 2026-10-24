@@ -439,7 +439,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let presenting = app.ui.screen_mode == ScreenMode::Presentation;
     // Scrollbars sit outside the view (right and bottom); rulers and the view share the rest.
     let embedded = app.embed.is_some();
-    let chromeless = app.embed.as_ref().is_some_and(|e| !e.studio());
+    let chromeless = app.embed.as_ref().is_some_and(crate::embed::Embed::chromeless);
     let bars = !presenting && !chromeless && app.session.active().is_some();
     let full = if bars { Rect::from_min_max(outer.min, outer.max - vec2(SCROLLBAR, SCROLLBAR)) } else { outer };
     // Rulers measure the unrotated layout, so they hide while the view is rotated.
@@ -2451,6 +2451,17 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
         }
     }
     app.after_engine();
+    // A studio without chrome: a click with the selection tool picks the paragraph under it (every
+    // item is locked, so the tool itself found nothing) and tells the host its style.
+    if resp.clicked_by(egui::PointerButton::Primary)
+        && !space
+        && !menu_open
+        && app.session.tool_id() == "selection"
+        && app.embed.as_ref().is_some_and(crate::embed::Embed::studio_bare)
+        && let Some(o) = resp.interact_pointer_pos().filter(|o| in_view(*o))
+    {
+        app.embed_pick_paragraph(xf.to_canvas(o));
+    }
     // Right-click: tools only see the primary button, so it starts no gesture; it opens the menu.
     if resp.secondary_clicked()
         && !down

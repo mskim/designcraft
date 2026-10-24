@@ -780,8 +780,8 @@ impl DesignApp {
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if let Some(e) = &self.embed {
-            let (tool_ok, command_ok): (fn(&str) -> bool, fn(&str, &Value) -> bool) =
-                if e.studio() { (embed::studio_tool_allowed, embed::studio_command_allowed) } else { (embed::tool_allowed, embed::command_allowed) };
+            let tool_ok: fn(&str) -> bool = if e.studio() { embed::studio_tool_allowed } else { embed::tool_allowed };
+            let command_ok = e.command_filter();
             if id == "tool.select" && !params.get("tool").and_then(Value::as_str).is_some_and(tool_ok) {
                 return Err("not available here".into());
             }
@@ -1155,12 +1155,7 @@ impl DesignApp {
             self.studio_begin(config);
             return;
         }
-        self.ui.rulers = false;
-        self.ui.frame_edges = false;
-        self.ui.guides = false;
-        self.ui.baseline_grid = false;
-        self.ui.task_bar = false;
-        self.ui.hidden_panels = 1;
+        self.hide_chrome();
         self.embed = Some(embed::Embed { config, ..Default::default() });
         self.session.command_filter = Some(embed::command_allowed);
         self.embed_lock();
@@ -1186,9 +1181,12 @@ impl DesignApp {
     /// Studio mode: the full interface over the documents the host opened (tabs, in
     /// `config.documents`' order), changing paragraph-style definitions only. Every document is
     /// prepared: every item locked, no history; its styles as loaded are each `styleChanged`'s
-    /// `before`. The chrome a 교정/교열 load hid comes back.
+    /// `before`. The chrome a 교정/교열 load hid comes back — unless the host sent `chrome: false`:
+    /// then it's hidden as 교정/교열 hides it, and no style edits.
     fn studio_begin(&mut self, config: embed::EmbedConfig) {
-        if self.embed.as_ref().is_some_and(|e| !e.studio()) {
+        if !config.chrome {
+            self.hide_chrome();
+        } else if self.embed.as_ref().is_some_and(|e| !e.studio() || !e.config.chrome) {
             let d = UiState::default();
             self.ui.rulers = d.rulers;
             self.ui.frame_edges = d.frame_edges;
@@ -1198,8 +1196,9 @@ impl DesignApp {
             self.ui.hidden_panels = d.hidden_panels;
         }
         let names = config.documents.clone();
-        self.embed = Some(embed::Embed { config, ..Default::default() });
-        self.session.command_filter = Some(embed::studio_command_allowed);
+        let embed = embed::Embed { config, ..Default::default() };
+        self.session.command_filter = Some(embed.command_filter());
+        self.embed = Some(embed);
         let active = self.session.active_index();
         for i in 0..self.session.documents().len() {
             self.session.set_active(i);
@@ -1229,6 +1228,40 @@ impl DesignApp {
         if let Some(e) = self.embed.as_mut() {
             e.last_spread = spread;
             e.last_tool = Some(tool);
+        }
+    }
+
+    /// An embed's hidden chrome: no rulers, frame edges, guides, baseline grid, task bar or panels.
+    fn hide_chrome(&mut self) {
+        self.ui.rulers = false;
+        self.ui.frame_edges = false;
+        self.ui.guides = false;
+        self.ui.baseline_grid = false;
+        self.ui.task_bar = false;
+        self.ui.hidden_panels = 1;
+    }
+
+    /// Studio mode without chrome: the paragraph style of the text under canvas point `p` in the
+    /// active document, whatever the locks (studio locks every item, so the selection tool finds
+    /// nothing): body text, a table cell, a running head or folio on the parent page. None where
+    /// there's no text. Changes nothing.
+    pub fn embed_paragraph_at(&self, p: designcraft_geom::Point) -> Option<String> {
+        let zoom = self.view().map_or(1.0, |v| v.zoom).max(1e-6);
+        self.session.paragraph_at(p, 4.0 / zoom).map(|h| h.style).filter(|s| !s.is_empty())
+    }
+
+    /// A primary click on the canvas of a studio without chrome: reports the paragraph style under
+    /// `p` (a canvas point) as `paragraphSelected`, with the next poll.
+    pub fn embed_pick_paragraph(&mut self, p: designcraft_geom::Point) {
+        if !self.embed.as_ref().is_some_and(embed::Embed::studio_bare) {
+            return;
+        }
+        let name = self.embed_paragraph_at(p);
+        let Some(uid) = self.session.active().map(|st| st.uid) else { return };
+        let title = self.session.active().map(|st| st.title()).unwrap_or_default();
+        if let Some(e) = self.embed.as_mut() {
+            let document = e.studio.get(&uid).map_or(title, |d| d.name.clone());
+            e.outbox.push(embed::EmbedEvent::ParagraphSelected { document, name });
         }
     }
 
@@ -1286,7 +1319,7 @@ impl DesignApp {
     /// isn't editable — is undone.
     fn studio_poll(&mut self) -> Vec<embed::EmbedEvent> {
         use embed::EmbedEvent as E;
-        let mut events = Vec::new();
+        let mut events = self.embed.as_mut().map(|e| std::mem::take(&mut e.outbox)).unwrap_or_default();
         let Some(st) = self.session.active() else { return events };
         if st.interaction.is_some() {
             return events;
@@ -1958,7 +1991,7 @@ impl DesignApp {
         }
         let embedded = self.embed.is_some();
         // 교정/교열 has no chrome; the studio keeps the app's (but the start screen).
-        let chromeless = self.embed.as_ref().is_some_and(|e| !e.studio());
+        let chromeless = self.embed.as_ref().is_some_and(embed::Embed::chromeless);
         if !presenting && !chromeless {
             chrome::app_bar(self, ui);
             if dbg {

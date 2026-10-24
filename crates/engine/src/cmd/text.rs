@@ -2,7 +2,7 @@
 
 use designcraft_compose as compose;
 use designcraft_doc::story::floor_char_boundary;
-use designcraft_doc::{CellAddr, CharAttrs, Content, ItemId, ParaAttrs, Selection, StoryId, TextSel};
+use designcraft_doc::{CellAddr, CharAttrs, Content, ItemId, ParaAttrs, Selection, SpreadRef, StoryId, TextSel};
 use designcraft_geom::Point;
 use serde_json::{Value, json};
 
@@ -480,12 +480,26 @@ fn hit_byte_with(
     hit: fn(&compose::ComposedStory, usize, Point) -> Option<usize>,
 ) -> Option<(StoryId, usize, Option<CellAddr>)> {
     let st = s.active()?;
-    let loc = st.doc.find(frame)?;
-    let it = st.doc.item_at(&loc)?;
+    hit_byte_in(&st.doc, &s.cache, frame, pt, None, hit)
+}
+
+/// [`hit_byte_with`] in `doc`: `pt` is in the space of the spread holding `frame` (a parent
+/// spread's for a parent item), and `page` the document page a parent item is shown on (its
+/// page numbers are that page's), None for an item of the page itself.
+fn hit_byte_in(
+    doc: &designcraft_doc::Document,
+    cache: &compose::Cache,
+    frame: ItemId,
+    pt: Point,
+    page: Option<usize>,
+    hit: fn(&compose::ComposedStory, usize, Point) -> Option<usize>,
+) -> Option<(StoryId, usize, Option<CellAddr>)> {
+    let loc = doc.find(frame)?;
+    let it = doc.item_at(&loc)?;
     let sid = it.text_frame()?.story;
-    let xf = st.doc.parent_xf(&loc) * st.doc.text_xf(it);
+    let xf = doc.parent_xf(&loc) * doc.text_xf(it);
     let inner = xf.inverse() * pt;
-    let cs = s.cache.get(&st.doc, sid, None);
+    let cs = cache.get(doc, sid, page);
     let fi = cs.frames.iter().position(|f| f.frame == frame)?;
     // Map path-text hits along the curve before choosing the character unit.
     let inner = cs.frames.get(fi).and_then(|ft| compose::PathTextMap::new(it, ft)).map_or(inner, |m| m.to_line(inner));
@@ -497,6 +511,89 @@ fn hit_byte_with(
     }
     let b = hit(&cs, fi, inner).unwrap_or(0);
     Some((sid, b, None))
+}
+
+/// The paragraph under a point: its story, the table cell or footnote it's in, its index there,
+/// and its paragraph style's name. [`Session::paragraph_at`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParagraphAt {
+    pub story: StoryId,
+    pub cell: Option<CellAddr>,
+    pub paragraph: usize,
+    pub style: String,
+}
+
+impl Session {
+    /// The paragraph under canvas point `p` in the active document (as the canvas lays it out),
+    /// **whatever the locks**: the frontmost text frame there (inside groups too, and behind
+    /// objects that hold no text), else a text frame of the parent page showing on that page
+    /// (a running head, a folio); then the character there, in a table cell or footnote if it's
+    /// in one. `tol` is the hit tolerance in points. Nothing changes: not the document, not the
+    /// selection. An embedded studio uses it to pick a paragraph style where every item is
+    /// locked and the selection tool's hit test finds nothing.
+    pub fn paragraph_at(&self, p: Point, tol: f64) -> Option<ParagraphAt> {
+        let st = self.active()?;
+        let doc = &st.doc;
+        let layout = designcraft_tools::CanvasLayout::new(doc, st.editing_parents);
+        let (sr, sp) = layout.spread_at(p)?;
+        let own = text_frame_at(doc, &doc.spread(sr)?.items, sp, tol).map(|f| (f, sp, None));
+        let (frame, pt, page) = match (own, sr) {
+            (Some(hit), _) => hit,
+            (None, SpreadRef::Doc(si)) => parent_text_frame_at(doc, si, sp, tol)?,
+            (None, _) => return None,
+        };
+        let (story, b, cell) = hit_byte_in(doc, &self.cache, frame, pt, page, compose::hit)?;
+        let text = doc.text_story(story, cell)?;
+        let paragraph = text.para_at(b);
+        let style = text.paras.get(paragraph)?.style.clone();
+        Some(ParagraphAt { story, cell, paragraph, style })
+    }
+}
+
+/// Whether `it` shows: not hidden, on a visible layer (locks don't matter).
+fn shown(doc: &designcraft_doc::Document, it: &designcraft_doc::Item) -> bool {
+    !it.hidden && doc.layer(it.layer).is_none_or(|l| l.visible)
+}
+
+/// The frontmost shown text frame among `items` (a spread's) under `p`, looking inside groups and
+/// past objects that hold no text, locked or not.
+fn text_frame_at(doc: &designcraft_doc::Document, items: &[std::sync::Arc<designcraft_doc::Item>], p: Point, tol: f64) -> Option<ItemId> {
+    let mut items: Vec<&std::sync::Arc<designcraft_doc::Item>> = items.iter().filter(|it| shown(doc, it)).collect();
+    items.sort_by_key(|it| doc.layer_rank(it.layer));
+    items.into_iter().rev().find_map(|it| designcraft_doc::hit_descendant(it, p, tol, &|c| c.is_text_frame()))
+}
+
+/// The frontmost text frame of the parent page showing (not overridden) on document spread `si`'s
+/// page under `p`, locked or not, as the tools' `hit_parent_on_page` finds an unlocked item:
+/// (frame, `p` in the parent spread's space, the absolute document page).
+fn parent_text_frame_at(doc: &designcraft_doc::Document, si: usize, p: Point, tol: f64) -> Option<(ItemId, Point, Option<usize>)> {
+    let spread = doc.spreads.get(si)?;
+    let pi = spread.page_at_x(p.x)?;
+    let page = doc.first_page_of_spread(si).saturating_add(pi);
+    let pg = spread.pages.get(pi)?;
+    if !pg.show_parent_items {
+        return None;
+    }
+    // In the renderer's order: by layer, the parent's bases before the parent; the last is on top.
+    let mut shown_items = Vec::new();
+    for (ppi, ppg) in doc.shown_parent_pages(SpreadRef::Doc(si), pi) {
+        let Some(parent) = doc.parents.get(ppi) else { continue };
+        let Some(parent_page) = parent.pages.get(ppg) else { continue };
+        let off = designcraft_geom::Vec2::new(pg.x - parent_page.x, 0.0);
+        for it in &parent.items {
+            if pg.overridden.contains(&it.id) || parent.pages.len() > 1 && parent.page_at_x(it.bounds().center().x) != Some(ppg) {
+                continue;
+            }
+            if shown(doc, it) {
+                shown_items.push((it, off));
+            }
+        }
+    }
+    shown_items.sort_by_key(|(it, _)| doc.layer_rank(it.layer));
+    shown_items.into_iter().rev().find_map(|(it, off)| {
+        let q = p - off;
+        designcraft_doc::hit_descendant(it, q, tol, &|c| c.is_text_frame()).map(|f| (f, q, Some(page)))
+    })
 }
 
 /// The Eyedropper with text selected: the formatting of the text under `point` in `frame` goes to

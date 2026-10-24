@@ -979,7 +979,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
     // everything else goes on as usual (the engine's command filter sees the rest).
     // The studio keeps the view toggles, panels and windows (for looking), not files or dialogs.
     let allowed = match &app.embed {
-        Some(e) if e.studio() => crate::embed::studio_ui_command_allowed(id),
+        Some(e) if !e.chromeless() => crate::embed::studio_ui_command_allowed(id),
         Some(_) => crate::embed::ui_command_allowed(id),
         None => true,
     };

@@ -548,6 +548,58 @@ impl Session {
         let style = text.paras.get(paragraph)?.style.clone();
         Some(ParagraphAt { story, cell, paragraph, style })
     }
+
+    /// The anchored object under canvas point `p` in the active document, **whatever the locks**:
+    /// the frontmost shown text frame's placed object (inside groups too) whose box holds `p`, with
+    /// its item's label and its box in canvas coordinates (the bounding box, if turned). It tests
+    /// the composed boxes, not the glyphs: a glyph hit falls on the next character right of an
+    /// object's midpoint, and an object taller than its line is above the line's glyphs. Nothing
+    /// changes. An embed uses it to report a click on a typeset formula.
+    pub fn anchored_object_at(&self, p: Point) -> Option<ObjectHit> {
+        let st = self.active()?;
+        let doc = &st.doc;
+        let layout = designcraft_tools::CanvasLayout::new(doc, st.editing_parents);
+        let (sr, _) = layout.spread_at(p)?;
+        let mut frames = Vec::new();
+        shown_text_frames(doc, &doc.spread(sr)?.items, layout.xf(sr), &mut frames);
+        frames.iter().rev().find_map(|&(it, xf)| {
+            let sid = it.text_frame()?.story;
+            let inner = xf.inverse() * p;
+            let cs = self.cache.get(doc, sid, None);
+            let ft = cs.frames.iter().find(|f| f.frame == it.id)?;
+            ft.objects.iter().rev().find_map(|o| {
+                let r = designcraft_geom::Rect::new(o.origin.x, o.origin.y, o.origin.x + o.size.0, o.origin.y + o.size.1);
+                r.contains(inner).then(|| ObjectHit { label: o.object.item.label.clone(), rect: xf.transform_rect_bbox(r) })
+            })
+        })
+    }
+}
+
+/// An anchored object under a point: its item's label and its box on the canvas.
+/// [`Session::anchored_object_at`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectHit {
+    pub label: String,
+    pub rect: designcraft_geom::Rect,
+}
+
+/// The shown text frames among `items` (a spread's, through `xf` to the canvas), back to front by
+/// layer, inside groups too, each with its text space → canvas transform. Locks don't matter.
+fn shown_text_frames<'a>(
+    doc: &designcraft_doc::Document,
+    items: &'a [std::sync::Arc<designcraft_doc::Item>],
+    xf: designcraft_geom::Affine,
+    out: &mut Vec<(&'a designcraft_doc::Item, designcraft_geom::Affine)>,
+) {
+    let mut items: Vec<&'a std::sync::Arc<designcraft_doc::Item>> = items.iter().filter(|it| shown(doc, it)).collect();
+    items.sort_by_key(|it| doc.layer_rank(it.layer));
+    for it in items {
+        if it.is_text_frame() {
+            out.push((it, xf * doc.text_xf(it)));
+        } else if !it.children().is_empty() {
+            shown_text_frames(doc, it.children(), xf * it.xf, out);
+        }
+    }
 }
 
 /// Whether `it` shows: not hidden, on a visible layer (locks don't matter).
@@ -4115,5 +4167,67 @@ mod pick_up_format_tests {
         let rect = s.execute("frame.create", &json!({"rect": [500, 500, 520, 520]})).unwrap()["id"].as_u64().unwrap();
         assert!(s.execute("type.pickUpFormat", &json!({"frame": rect, "point": [510, 510]})).is_err());
         let _ = ItemId(rect);
+    }
+}
+
+#[cfg(test)]
+mod anchored_object_at_tests {
+    use designcraft_doc::{ItemId, SpreadRef, StoryId};
+    use designcraft_geom::Point;
+    use serde_json::json;
+
+    use crate::Session;
+
+    /// A text frame with a 24×40 pt inline object labelled `label` after "Before " (taller than
+    /// its line, as a display formula is), and its story.
+    fn with_object(label: &str) -> (Session, StoryId) {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 400], "content": "text", "text": "Before after and more words."})).unwrap();
+        let sid = StoryId(r["story"].as_u64().unwrap());
+        let b = s.execute("frame.create", &json!({"rect": [450, 450, 474, 490]})).unwrap()["id"].as_u64().unwrap();
+        if !label.is_empty() {
+            s.execute("object.label", &json!({"label": label, "ids": [b]})).unwrap();
+        }
+        s.execute("anchored.insert", &json!({"ids": [b], "story": sid.0, "pos": 7})).unwrap();
+        (s, sid)
+    }
+
+    /// Spread point → canvas point (spread 0).
+    fn canvas(s: &Session, x: f64, y: f64) -> Point {
+        designcraft_tools::CanvasLayout::new(&s.doc().unwrap().doc, false).to_canvas(SpreadRef::Doc(0), Point::new(x, y))
+    }
+
+    #[test]
+    fn the_anchored_object_under_a_point_whatever_the_locks() {
+        let (mut s, sid) = with_object("math:0:0:0");
+        let d = s.doc().unwrap().doc.clone();
+        let cs = s.cache.get(&d, sid, None);
+        let o = cs.frames[0].objects[0].clone();
+        // (The frame's inner space is spread space here.)
+        let (x0, y0, w, h) = (o.origin.x, o.origin.y, o.size.0, o.size.1);
+        let fid = ItemId(cs.frames[0].frame.0);
+        s.execute("object.lock", &json!({"ids": [fid.0]})).unwrap();
+        for (x, y) in [(x0 + 3.0, y0 + h * 0.5), (x0 + w - 3.0, y0 + h * 0.5), (x0 + w * 0.5, y0 + 2.0)] {
+            let hit = s.anchored_object_at(canvas(&s, x, y)).unwrap_or_else(|| panic!("no hit at {x},{y}"));
+            assert_eq!(hit.label, "math:0:0:0");
+            let top_left = canvas(&s, x0, y0);
+            assert!((hit.rect.x0 - top_left.x).abs() < 1e-6 && (hit.rect.y0 - top_left.y).abs() < 1e-6, "{:?}", hit.rect);
+            assert!((hit.rect.width() - w).abs() < 1e-6 && (hit.rect.height() - h).abs() < 1e-6, "{:?}", hit.rect);
+        }
+        // The text beside it, and off the frame.
+        let line = &cs.frames[0].lines[o.line];
+        assert_eq!(s.anchored_object_at(canvas(&s, x0 + w + 6.0, line.baseline - 3.0)), None);
+        assert_eq!(s.anchored_object_at(canvas(&s, x0 - 6.0, line.baseline - 3.0)), None);
+        assert_eq!(s.anchored_object_at(canvas(&s, 500.0, 600.0)), None);
+    }
+
+    #[test]
+    fn an_unlabelled_object_has_an_empty_label() {
+        let (s, sid) = with_object("");
+        let d = s.doc().unwrap().doc.clone();
+        let o = s.cache.get(&d, sid, None).frames[0].objects[0].clone();
+        let hit = s.anchored_object_at(canvas(&s, o.origin.x + 3.0, o.origin.y + 3.0)).unwrap();
+        assert_eq!(hit.label, "");
     }
 }

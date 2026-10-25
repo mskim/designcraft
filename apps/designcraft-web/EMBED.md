@@ -69,6 +69,7 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
 { type: "textEdited", story: "table:7", paragraph: 0, text: "…", cell: { table: 0, row: 1, col: 2 } }
 { type: "frameMoved", label: "image:4", col: 1, width: 3, lines: 8, v: "top" }
 { type: "frameMoved", label: "table:7", col: 2, width: 4, v: "middle" }
+{ type: "formulaSelected", label: "math:3:0:1", rect: { x: 120, y: 64.5, width: 48, height: 30 } }
 { type: "spreads", count: 13 }                         // text reflowed onto a new page, or back
 { type: "tool", tool: "type" }                         // the tool changed
 { type: "rejected", reason: "paragraphs" }             // an edit the editor undid
@@ -87,6 +88,15 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   `lines` in body lines (a table has none: its height is its content's), and `v` one of
   `"line"`, `"top"`, `"middle"`, `"bottom"` (an image is never `"line"`). A frame dropped on
   another spread goes back to its own page first.
+- **`formulaSelected`** is sent on a primary press, with either tool, on a typeset formula: an
+  inline anchored object whose label starts with `math:` (designcraft_rb's labels). `label` is
+  that label. `rect` is the formula's box in CSS pixels relative to the embed's viewport (the
+  iframe's top-left corner; add the iframe's `getBoundingClientRect()` for the host page). The
+  click doesn't place a caret or select anything, and the rest of its drag and its release are
+  ignored. Any other object (an image, an unlabelled one) is clicked as before, and nothing is
+  sent. Panning or zooming afterwards isn't reported, so the rect is only good until then.
+  Typing over a formula isn't blocked in the embed: its mark is text, and deleting or typing
+  over it reaches the host as a `textEdited`; the host refuses one that changes a formula's mark.
 - **`tool`** comes for any change, including one the host asked for with `setTool`, the V and
   T keys, and a double-click into text.
 - **`rejected`** reasons: `"paragraphs"` (a paragraph was added or removed, e.g. Return or a

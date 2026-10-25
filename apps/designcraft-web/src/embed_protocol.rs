@@ -151,6 +151,9 @@ pub fn event(e: &EmbedEvent) -> Value {
             json!({"type": "styleChanged", "document": document, "name": name, "before": before, "after": after})
         }
         EmbedEvent::ParagraphSelected { document, name } => json!({"type": "paragraphSelected", "document": document, "name": name}),
+        EmbedEvent::FormulaSelected { label, rect: [x, y, width, height] } => {
+            json!({"type": "formulaSelected", "label": label, "rect": {"x": x, "y": y, "width": width, "height": height}})
+        }
     }
 }
 
@@ -261,6 +264,15 @@ mod tests {
         assert_eq!(event(&picked), json!({"type": "paragraphSelected", "document": "본문", "name": "Body"}));
         let none = EmbedEvent::ParagraphSelected { document: "본문".into(), name: None };
         assert_eq!(event(&none), json!({"type": "paragraphSelected", "document": "본문", "name": null}));
+    }
+
+    #[test]
+    fn formula_selected_has_its_label_and_box() {
+        let picked = EmbedEvent::FormulaSelected { label: "math:3:0:1".into(), rect: [120.0, 64.5, 48.0, 30.25] };
+        assert_eq!(
+            event(&picked),
+            json!({"type": "formulaSelected", "label": "math:3:0:1", "rect": {"x": 120.0, "y": 64.5, "width": 48.0, "height": 30.25}})
+        );
     }
 
     #[test]

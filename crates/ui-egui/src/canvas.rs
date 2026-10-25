@@ -2397,7 +2397,27 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
     let (pressed, released, origin, latest, now) =
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.press_origin(), i.pointer.latest_pos(), i.time));
     let in_view = |o: Pos2| if xf.rot == 0 { rect.contains(o) } else { resp.rect.contains(o) };
+    // 교정/교열: a press on a typeset formula is the host's (it opens its formula editor over the
+    // box it's told). It's checked before the tool sees the press, and the tool sees nothing more
+    // of the gesture until the release: the type tool would place a caret on the press, and a
+    // drag or the release would select text or the frame.
+    let formula_id = egui::Id::new(("canvas_formula_press", app.pane));
+    let mut formula_press: bool = ui.data(|d| d.get_temp(formula_id)).unwrap_or(false);
+    let zoom_factor = ui.ctx().zoom_factor() as f64;
+    // Canvas → CSS pixels in the viewport: on screen (the canvas rect's offset included), then
+    // egui points times the zoom factor.
+    let to_css = |r: DRect| {
+        let s = xf.rect(r);
+        DRect::new(s.min.x as f64 * zoom_factor, s.min.y as f64 * zoom_factor, s.max.x as f64 * zoom_factor, s.max.y as f64 * zoom_factor)
+    };
     if pressed
+        && !space
+        && !menu_open
+        && let Some(o) = origin.filter(|o| in_view(*o) && resp.hovered())
+        && app.embed_pick_formula(pos(o), to_css)
+    {
+        formula_press = true;
+    } else if pressed
         && !space
         && !menu_open
         && let Some(o) = origin.filter(|o| in_view(*o) && resp.hovered())
@@ -2449,6 +2469,12 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
         events.push(PointerEvent { kind: PointerKind::Move, pos: pos(p), mods: m, clicks: 1 });
     }
     ui.data_mut(|d| d.insert_temp(down_id, down));
+    if formula_press {
+        // The formula's gesture: nothing reaches the tool until the button is up again.
+        events.clear();
+        formula_press = !released && primary_down;
+    }
+    ui.data_mut(|d| d.insert_temp(formula_id, formula_press));
     for e in events {
         if let Err(err) = app.session.pointer(&e, vi) {
             app.status(err.to_string());

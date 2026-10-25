@@ -283,6 +283,11 @@ impl Embed {
         self.studio() && !self.config.chrome
     }
 
+    /// 교정/교열 (begun with `embed_begin` in proofread mode, not the studio).
+    pub fn proofread(&self) -> bool {
+        self.config.mode == EmbedMode::Proofread
+    }
+
     /// No chrome: 교정/교열, or a studio loaded with `chrome: false`.
     pub fn chromeless(&self) -> bool {
         !self.studio() || !self.config.chrome
@@ -744,6 +749,13 @@ pub enum EmbedEvent {
     ParagraphSelected {
         document: String,
         name: Option<String>,
+    },
+    /// 교정/교열: a click landed on a typeset formula (an anchored object labelled `math:…`).
+    /// `rect` is its box as `[x, y, width, height]` in CSS pixels in the embed's viewport. The
+    /// click placed no caret.
+    FormulaSelected {
+        label: String,
+        rect: [f64; 4],
     },
 }
 
@@ -2023,6 +2035,208 @@ mod tests {
             assert!(!f("style.paragraph.edit", &json!({"name": "Body", "chars": {"size": 12}})));
             assert!(f("font.list", &json!({})), "queries still run");
             assert!(!app.session.active().unwrap().is_dirty());
+        }
+
+        // ---- formulaSelected: a click on a typeset formula in 교정/교열 ----
+
+        /// A text frame holding three inline 24×40 pt objects, each taller than its line as a
+        /// display formula is: `math:0:0:0` after "Before ", `image:2` after "after ", and an
+        /// unlabelled one after "and ". Returns (app, the story). Not yet in embed mode.
+        fn formula_doc() -> (DesignApp, u64) {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({})).unwrap();
+            let r = app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "text": "Before after and more words."})).unwrap();
+            let sid = r["story"].as_u64().unwrap();
+            // From the end, so each position is still the one in the text above.
+            for (pos, label) in [(17, ""), (13, "image:2"), (7, "math:0:0:0")] {
+                let b = app.run("frame.create", json!({"rect": [450, 450, 474, 490]})).unwrap()["id"].as_u64().unwrap();
+                if !label.is_empty() {
+                    app.run("object.label", json!({"label": label, "ids": [b]})).unwrap();
+                }
+                app.run("anchored.insert", json!({"ids": [b], "story": sid, "pos": pos})).unwrap();
+            }
+            app.run("selection.set", json!({"ids": []})).unwrap();
+            (app, sid)
+        }
+
+        /// The canvas boxes of the story's placed objects, in the story's order (the frame's
+        /// inner space is spread space here).
+        pub(crate) fn object_boxes(app: &DesignApp, story: u64) -> Vec<designcraft_geom::Rect> {
+            let d = app.session.active().unwrap().doc.clone();
+            let cs = app.session.cache.get(&d, designcraft_doc::StoryId(story), None);
+            let xf = CanvasLayout::new(&d, false).xf(SpreadRef::Doc(0));
+            let mut objects = cs.frames[0].objects.clone();
+            objects.sort_by_key(|o| o.index);
+            objects
+                .iter()
+                .map(|o| xf.transform_rect_bbox(designcraft_geom::Rect::new(o.origin.x, o.origin.y, o.origin.x + o.size.0, o.origin.y + o.size.1)))
+                .collect()
+        }
+
+        fn twice(r: designcraft_geom::Rect) -> designcraft_geom::Rect {
+            designcraft_geom::Rect::new(r.x0 * 2.0, r.y0 * 2.0, r.x1 * 2.0, r.y1 * 2.0)
+        }
+
+        fn formula(rect: designcraft_geom::Rect) -> EmbedEvent {
+            EmbedEvent::FormulaSelected { label: "math:0:0:0".into(), rect: [rect.x0, rect.y0, rect.width(), rect.height()] }
+        }
+
+        #[test]
+        fn a_pick_on_a_formula_reports_formula_selected_with_its_box_and_changes_nothing() {
+            let (mut app, sid) = formula_doc();
+            app.embed_begin(EmbedConfig::default());
+            let _ = app.embed_poll(0.0);
+            let (doc, sel) = {
+                let st = app.session.active().unwrap();
+                (st.doc.clone(), st.selection.clone())
+            };
+            let m = object_boxes(&app, sid)[0];
+            // Its centre, its right half (where a glyph hit gives the next character), its top
+            // (above the line's glyphs).
+            for p in [m.center(), designcraft_geom::Point::new(m.x1 - 2.0, m.center().y), designcraft_geom::Point::new(m.center().x, m.y0 + 2.0)] {
+                assert!(app.embed_pick_formula(p, twice), "{p:?}");
+            }
+            let want = formula(twice(m));
+            assert_eq!(app.embed_poll(0.0), vec![want.clone(), want.clone(), want]);
+            let st = app.session.active().unwrap();
+            assert!(Arc::ptr_eq(&st.doc, &doc) && st.selection == sel, "no caret, no change");
+            assert_eq!(app.embed_poll(0.0), vec![], "sent once");
+        }
+
+        #[test]
+        fn a_pick_on_text_an_image_or_an_unlabelled_object_reports_nothing() {
+            let (mut app, sid) = formula_doc();
+            app.embed_begin(EmbedConfig::default());
+            let _ = app.embed_poll(0.0);
+            let b = object_boxes(&app, sid);
+            let beside = designcraft_geom::Point::new(b[0].x1 + 4.0, b[0].y1 - 3.0);
+            for p in [beside, b[1].center(), b[2].center()] {
+                assert!(!app.embed_pick_formula(p, twice), "{p:?}");
+            }
+            assert_eq!(app.embed_poll(0.0), vec![]);
+        }
+
+        /// Drives the canvas as the browser would: frames of input at an egui zoom factor of 2
+        /// (each egui point two CSS pixels), with the time going on so clicks don't pair up.
+        struct Canvas {
+            ctx: egui::Context,
+            time: f64,
+        }
+
+        impl Canvas {
+            fn new(app: &mut DesignApp) -> Self {
+                let ctx = egui::Context::default();
+                ctx.set_zoom_factor(2.0);
+                let mut c = Canvas { ctx, time: 0.0 };
+                c.frame(app, vec![]);
+                c.frame(app, vec![]);
+                app.run("view.fitSpread", json!({})).unwrap();
+                c.frame(app, vec![]);
+                c
+            }
+
+            fn frame(&mut self, app: &mut DesignApp, events: Vec<egui::Event>) {
+                self.time += 1.0;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                };
+                let mut out = self.ctx.run_ui(raw, |ui| crate::canvas::show(app, ui));
+                out.textures_delta.clear();
+            }
+
+            /// The screen position (egui points) of canvas point `p`.
+            fn screen(app: &DesignApp, p: designcraft_geom::Point) -> egui::Pos2 {
+                crate::canvas::Xf::new(app.canvas_rect.unwrap(), app.view().unwrap()).to_screen(p)
+            }
+
+            /// A primary press at `p`, a drag of 30 points right, the release.
+            fn click(&mut self, app: &mut DesignApp, p: egui::Pos2) {
+                let button =
+                    |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                let to = p + egui::vec2(30.0, 0.0);
+                self.frame(app, vec![egui::Event::PointerMoved(p), button(p, true)]);
+                self.frame(app, vec![egui::Event::PointerMoved(to)]);
+                self.frame(app, vec![button(to, false)]);
+                self.frame(app, vec![]);
+            }
+        }
+
+        #[test]
+        fn a_click_on_a_formula_with_either_tool_reports_it_in_css_pixels_and_places_no_caret() {
+            for tool in TOOLS {
+                let (mut app, sid) = formula_doc();
+                app.embed_begin(EmbedConfig::default());
+                app.run("tool.select", json!({"tool": tool})).unwrap();
+                let mut canvas = Canvas::new(&mut app);
+                let _ = app.embed_poll(0.0);
+                let (doc, sel) = {
+                    let st = app.session.active().unwrap();
+                    (st.doc.clone(), st.selection.clone())
+                };
+                let m = object_boxes(&app, sid)[0];
+                let on_screen = egui::Rect::from_two_pos(
+                    Canvas::screen(&app, designcraft_geom::Point::new(m.x0, m.y0)),
+                    Canvas::screen(&app, designcraft_geom::Point::new(m.x1, m.y1)),
+                );
+                // Its right half: there a glyph hit gives the character after it.
+                let at = Canvas::screen(&app, designcraft_geom::Point::new(m.x1 - 2.0, m.center().y));
+                canvas.click(&mut app, at);
+                let events = app.embed_poll(5.0);
+                let Some(EmbedEvent::FormulaSelected { label, rect }) = events.first() else { panic!("{tool}: {events:?}") };
+                assert_eq!(label, "math:0:0:0");
+                // CSS px: the box on screen (the canvas rect's offset in it) at zoom factor 2.
+                let want = [on_screen.min.x * 2.0, on_screen.min.y * 2.0, on_screen.width() * 2.0, on_screen.height() * 2.0];
+                assert!(rect.iter().zip(want).all(|(a, b)| (*a as f32 - b).abs() < 0.01), "{tool}: {rect:?} {want:?}");
+                assert!(rect[0] > 0.0 && rect[1] > 0.0, "inside the viewport");
+                assert_eq!(events.len(), 1, "{tool}: {events:?}");
+                let st = app.session.active().unwrap();
+                assert!(Arc::ptr_eq(&st.doc, &doc), "{tool}: nothing changed");
+                assert_eq!(st.selection, sel, "{tool}: no caret, no selection, not even from the drag or the release");
+                assert!(st.interaction.is_none());
+            }
+        }
+
+        #[test]
+        fn a_click_on_text_beside_a_formula_still_places_the_caret() {
+            let (mut app, sid) = formula_doc();
+            app.embed_begin(EmbedConfig::default());
+            app.run("tool.select", json!({"tool": "type"})).unwrap();
+            let mut canvas = Canvas::new(&mut app);
+            let _ = app.embed_poll(0.0);
+            let b = object_boxes(&app, sid);
+            let p = Canvas::screen(&app, designcraft_geom::Point::new(b[0].x1 + 4.0, b[0].y1 - 3.0));
+            canvas.frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                ],
+            );
+            canvas.frame(
+                &mut app,
+                vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+            );
+            canvas.frame(&mut app, vec![]);
+            let t = app.session.active().unwrap().selection.text.expect("a caret");
+            assert_eq!(t.story.0, sid);
+            assert!(!app.embed_poll(5.0).iter().any(|e| matches!(e, EmbedEvent::FormulaSelected { .. })));
+        }
+
+        #[test]
+        fn studio_and_the_full_editor_report_no_formula() {
+            let (mut app, sid) = formula_doc();
+            let m = object_boxes(&app, sid)[0];
+            assert!(!app.embed_pick_formula(m.center(), twice), "the full editor");
+            for config in [studio_config(), bare_config()] {
+                let (mut app, _) = formula_doc();
+                app.embed_begin(config);
+                let _ = app.embed_poll(0.0);
+                assert!(!app.embed_pick_formula(m.center(), twice));
+                assert_eq!(app.embed_poll(0.0), vec![]);
+            }
         }
     }
 }

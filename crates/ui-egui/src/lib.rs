@@ -1276,6 +1276,21 @@ impl DesignApp {
         }
     }
 
+    /// A primary press on the canvas of a 교정/교열 embed: when it lands on a typeset formula (an
+    /// anchored object labelled `math:…`, whatever the locks) it reports `formulaSelected` with
+    /// the next poll, its box mapped by `to_css` (canvas → CSS pixels in the viewport), and
+    /// returns true: the press is the host's, and the tool mustn't see it. Changes nothing.
+    pub fn embed_pick_formula(&mut self, p: designcraft_geom::Point, to_css: impl Fn(designcraft_geom::Rect) -> designcraft_geom::Rect) -> bool {
+        if !self.embed.as_ref().is_some_and(embed::Embed::proofread) {
+            return false;
+        }
+        let Some(hit) = self.session.anchored_object_at(p).filter(|h| h.label.starts_with("math:")) else { return false };
+        let r = to_css(hit.rect);
+        let Some(e) = self.embed.as_mut() else { return false };
+        e.outbox.push(embed::EmbedEvent::FormulaSelected { label: hit.label, rect: [r.x0, r.y0, r.width(), r.height()] });
+        true
+    }
+
     /// Studio mode's `load`: closes every open document, opens each of `documents` (name, file
     /// bytes) as a tab in order, makes the first active, and begins studio over them with
     /// `config`. Sent again — after a save, or to take changes back — it starts over the same
@@ -1483,7 +1498,8 @@ impl DesignApp {
         if self.embed.as_ref().is_some_and(embed::Embed::studio) {
             return self.studio_poll();
         }
-        let mut events = Vec::new();
+        // Events raised outside the poll (a formula picked by a click) go first.
+        let mut events = self.embed.as_mut().map(|e| std::mem::take(&mut e.outbox)).unwrap_or_default();
         let Some(last) = self.embed.as_ref().map(|e| e.last_doc.clone()) else { return events };
         let Some(st) = self.session.active() else { return events };
         if st.interaction.is_some() {

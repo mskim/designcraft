@@ -185,12 +185,14 @@ over several documents, as tabs, where only paragraph-style definitions may chan
 book_write's 디자인수정 shows only the pages and edits the styles in its own settings column.
 `load` with `mode: "studio"` and `chrome: false` opens the documents as above, but:
 
-- **No chrome,** as in 교정/교열: menus, panels, document tabs, the task bar, rulers, guides, frame
+- **No chrome,** as in 교정/교열: menus, panels, document tabs, the task bar, guides, frame
   edges, the baseline grid, scrollbars and the context menu stay off (also after a load that
   follows one with the chrome), and the app-level filter is 교정/교열's (`ui_command_allowed`):
   panel, window, app and help ids and the view toggles that bring chrome back are refused;
   zooming, fitting and going to a page or spread stay. A later `load` without `chrome: false`
   brings the chrome back.
+- **Rulers,** as in 교정/교열 (below): shown, display-only, in millimetres, each page from its own
+  corner.
 - **No style edits:** `style.paragraph.edit` is refused too, directly or as a live preview
   (`studio_bare_command_allowed`), so no `styleChanged` is sent. The host edits the style
   itself, lays the pages out again and sends `load` again.
@@ -220,11 +222,20 @@ logged; the text shows in a fallback face.
 The host's source is markdown; the editor's document is a rendering of it. Only edits the host
 can write back to the source are allowed:
 
-- **No chrome.** Menus, panels, document tabs, the task bar, rulers, guides, frame edges, the
+- **No chrome.** Menus, panels, document tabs, the task bar, guides, frame edges, the
   baseline grid, scrollbars and the context menu are off, from before the first `load`. Panel,
   window, app and help commands, and the view toggles that bring chrome back, are refused;
   zooming, fitting and going to a page or spread stay. book_write draws the two-button toolbar
   itself and sends `setTool`.
+- **Rulers, display-only.** The rulers are the one piece of chrome shown (hidden only while the
+  view is rotated). They measure in millimetres, each page from its own top-left corner (a
+  right-hand page starts at 0): at load each document's units, ruler origin (page) and zero
+  point ([0, 0]) are set directly, with no undo entry and no unsaved change. Nothing on them
+  does anything: the corner takes no drag or double-click, no ruler menu opens, no guide is
+  dragged out, and `view.zeroPoint`, `view.lockZeroPoint`, `view.rulers`, `guide.*`,
+  `document.preferences` and `app.deleteAllGuides` are refused. Readouts that follow the units
+  (tool-size and smart-guide labels, the page size) show millimetres too. A studio loaded with
+  the chrome keeps the file's units and origin, and its rulers stay tools.
 - **Two tools.** The type tool and the selection tool. Anything else (including the V/T keys
   reaching another tool) falls back to selection.
 - **Text only.** The type tool types and deletes characters. Formatting, styles, swatches,

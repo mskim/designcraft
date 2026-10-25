@@ -2037,6 +2037,10 @@ fn ruler_rects(full: Rect, rect: Rect) -> (Rect, Rect) {
 /// (the horizontal ruler) Delete All Guides on Spread. Right-clicking the corner where they meet
 /// opens Lock Zero Point and the units for both rulers at once.
 fn ruler_units_menus(app: &mut DesignApp, resp: &egui::Response, full: Rect, rect: Rect, doc: &Document) {
+    // A chromeless embed's rulers are display-only: no menus.
+    if app.embed.as_ref().is_some_and(crate::embed::Embed::chromeless) {
+        return;
+    }
     let (top, left) = ruler_rects(full, rect);
     let corner = Rect::from_min_max(full.min, rect.min);
     let at = resp.interact_pointer_pos();
@@ -2768,6 +2772,10 @@ const ZERO_POINT_DRAG: &str = "canvas_zero_point_drag";
 /// Cmd-dragged (Ctrl elsewhere), it makes a horizontal and a vertical guide instead.
 /// Holds the pointer position while dragging; returns true while it owns the pointer.
 fn zero_point_drag(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, rect: Rect, xf: &Xf) -> bool {
+    // A chromeless embed's rulers are display-only: the corner takes no press.
+    if app.embed.as_ref().is_some_and(crate::embed::Embed::chromeless) {
+        return false;
+    }
     let id = egui::Id::new((ZERO_POINT_DRAG, app.pane));
     let corner = Rect::from_min_max(resp.rect.min, rect.min);
     let (pressed, released, down, origin, latest, dbl, command) = ui.input(|i| {
@@ -3962,6 +3970,63 @@ mod tests {
 
     fn zero_point(h: &Harness<'_, DesignApp>) -> [f64; 2] {
         h.state().session.doc().unwrap().doc.settings.zero_point
+    }
+
+    /// A facing three-page document in a chromeless embed: 교정/교열 (`studio` false) or a
+    /// studio loaded with `chrome: false`.
+    fn chromeless_harness(studio: bool) -> Harness<'static, DesignApp> {
+        use crate::embed::{DocConfig, EmbedConfig, EmbedMode};
+        let services = crate::Services { inbox: Some(crate::Inbox::default()), ..Default::default() };
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), services);
+        app.run("file.new", json!({"pages": 3, "facingPages": true})).unwrap();
+        let config = if studio {
+            EmbedConfig {
+                mode: EmbedMode::Studio,
+                chrome: false,
+                documents: vec![DocConfig { name: "본문".into(), editable: true }],
+                ..Default::default()
+            }
+        } else {
+            EmbedConfig::default()
+        };
+        app.embed_begin(config);
+        fast_harness(app)
+    }
+
+    fn guide_count(h: &Harness<'_, DesignApp>) -> usize {
+        let doc = &h.state().session.doc().unwrap().doc;
+        doc.spreads.iter().flat_map(|sp| &sp.pages).map(|p| p.guides.len()).sum()
+    }
+
+    #[test]
+    fn chromeless_rulers_show_and_take_no_gestures() {
+        for studio in [false, true] {
+            let mut h = chromeless_harness(studio);
+            assert!(h.state().ui.rulers, "studio: {studio}");
+            let rect = h.state().canvas_rect.unwrap();
+            let corner = rect.min - vec2(RULER / 2.0, RULER / 2.0);
+            let dest = rect.min + vec2(80.0, 50.0);
+            let doc = h.state().session.doc().unwrap().doc.clone();
+            // The corner: no drag, no double-click reset, no menu.
+            corner_drag(&mut h, corner, dest);
+            assert_eq!(zero_point(&h), [0.0, 0.0], "studio: {studio}");
+            corner_click(&mut h, corner);
+            corner_click(&mut h, corner);
+            assert_eq!(zero_point(&h), [0.0, 0.0]);
+            right_click(&mut h, corner);
+            assert!(h.query_by_label("   Lock Zero Point").is_none() && h.query_by_label_contains("Hide Rulers").is_none());
+            // The rulers: no guide dragged out, no units menu.
+            drag(&mut h, pos2(rect.center().x, rect.min.y - RULER / 2.0), rect.center());
+            drag(&mut h, pos2(rect.min.x - RULER / 2.0, rect.center().y), rect.center());
+            assert_eq!(guide_count(&h), 0, "studio: {studio}");
+            right_click(&mut h, pos2(rect.center().x, rect.min.y - RULER / 2.0));
+            right_click(&mut h, pos2(rect.min.x - RULER / 2.0, rect.center().y));
+            assert!(h.query_by_label("   Points").is_none() && h.query_by_label("✓ Millimeters").is_none(), "studio: {studio}");
+            assert!(h.query_by_label("   Delete All Guides on Spread").is_none());
+            let st = h.state().session.doc().unwrap();
+            assert!(std::sync::Arc::ptr_eq(&st.doc, &doc), "studio: {studio}: the document is untouched");
+            assert!(h.state().ui.rulers);
+        }
     }
 
     #[test]

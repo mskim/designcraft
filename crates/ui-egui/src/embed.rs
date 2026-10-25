@@ -1438,7 +1438,7 @@ mod tests {
         #[test]
         fn studio_brings_back_the_chrome_a_proofread_load_hid() {
             let (mut app, ..) = embedded();
-            assert!(!app.ui.rulers);
+            assert!(app.ui.rulers && !app.ui.frame_edges && !app.ui.guides);
             app.embed_begin(EmbedConfig { mode: EmbedMode::Studio, ..Default::default() });
             assert!(app.ui.rulers && app.ui.frame_edges && app.ui.guides && app.ui.task_bar && app.ui.hidden_panels == 0);
         }
@@ -1692,7 +1692,9 @@ mod tests {
         #[test]
         fn chrome_is_off() {
             let (app, ..) = embedded();
-            assert!(!app.ui.rulers && !app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
+            assert!(app.ui.rulers, "the rulers are the exception");
+            assert!(!app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
+            assert_eq!(app.ui.hidden_panels, 1);
             assert!(app.embed.is_some());
         }
 
@@ -1713,7 +1715,7 @@ mod tests {
             let (mut app, _, story, _) = embedded();
             assert!(refused(app.run("type.bold", json!({}))));
             assert!(refused(app.run("view.rulers", json!({}))));
-            assert!(!app.ui.rulers);
+            assert!(app.ui.rulers, "the rulers stay");
             assert!(refused(app.run("app.preferences", json!({}))));
             assert!(!refused(app.run("view.fitSpread", json!({}))));
             // Text typed into a locked frame's story, and undone.
@@ -1890,12 +1892,13 @@ mod tests {
             let docs = served(&mut studio_app);
             app.studio_load(&docs, bare_config()).unwrap();
             assert!(app.embed.as_ref().is_some_and(Embed::studio_bare));
-            assert!(!app.ui.rulers && !app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
+            assert!(app.ui.rulers, "the rulers are the exception");
+            assert!(!app.ui.frame_edges && !app.ui.guides && !app.ui.baseline_grid && !app.ui.task_bar);
             assert_eq!(app.ui.hidden_panels, 1);
             for id in ["view.rulers", "view.frameEdges", "panel.show", "window.panel"] {
                 assert!(refused(app.run(id, json!({}))), "{id}");
             }
-            assert!(!app.ui.rulers && app.ui.hidden_panels == 1);
+            assert!(app.ui.rulers && app.ui.hidden_panels == 1);
             app.run("view.fitSpread", json!({})).unwrap();
             assert_eq!(app.session.tool_id(), "selection");
             assert!(app.run("tool.select", json!({"tool": "hand"})).is_ok());
@@ -1903,6 +1906,111 @@ mod tests {
             // A load with the chrome brings it back.
             app.studio_load(&docs, studio_config()).unwrap();
             assert!(app.ui.rulers && app.ui.hidden_panels == 0);
+        }
+
+        // ---- rulers in the chromeless embeds: display-only, millimetres from each page ----
+
+        /// A facing document of three pages (spread 1 holds pages 2 and 3) in picas from the
+        /// spread with a zero point moved off the corner, the way a file may come.
+        fn ruled_doc(app: &mut DesignApp) {
+            app.run("file.new", json!({"pages": 3, "facingPages": true})).unwrap();
+            app.run("document.preferences", json!({"horizontalUnits": "picas", "verticalUnits": "inches", "rulerOrigin": "spread"})).unwrap();
+            app.run("view.zeroPoint", json!({"at": [30, 20]})).unwrap();
+            assert_ne!(app.session.active().unwrap().doc.settings.zero_point, [0.0, 0.0]);
+        }
+
+        fn proofread_ruled() -> DesignApp {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            ruled_doc(&mut app);
+            app.embed_begin(EmbedConfig::default());
+            app
+        }
+
+        fn bare_studio_ruled() -> DesignApp {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            ruled_doc(&mut app);
+            app.embed_begin(EmbedConfig { documents: vec![DocConfig { name: "본문".into(), editable: true }], ..bare_config() });
+            app
+        }
+
+        fn assert_mm_from_each_page(app: &DesignApp) {
+            for st in app.session.documents() {
+                let s = &st.doc.settings;
+                assert_eq!((s.horizontal_units, s.vertical_units), (designcraft_geom::Unit::Millimeters, designcraft_geom::Unit::Millimeters));
+                assert_eq!(s.ruler_origin, designcraft_doc::RulerOrigin::Page);
+                assert_eq!(s.zero_point, [0.0, 0.0]);
+                assert!(st.history.undo.is_empty() && st.history.redo.is_empty(), "no undo entry");
+                assert!(!st.is_dirty(), "no unsaved change");
+                assert_eq!(st.revision, st.saved_revision);
+                // The facing spread: the right page's ruler starts at its own corner.
+                let pieces = st.doc.ruler_pieces(SpreadRef::Doc(1));
+                let pages = &st.doc.spreads[1].pages;
+                assert_eq!(pieces.len(), 2, "{pieces:?}");
+                let mut xs: Vec<f64> = pages.iter().map(|p| p.x).collect();
+                xs.sort_by(f64::total_cmp);
+                assert_eq!(pieces.iter().map(|p| p.2.x).collect::<Vec<_>>(), xs);
+            }
+        }
+
+        #[test]
+        fn a_proofread_load_measures_each_page_in_millimetres_from_its_corner() {
+            let mut app = proofread_ruled();
+            assert_mm_from_each_page(&app);
+            assert_eq!(
+                app.embed.as_ref().and_then(|e| e.last_doc.as_ref()).map(|d| d.settings.ruler_origin),
+                Some(designcraft_doc::RulerOrigin::Page)
+            );
+            assert!(!rejected(&app.embed_poll(0.0)));
+        }
+
+        #[test]
+        fn a_bare_studio_load_measures_each_page_in_millimetres_and_reports_no_change() {
+            let mut app = bare_studio_ruled();
+            assert_mm_from_each_page(&app);
+            let doc = app.session.active().unwrap().doc.clone();
+            let events = app.embed_poll(0.0);
+            assert!(!rejected(&events), "{events:?}");
+            assert!(Arc::ptr_eq(&app.session.active().unwrap().doc, &doc), "not reverted");
+            assert!(!rejected(&app.embed_poll(0.1)));
+            assert_mm_from_each_page(&app);
+        }
+
+        #[test]
+        fn with_chrome_the_studio_keeps_the_files_units_and_origin() {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            ruled_doc(&mut app);
+            let before = app.session.active().unwrap().doc.settings.clone();
+            app.embed_begin(EmbedConfig { documents: vec![DocConfig { name: "본문".into(), editable: true }], ..studio_config() });
+            assert_eq!(app.session.active().unwrap().doc.settings, before);
+            assert!(app.run("view.zeroPoint", json!({"reset": true})).is_ok(), "the ruler commands still run");
+        }
+
+        #[test]
+        fn the_full_editor_keeps_the_files_units_and_origin() {
+            let mut app = DesignApp::new(Session::new(), Services::default());
+            ruled_doc(&mut app);
+            let s = &app.session.active().unwrap().doc.settings;
+            assert_eq!((s.horizontal_units, s.ruler_origin), (designcraft_geom::Unit::Picas, designcraft_doc::RulerOrigin::Spread));
+        }
+
+        #[test]
+        fn the_chromeless_embeds_refuse_every_ruler_command() {
+            for mut app in [proofread_ruled(), bare_studio_ruled()] {
+                let doc = app.session.active().unwrap().doc.clone();
+                for (id, params) in [
+                    ("view.zeroPoint", json!({"at": [10, 10]})),
+                    ("view.zeroPoint", json!({"reset": true})),
+                    ("view.lockZeroPoint", json!({"on": true})),
+                    ("view.rulers", json!({})),
+                    ("document.preferences", json!({"horizontalUnits": "points"})),
+                    ("app.deleteAllGuides", json!({})),
+                    ("guide.add", json!({"orientation": "horizontal", "position": 100})),
+                ] {
+                    assert!(refused(app.run(id, params)), "{id}");
+                }
+                assert!(app.ui.rulers);
+                assert!(Arc::ptr_eq(&app.session.active().unwrap().doc, &doc), "nothing changed");
+            }
         }
 
         #[test]

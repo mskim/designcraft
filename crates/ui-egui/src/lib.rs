@@ -1161,9 +1161,13 @@ impl DesignApp {
         self.embed_lock();
         self.select_tool("selection");
         // The lock must not be undoable: the document was just opened, so its history holds nothing else.
+        // Nor the rulers' settings, which must also not count as a change.
         if let Some(st) = self.session.active_mut() {
             st.history.undo.clear();
             st.history.redo.clear();
+            embed_ruler_settings(st);
+            st.saved_doc = st.doc.clone();
+            st.saved_revision = st.revision;
         }
         let doc = self.session.active().map(|d| d.doc.clone());
         let spread = match canvas::current_spread(self) {
@@ -1196,6 +1200,7 @@ impl DesignApp {
             self.ui.hidden_panels = d.hidden_panels;
         }
         let names = config.documents.clone();
+        let chrome = config.chrome;
         let embed = embed::Embed { config, ..Default::default() };
         self.session.command_filter = Some(embed.command_filter());
         self.embed = Some(embed);
@@ -1207,6 +1212,10 @@ impl DesignApp {
             // The lock must not be undoable, nor count as a change: the document was just opened.
             st.history.undo.clear();
             st.history.redo.clear();
+            // Before `last` is taken, or `studio_change` would see the settings as a change.
+            if !chrome {
+                embed_ruler_settings(st);
+            }
             st.saved_doc = st.doc.clone();
             st.saved_revision = st.revision;
             let (name, editable) = names.get(i).map_or_else(|| (st.title(), false), |c| (c.name.clone(), c.editable));
@@ -1231,9 +1240,11 @@ impl DesignApp {
         }
     }
 
-    /// An embed's hidden chrome: no rulers, frame edges, guides, baseline grid, task bar or panels.
+    /// An embed's hidden chrome: no frame edges, guides, baseline grid, task bar or panels. The
+    /// rulers are the exception: always shown, display-only (`canvas` takes no gesture on them
+    /// when chromeless), measuring each page in millimetres ([`embed_ruler_settings`]).
     fn hide_chrome(&mut self) {
-        self.ui.rulers = false;
+        self.ui.rulers = true;
         self.ui.frame_edges = false;
         self.ui.guides = false;
         self.ui.baseline_grid = false;
@@ -2268,6 +2279,28 @@ pub fn drop_key_name_text(raw: &mut egui::RawInput, text_input_focused: bool) {
     if !text_input_focused {
         raw.events.retain(|e| !matches!(e, egui::Event::Text(t) if is_key_name(t)));
     }
+}
+
+/// A chromeless embed's rulers: millimetres both ways, each page measured from its own top-left
+/// corner (no zero point moved off it). Written on the document directly, not as a command: it
+/// leaves no undo entry, and the caller takes it as the saved state. Only the view reads these
+/// settings; a chromeless embed never saves the document back.
+fn embed_ruler_settings(st: &mut designcraft_engine::DocState) {
+    use designcraft_geom::Unit::Millimeters;
+    let s = &st.doc.settings;
+    if s.horizontal_units == Millimeters
+        && s.vertical_units == Millimeters
+        && s.ruler_origin == designcraft_doc::RulerOrigin::Page
+        && s.zero_point == [0.0, 0.0]
+    {
+        return;
+    }
+    let s = &mut Arc::make_mut(&mut st.doc).settings;
+    s.horizontal_units = Millimeters;
+    s.vertical_units = Millimeters;
+    s.ruler_origin = designcraft_doc::RulerOrigin::Page;
+    s.zero_point = [0.0, 0.0];
+    st.bump_revision();
 }
 
 #[cfg(test)]

@@ -550,18 +550,20 @@ impl Session {
     }
 
     /// The anchored object under canvas point `p` in the active document, **whatever the locks**:
-    /// the frontmost shown text frame's placed object (inside groups too) whose box holds `p`, with
-    /// its item's label and its box in canvas coordinates (the bounding box, if turned). It tests
-    /// the composed boxes, not the glyphs: a glyph hit falls on the next character right of an
-    /// object's midpoint, and an object taller than its line is above the line's glyphs. Nothing
-    /// changes. An embed uses it to report a click on a typeset formula.
+    /// the frontmost shown text frame's placed object (inside groups too, and in a multi-state
+    /// object's active state) whose box holds `p`, with its item's label and its box in canvas
+    /// coordinates (the bounding box, if turned). It tests the composed boxes, not the glyphs: a
+    /// glyph hit falls on the next character right of an object's midpoint, and an object taller
+    /// than its line is above the line's glyphs. Only the frames' own text is searched, not
+    /// objects in table cells, footnotes or parent-page frames. Nothing changes. An embed uses it
+    /// to report a click on a typeset formula.
     pub fn anchored_object_at(&self, p: Point) -> Option<ObjectHit> {
         let st = self.active()?;
         let doc = &st.doc;
         let layout = designcraft_tools::CanvasLayout::new(doc, st.editing_parents);
         let (sr, _) = layout.spread_at(p)?;
         let mut frames = Vec::new();
-        shown_text_frames(doc, &doc.spread(sr)?.items, layout.xf(sr), &mut frames);
+        shown_text_frames(doc, doc.spread(sr)?.items.iter(), layout.xf(sr), &mut frames);
         frames.iter().rev().find_map(|&(it, xf)| {
             let sid = it.text_frame()?.story;
             let inner = xf.inverse() * p;
@@ -584,20 +586,21 @@ pub struct ObjectHit {
 }
 
 /// The shown text frames among `items` (a spread's, through `xf` to the canvas), back to front by
-/// layer, inside groups too, each with its text space → canvas transform. Locks don't matter.
+/// layer, inside groups too (a multi-state object's active state only), each with its text space
+/// → canvas transform. Locks don't matter.
 fn shown_text_frames<'a>(
     doc: &designcraft_doc::Document,
-    items: &'a [std::sync::Arc<designcraft_doc::Item>],
+    items: impl Iterator<Item = &'a std::sync::Arc<designcraft_doc::Item>>,
     xf: designcraft_geom::Affine,
     out: &mut Vec<(&'a designcraft_doc::Item, designcraft_geom::Affine)>,
 ) {
-    let mut items: Vec<&'a std::sync::Arc<designcraft_doc::Item>> = items.iter().filter(|it| shown(doc, it)).collect();
+    let mut items: Vec<&'a std::sync::Arc<designcraft_doc::Item>> = items.filter(|it| shown(doc, it)).collect();
     items.sort_by_key(|it| doc.layer_rank(it.layer));
     for it in items {
         if it.is_text_frame() {
             out.push((it, xf * doc.text_xf(it)));
         } else if !it.children().is_empty() {
-            shown_text_frames(doc, it.children(), xf * it.xf, out);
+            shown_text_frames(doc, it.shown_children(), xf * it.xf, out);
         }
     }
 }
@@ -4229,5 +4232,27 @@ mod anchored_object_at_tests {
         let o = s.cache.get(&d, sid, None).frames[0].objects[0].clone();
         let hit = s.anchored_object_at(canvas(&s, o.origin.x + 3.0, o.origin.y + 3.0)).unwrap();
         assert_eq!(hit.label, "");
+    }
+
+    #[test]
+    fn a_multi_state_object_shows_only_its_active_states_objects() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let mut frames = Vec::new();
+        for label in ["math:a", "math:b"] {
+            let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 400], "content": "text", "text": "Before after."})).unwrap();
+            let b = s.execute("frame.create", &json!({"rect": [450, 450, 474, 490]})).unwrap()["id"].clone();
+            s.execute("object.label", &json!({"label": label, "ids": [b]})).unwrap();
+            s.execute("anchored.insert", &json!({"ids": [b], "story": r["story"], "pos": 7})).unwrap();
+            frames.push((r["id"].clone(), StoryId(r["story"].as_u64().unwrap())));
+        }
+        let d = s.doc().unwrap().doc.clone();
+        let o = s.cache.get(&d, frames[0].1, None).frames[0].objects[0].clone();
+        let at = canvas(&s, o.origin.x + 3.0, o.origin.y + 3.0);
+        assert_eq!(s.anchored_object_at(at).unwrap().label, "math:b", "the frontmost");
+        let id = s.execute("states.create", &json!({"ids": [frames[0].0, frames[1].0]})).unwrap()["id"].clone();
+        assert_eq!(s.anchored_object_at(at).unwrap().label, "math:a", "state 1 shows, not state 2 above it");
+        s.execute("states.show", &json!({"id": id, "name": "State 2"})).unwrap();
+        assert_eq!(s.anchored_object_at(at).unwrap().label, "math:b");
     }
 }

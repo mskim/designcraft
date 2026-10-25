@@ -2047,6 +2047,7 @@ mod tests {
             app.run("file.new", json!({})).unwrap();
             let r = app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "text": "Before after and more words."})).unwrap();
             let sid = r["story"].as_u64().unwrap();
+            app.run("object.label", json!({"label": "story:main", "ids": [r["id"]]})).unwrap();
             // From the end, so each position is still the one in the text above.
             for (pos, label) in [(17, ""), (13, "image:2"), (7, "math:0:0:0")] {
                 let b = app.run("frame.create", json!({"rect": [450, 450, 474, 490]})).unwrap()["id"].as_u64().unwrap();
@@ -2101,6 +2102,25 @@ mod tests {
             let st = app.session.active().unwrap();
             assert!(Arc::ptr_eq(&st.doc, &doc) && st.selection == sel, "no caret, no change");
             assert_eq!(app.embed_poll(0.0), vec![], "sent once");
+        }
+
+        #[test]
+        fn a_pending_text_edit_goes_before_the_formula_and_only_once() {
+            let (mut app, sid) = formula_doc();
+            app.embed_begin(EmbedConfig::default());
+            let _ = app.embed_poll(0.0);
+            // Typed at the end of the paragraph: held back while the caret stays in it.
+            let end = app.session.active().unwrap().doc.story(designcraft_doc::StoryId(sid)).unwrap().text.len() - 1;
+            app.run("text.select", json!({"story": sid, "anchor": end, "focus": end})).unwrap();
+            app.run("text.insert", json!({"text": "!"})).unwrap();
+            assert_eq!(app.embed_poll(0.1), vec![], "pending");
+            let m = object_boxes(&app, sid)[0];
+            assert!(app.embed_pick_formula(m.center(), twice));
+            let text = paragraphs(&app, sid)[0].clone();
+            assert!(text.ends_with("words!."), "{text}");
+            let edited = EmbedEvent::TextEdited { story: "main".into(), paragraph: 0, text, cell: None };
+            assert_eq!(app.embed_poll(0.2), vec![edited, formula(twice(m))], "the host sees the edit first");
+            assert_eq!(app.embed_poll(5.0), vec![], "and not again");
         }
 
         #[test]

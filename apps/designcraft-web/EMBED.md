@@ -94,7 +94,10 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   iframe's top-left corner; add the iframe's `getBoundingClientRect()` for the host page). The
   click doesn't place a caret or select anything, and the rest of its drag and its release are
   ignored. Any other object (an image, an unlabelled one) is clicked as before, and nothing is
-  sent. Panning or zooming afterwards isn't reported, so the rect is only good until then.
+  sent; so is an object in a table cell or a footnote, which isn't searched. Each press sends
+  one `formulaSelected` (a double-click sends two). A `textEdited` still pending for the
+  paragraph being typed in is sent first, so the host has the text before the formula. Panning
+  or zooming afterwards isn't reported, so the rect is only good until then.
   Typing over a formula isn't blocked in the embed: its mark is text, and deleting or typing
   over it reaches the host as a `textEdited`; the host refuses one that changes a formula's mark.
 - **`tool`** comes for any change, including one the host asked for with `setTool`, the V and

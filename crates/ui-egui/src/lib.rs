@@ -1279,14 +1279,21 @@ impl DesignApp {
     /// A primary press on the canvas of a 교정/교열 embed: when it lands on a typeset formula (an
     /// anchored object labelled `math:…`, whatever the locks) it reports `formulaSelected` with
     /// the next poll, its box mapped by `to_css` (canvas → CSS pixels in the viewport), and
-    /// returns true: the press is the host's, and the tool mustn't see it. Changes nothing.
+    /// returns true: the press is the host's, and the tool mustn't see it. Changes nothing. Each
+    /// press reports once (a double-click, twice). Objects in table cells and footnotes aren't
+    /// searched: a press there goes to the tool. A paragraph edit not reported yet goes first —
+    /// the press places no caret, so the caret never leaves its paragraph to send it — so the
+    /// host has the text as it is before it edits the formula.
     pub fn embed_pick_formula(&mut self, p: designcraft_geom::Point, to_css: impl Fn(designcraft_geom::Rect) -> designcraft_geom::Rect) -> bool {
         if !self.embed.as_ref().is_some_and(embed::Embed::proofread) {
             return false;
         }
         let Some(hit) = self.session.anchored_object_at(p).filter(|h| h.label.starts_with("math:")) else { return false };
         let r = to_css(hit.rect);
+        let pending = self.embed.as_mut().and_then(|e| e.pending_text.take());
+        let edited = pending.and_then(|p| self.embed_text_event(&p.change));
         let Some(e) = self.embed.as_mut() else { return false };
+        e.outbox.extend(edited);
         e.outbox.push(embed::EmbedEvent::FormulaSelected { label: hit.label, rect: [r.x0, r.y0, r.width(), r.height()] });
         true
     }

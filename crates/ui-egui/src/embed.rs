@@ -135,6 +135,34 @@ pub fn studio_tool_allowed(id: &str) -> bool {
     STUDIO_TOOLS.contains(&id)
 }
 
+/// The tools panel's groups holding only the tools `allowed` keeps, each group's flyout too; an
+/// empty group is a separator, as in [`TOOL_GROUPS`](designcraft_tools::TOOL_GROUPS). Groups left
+/// empty go, and so does a separator that would lead, trail or follow another.
+pub fn tool_groups(allowed: impl Fn(&str) -> bool) -> Vec<Vec<designcraft_tools::ToolInfo>> {
+    let mut out: Vec<Vec<designcraft_tools::ToolInfo>> = Vec::new();
+    for g in designcraft_tools::TOOL_GROUPS {
+        if g.is_empty() {
+            if out.last().is_some_and(|l| !l.is_empty()) {
+                out.push(Vec::new());
+            }
+            continue;
+        }
+        let kept: Vec<_> = g.iter().copied().filter(|t| allowed(t.id)).collect();
+        if !kept.is_empty() {
+            out.push(kept);
+        }
+    }
+    if out.last().is_some_and(Vec::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// Whether the tools panel has enough buttons to fold into two columns (its chevron).
+pub fn foldable(groups: &[Vec<designcraft_tools::ToolInfo>]) -> bool {
+    groups.iter().filter(|g| !g.is_empty()).count() > 4
+}
+
 /// Whether `id` is one of [`STUDIO_REFUSED`]: the id itself, or under one of its prefixes.
 fn studio_refused(id: &str) -> bool {
     STUDIO_REFUSED.iter().any(|r| if r.ends_with('.') { id.starts_with(r) } else { id == *r || id.starts_with(&format!("{r}.")) })
@@ -250,11 +278,13 @@ pub struct EmbedConfig {
     /// Studio mode: the full interface (true, the default), or only the pages (false: 교정/교열's
     /// hidden chrome, no style edits, a click reports the paragraph style under it).
     pub chrome: bool,
+    /// 교정/교열: the tools panel (true, the default), holding only [`TOOLS`], or none (false).
+    pub tools: bool,
 }
 
 impl Default for EmbedConfig {
     fn default() -> Self {
-        Self { mode: EmbedMode::default(), grid: None, frames: BTreeMap::new(), documents: Vec::new(), chrome: true }
+        Self { mode: EmbedMode::default(), grid: None, frames: BTreeMap::new(), documents: Vec::new(), chrome: true, tools: true }
     }
 }
 
@@ -291,6 +321,16 @@ impl Embed {
     /// No chrome: 교정/교열, or a studio loaded with `chrome: false`.
     pub fn chromeless(&self) -> bool {
         !self.studio() || !self.config.chrome
+    }
+
+    /// 교정/교열 with its tools panel: the panel is drawn without the rest of the chrome.
+    pub fn tools_alone(&self) -> bool {
+        self.proofread() && self.config.tools
+    }
+
+    /// The tools this embed may select: [`tool_allowed`], or studio's [`studio_tool_allowed`].
+    pub fn tool_filter(&self) -> fn(&str) -> bool {
+        if self.studio() { studio_tool_allowed } else { tool_allowed }
     }
 
     /// The engine's command filter for this embed.
@@ -1076,6 +1116,45 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(changed_paragraphs(&a(&["가", "나", "다"]), &a(&["가", "나!", "다"])), Some(vec![1]));
         assert_eq!(changed_paragraphs(&a(&["가", "나"]), &a(&["가", "나", ""])), None);
+    }
+
+    fn ids(groups: &[Vec<designcraft_tools::ToolInfo>]) -> Vec<Vec<&'static str>> {
+        groups.iter().map(|g| g.iter().map(|t| t.id).collect()).collect()
+    }
+
+    #[test]
+    fn the_tools_panel_holds_only_the_tools_the_embed_allows() {
+        // A separator stays between two kept groups; empty groups and doubled, leading or
+        // trailing separators go.
+        assert_eq!(ids(&tool_groups(tool_allowed)), vec![vec!["selection"], vec![], vec!["type"]]);
+        assert_eq!(ids(&tool_groups(studio_tool_allowed)), vec![vec!["selection"], vec![], vec!["hand"], vec!["zoom"]]);
+        // The full app: every group, as the catalogue has them.
+        let all = tool_groups(|_| true);
+        assert_eq!(all.len(), designcraft_tools::TOOL_GROUPS.len());
+        assert!(all.iter().zip(designcraft_tools::TOOL_GROUPS).all(|(a, b)| a.len() == b.len()));
+    }
+
+    #[test]
+    fn a_flyout_keeps_only_its_allowed_tools() {
+        let type_group = tool_groups(tool_allowed).into_iter().find(|g| g.iter().any(|t| t.id == "type")).unwrap();
+        assert_eq!(type_group.len(), 1, "no Type on a Path, no vertical type: no flyout");
+    }
+
+    #[test]
+    fn too_few_tools_to_fold_into_two_columns() {
+        assert!(!foldable(&tool_groups(tool_allowed)));
+        assert!(!foldable(&tool_groups(studio_tool_allowed)));
+        assert!(foldable(&tool_groups(|_| true)));
+    }
+
+    #[test]
+    fn a_proofread_embed_draws_its_tools_alone_unless_told_not_to() {
+        let embed = |config: EmbedConfig| Embed { config, ..Default::default() };
+        assert!(embed(EmbedConfig::default()).tools_alone());
+        assert!(!embed(EmbedConfig { tools: false, ..Default::default() }).tools_alone());
+        // The studio's tools panel is its chrome's (none without it).
+        assert!(!embed(EmbedConfig { mode: EmbedMode::Studio, ..Default::default() }).tools_alone());
+        assert!(!embed(EmbedConfig { mode: EmbedMode::Studio, chrome: false, ..Default::default() }).tools_alone());
     }
 
     mod app {
@@ -2256,6 +2335,73 @@ mod tests {
                 let _ = app.embed_poll(0.0);
                 assert!(!app.embed_pick_formula(m.center(), twice));
                 assert_eq!(app.embed_poll(0.0), vec![]);
+            }
+        }
+
+        mod tools_panel {
+            use super::*;
+            use egui_kittest::kittest::Queryable;
+
+            fn window(app: DesignApp) -> egui_kittest::Harness<'static, crate::test_window::Window> {
+                crate::test_window::open(app, egui::vec2(1200.0, 800.0))
+            }
+
+            fn shown(h: &egui_kittest::Harness<'static, crate::test_window::Window>, label: &str) -> bool {
+                h.query_by_label(label).is_some()
+            }
+
+            #[test]
+            fn a_proofread_embed_draws_only_the_selection_and_type_tools() {
+                let (app, ..) = embedded();
+                let h = window(app);
+                assert!(shown(&h, "Selection Tool (V)") && shown(&h, "Type Tool (T)"));
+                for label in ["Direct Selection Tool (A)", "Hand Tool (H)", "Fill (X)", "Toggle double column"] {
+                    assert!(!shown(&h, label), "{label}");
+                }
+                assert_eq!(crate::test_window::panel_rect(&h, "tools").width(), 8.0 + crate::toolbar::BTN + 8.0);
+            }
+
+            #[test]
+            fn tools_false_draws_no_tools_panel() {
+                let (mut app, ..) = embedded();
+                app.embed_begin(EmbedConfig { tools: false, ..Default::default() });
+                let h = window(app);
+                assert!(!shown(&h, "Selection Tool (V)") && !shown(&h, "Type Tool (T)"));
+            }
+
+            #[test]
+            fn a_click_on_a_tool_reports_it() {
+                let (app, ..) = embedded();
+                let mut h = window(app);
+                let _ = h.state_mut().app.embed_poll(0.0);
+                h.get_by_label("Type Tool (T)").click();
+                h.run_steps(3);
+                assert_eq!(h.state().app.session.tool_id(), "type");
+                assert!(h.state_mut().app.embed_poll(0.0).contains(&EmbedEvent::Tool("type")));
+                h.get_by_label("Selection Tool (V)").click();
+                h.run_steps(3);
+                assert!(h.state_mut().app.embed_poll(0.0).contains(&EmbedEvent::Tool("selection")));
+            }
+
+            #[test]
+            fn studio_shows_only_its_working_tools() {
+                let Studio { app, .. } = studio();
+                let h = window(app);
+                for label in ["Selection Tool (V)", "Hand Tool (H)", "Zoom Tool (Z)"] {
+                    assert!(shown(&h, label), "{label}");
+                }
+                for label in ["Type Tool (T)", "Pen Tool (P)", "Rectangle Frame Tool (F)"] {
+                    assert!(!shown(&h, label), "{label}");
+                }
+            }
+
+            #[test]
+            fn the_full_app_keeps_every_tool() {
+                let h = window(DesignApp::new(Session::new(), Services::default()));
+                for label in ["Selection Tool (V)", "Direct Selection Tool (A)", "Type Tool (T)", "Zoom Tool (Z)", "Fill (X)", "Toggle double column"]
+                {
+                    assert!(shown(&h, label), "{label}");
+                }
             }
         }
     }

@@ -45,8 +45,9 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   grid: { columns: 6, rows: 12, lineHeight: 22.0,      // the source map's grid
           textAreas: [[x0, y0, x1, y1], …],            // one per page (0-based), page coordinates, points
           firstPageTop: 180.0 },                       // optional: on page 1, "top" is below the heading
-  frames: { "lead:6": { v: "line" }, "table:7": { v: "top" }, "image:4": {} } }
+  frames: { "lead:6": { v: "line" }, "table:7": { v: "top" }, "image:4": {} },
                                                        // each movable frame's v as the source has it
+  tools: true }                                        // default true; false: no tools panel
 { type: "showSpread", spread: 3 }
 { type: "setTool", tool: "type" }                      // "type" | "selection"
 ```
@@ -58,6 +59,10 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   dropped.
 - `frames[label].v == "line"` lets a lead box or table snap back to the line it sat at.
 - `setTool` with any other tool is refused, silently.
+- `tools` (default `true`) shows DesignCraft's own tools panel at the left, outside the rulers,
+  holding only the selection tool (V) and the type tool (T), one column, the current one
+  highlighted. A click on one is the same as `setTool` (a `tool` message follows). `false`
+  leaves the pages alone, for a host that draws its own buttons and sends `setTool`.
 
 ### Editor → host
 
@@ -176,8 +181,9 @@ over several documents, as tabs, where only paragraph-style definitions may chan
   live preview (`edit.preview`) runs only a command studio allows.
 - **The tabs** are titled by the documents' `name`s, and loading (which locks every item)
   doesn't mark them modified.
-- **Three tools:** selection, hand and zoom. Nothing on the page is typed or drawn, and every
-  item in every document is locked.
+- **Three tools:** selection, hand and zoom, the only ones the tools panel shows (without the
+  fill/stroke proxy). Nothing on the page is typed or drawn, and every item in every document
+  is locked.
 - **Paragraph-style edits only,** through `style.paragraph.edit` with only the allow-listed
   attributes: characters `fontFamily`, `fontStyle`, `size`, `tracking`, `fill`; paragraph
   `align`, `leftIndent`, `rightIndent`, `firstLineIndent` (`STUDIO_CHARS` / `STUDIO_PARA`). No
@@ -209,8 +215,8 @@ book_write's 디자인수정 shows only the pages and edits the styles in its ow
 - **No style edits:** `style.paragraph.edit` is refused too, directly or as a live preview
   (`studio_bare_command_allowed`), so no `styleChanged` is sent. The host edits the style
   itself, lays the pages out again and sends `load` again.
-- **Three tools,** as in studio: selection, hand and zoom. The first document is the one shown
-  (there are no tabs to switch).
+- **Three tools,** as in studio: selection, hand and zoom, with no tools panel (V, H and Z).
+  The first document is the one shown (there are no tabs to switch).
 - **Picking a paragraph:** a primary click on the page with the selection tool sends
   `paragraphSelected` with the active document's `name` and the paragraph style of the text
   under the pointer, or `name: null` where there's no text. Every item is locked, so the hit test
@@ -238,8 +244,8 @@ can write back to the source are allowed:
 - **No chrome.** Menus, panels, document tabs, the task bar, guides, frame edges, the
   baseline grid, scrollbars and the context menu are off, from before the first `load`. Panel,
   window, app and help commands, and the view toggles that bring chrome back, are refused;
-  zooming, fitting and going to a page or spread stay. book_write draws the two-button toolbar
-  itself and sends `setTool`.
+  zooming, fitting and going to a page or spread stay. The tools panel (`tools`, above) is the
+  exception: only its two tools, without the fill/stroke proxy or the double-column chevron.
 - **Rulers, display-only.** The rulers are the one piece of chrome shown (hidden only while the
   view is rotated). They measure in millimetres, each page from its own top-left corner (a
   right-hand page starts at 0): at load each document's units, ruler origin (page) and zero
@@ -249,8 +255,8 @@ can write back to the source are allowed:
   `document.preferences` and `app.deleteAllGuides` are refused. Readouts that follow the units
   (tool-size and smart-guide labels, the page size) show millimetres too. A studio loaded with
   the chrome keeps the file's units and origin, and its rulers stay tools.
-- **Two tools.** The type tool and the selection tool. Anything else (including the V/T keys
-  reaching another tool) falls back to selection.
+- **Two tools.** The type tool and the selection tool, the only ones the tools panel shows.
+  Anything else (including the V/T keys reaching another tool) falls back to selection.
 - **Text only.** The type tool types and deletes characters. Formatting, styles, swatches,
   fonts, tables, threading, cut, paste, save, export and the rest are refused (`DENIED` in
   `embed.rs`).

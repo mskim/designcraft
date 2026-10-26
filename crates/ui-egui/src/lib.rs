@@ -2045,6 +2045,10 @@ impl DesignApp {
                 dock::show(self, ui);
             }
         }
+        // 교정/교열's tools panel, alone: the hidden panels (`hide_chrome`) don't hide it.
+        if !presenting && self.embed.as_ref().is_some_and(embed::Embed::tools_alone) {
+            toolbar::show(self, ui);
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| {
             if self.session.active().is_none() {
                 if !embedded {

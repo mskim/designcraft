@@ -1,47 +1,58 @@
 //! The Tools panel (left): single or double column, tool groups with flyouts, fill/stroke proxy,
 //! screen mode buttons.
 
-use designcraft_tools::{SPLIT_IN_TWO_COLUMNS, TOOL_GROUPS};
+use designcraft_tools::{SPLIT_IN_TWO_COLUMNS, TOOL_GROUPS, ToolInfo};
 use egui::{Color32, Sense, Stroke, StrokeKind, vec2};
 use serde_json::{Value, json};
 
 use crate::theme::Tokens;
 use crate::{DesignApp, icons};
 
-const BTN: f32 = 24.0;
+pub(crate) const BTN: f32 = 24.0;
 
 pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
+    // An embed shows only the tools it allows (and none of the area under them); the full app,
+    // every tool.
+    let embedded = app.embed.is_some();
+    let groups: Vec<Vec<ToolInfo>> = match &app.embed {
+        Some(e) => crate::embed::tool_groups(e.tool_filter()),
+        None => TOOL_GROUPS.iter().map(|g| g.to_vec()).collect(),
+    };
+    let fold = crate::embed::foldable(&groups);
     let frame = egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, t.divider));
     // A single column that doesn't fit the window's height becomes two, without changing the
     // preference; whatever two columns still can't fit scrolls.
     let single_h_id = egui::Id::new("tools_single_column_height");
     let single_h: Option<f32> = ui.data(|d| d.get_temp(single_h_id));
     let viewport_h = ui.available_height() - frame.total_margin().sum().y;
-    let crowded = !app.ui.tools_double_column && single_h.is_some_and(|h| h > viewport_h);
-    let cols = if app.ui.tools_double_column || crowded { 2 } else { 1 };
+    let crowded = fold && !app.ui.tools_double_column && single_h.is_some_and(|h| h > viewport_h);
+    let cols = if fold && (app.ui.tools_double_column || crowded) { 2 } else { 1 };
     let width = 8.0 + BTN * cols as f32 + 4.0 * (cols as f32 - 1.0) + 8.0;
     let r = egui::Panel::left("tools").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
         crate::widgets::overflow_scrolling(ui);
         let scroll = egui::ScrollArea::vertical().id_salt("tools_scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.add_space(3.0);
-            // Collapse chevrons (nothing to toggle while the window forces two columns).
-            ui.horizontal(|ui| {
-                ui.add_space(width / 2.0 - 8.0);
-                let toggle = ui.add_enabled_ui(!crowded, |ui| {
-                    icons::button(
-                        ui,
-                        if cols == 1 { "double-chevron-right" } else { "double-chevron-left" },
-                        16.0,
-                        false,
-                        crate::i18n::tr(&app.ui.language, "Toggle double column"),
-                    )
+            // Collapse chevrons (nothing to toggle while the window forces two columns, nor with
+            // too few tools to fold).
+            if fold {
+                ui.horizontal(|ui| {
+                    ui.add_space(width / 2.0 - 8.0);
+                    let toggle = ui.add_enabled_ui(!crowded, |ui| {
+                        icons::button(
+                            ui,
+                            if cols == 1 { "double-chevron-right" } else { "double-chevron-left" },
+                            16.0,
+                            false,
+                            crate::i18n::tr(&app.ui.language, "Toggle double column"),
+                        )
+                    });
+                    if toggle.inner.clicked() {
+                        app.ui.tools_double_column = !app.ui.tools_double_column;
+                    }
                 });
-                if toggle.inner.clicked() {
-                    app.ui.tools_double_column = !app.ui.tools_double_column;
-                }
-            });
+            }
             ui.add_space(2.0);
             let current = app.session.tool_id();
             let mut chosen: Option<&'static str> = None;
@@ -49,7 +60,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             // A slot is a group (its current tool shown, the others in its flyout) or, in two
             // columns, one tool of a group InDesign lays out tool by tool.
             let mut row_items: Vec<Option<(usize, Option<usize>)>> = Vec::new();
-            for (gi, g) in TOOL_GROUPS.iter().enumerate() {
+            for (gi, g) in groups.iter().enumerate() {
                 if g.is_empty() {
                     row_items.push(None);
                 } else if cols == 2 && SPLIT_IN_TWO_COLUMNS.contains(&g[0].id) {
@@ -76,7 +87,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             for _ in 0..cols {
                                 let Some(Some((gi, pinned))) = row_items.get(i).copied() else { break };
-                                let group = TOOL_GROUPS[gi];
+                                let group = &groups[gi][..];
                                 let g = match pinned {
                                     Some(k) => &group[k..=k],
                                     None => group,
@@ -202,14 +213,16 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                     app.ui.flyout = None;
                 }
             }
-            ui.add_space(8.0);
-            fill_stroke_proxy(app, ui, width, cols);
+            if !embedded {
+                ui.add_space(8.0);
+                fill_stroke_proxy(app, ui, width, cols);
+            }
         });
         if cols == 1 {
             let h = scroll.content_size.y;
             ui.data_mut(|d| d.insert_temp(single_h_id, h));
             // Laid out in one column that turned out too tall: lay out again in two.
-            if h > viewport_h {
+            if fold && h > viewport_h {
                 ui.ctx().request_discard("tools panel: one column does not fit");
             }
         }

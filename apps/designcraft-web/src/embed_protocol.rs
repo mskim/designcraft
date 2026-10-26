@@ -51,6 +51,7 @@ fn parse_load(v: &Value) -> Option<HostMessage> {
             .and_then(Value::as_object)
             .map(|m| m.iter().map(|(k, f)| (k.clone(), f.get("v").and_then(Value::as_str).unwrap_or("").to_string())).collect())
             .unwrap_or_default(),
+        tools: v.get("tools").and_then(Value::as_bool).unwrap_or(true),
         ..Default::default()
     };
     if mode == EmbedMode::Proofread {
@@ -273,6 +274,23 @@ mod tests {
             event(&picked),
             json!({"type": "formulaSelected", "label": "math:3:0:1", "rect": {"x": 120.0, "y": 64.5, "width": 48.0, "height": 30.25}})
         );
+    }
+
+    #[test]
+    fn a_proofread_load_shows_the_tools_unless_told_not_to() {
+        let tools = |extra: Value| {
+            let mut m = json!({"type": "load", "documentUrl": "/b.designcraft"});
+            if let (Some(o), Some(e)) = (m.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            match parse(&m) {
+                Some(HostMessage::Load { config, .. }) => Some(config.tools),
+                _ => None,
+            }
+        };
+        assert_eq!(tools(json!({})), Some(true));
+        assert_eq!(tools(json!({"tools": true})), Some(true));
+        assert_eq!(tools(json!({"tools": false})), Some(false));
     }
 
     #[test]

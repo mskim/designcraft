@@ -323,6 +323,30 @@ fn a_cascade_of_wraps_settles() {
 }
 
 #[test]
+fn a_figure_anchored_before_its_kept_text_is_wrapped_where_they_land() {
+    // A figure anchored in a paragraph of its own, kept with the kept paragraphs after it (a
+    // question and its choices beside a figure). Near a column's foot they fit unwrapped but not
+    // wrapped, so they move to the next column, where unwrapped they would fit back. The passes
+    // must not end on one pass's layout with another pass's wrap: text under the figure here, or
+    // a wrap left in the next column where the figure no longer is.
+    for before in 4..30 {
+        let short: Vec<String> = (0..before).map(|i| format!("Line {i}")).collect();
+        let text = format!("{}\nFigure\nStem {}\nChoices {}\nAfter", short.join("\n"), &LOREM[..120], &LOREM[..120]);
+        let (mut d, sid, fid) = doc_with(&text, Rect::new(0.0, 0.0, 400.0, 330.0), ParaAttrs::default());
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.columns = 2;
+        let st = d.story_mut(sid).unwrap();
+        let figure = st.para_at(text.find("Figure").unwrap());
+        for (i, p) in st.paras.iter_mut().enumerate().skip(figure).take(3) {
+            p.para.keep_with_next = (i < figure + 2).then_some(1);
+            p.para.keep_lines_together = Some(true);
+            p.para.keep_all_lines = Some(true);
+        }
+        anchor_figure(&mut d, sid, text.find("Figure").unwrap());
+        assert_wrapped(&compose_story(&d, sid, &ComposeOptions::default()), &format!("{before} lines before"));
+    }
+}
+
+#[test]
 fn paragraph_rules_and_shading_move_with_vertically_justified_lines() {
     // A title page set at the foot of its frame: each paragraph's rule above stays above its first
     // line, and the shading round the lines, wherever vertical justification puts them.

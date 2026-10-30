@@ -13,6 +13,13 @@
 //!   wrapped by it (an inline object sits in its line and wraps none of its own story). The story
 //!   is composed again with the objects where the previous pass placed them until they stop
 //!   moving, at most [`MAX_PASSES`] more times.
+//!
+//!   A wrap can move its own anchor: text kept together that fits at a column's foot unwrapped
+//!   but not wrapped goes to the next column, where, unwrapped, it would fit back. An object found
+//!   back in a place it has been keeps the wrap it was last composed with as well, so its text is
+//!   wrapped wherever it lands; the stale wrap covers only the room the text left.
+
+use std::collections::BTreeMap;
 
 use designcraft_doc::{AnchorPosition, AnchoredObject, Document, Item, OBJECT_MARK, PageSide, SpreadRef, Story, StoryId, WrapMode};
 use designcraft_geom::Affine;
@@ -169,7 +176,24 @@ fn with_exclusions(specs: &[FrameSpec], added: &[Vec<Exclusion>]) -> Vec<FrameSp
         .collect()
 }
 
-fn settled(a: &[Vec<Exclusion>], b: &[Vec<Exclusion>]) -> bool {
+/// Where an own-story object's wrap fell in one pass: each exclusion it adds, with the index of
+/// the frame spec it is in.
+type Place = Vec<(usize, Exclusion)>;
+
+/// The exclusions `added` (per frame spec) by the object they belong to: its anchor's story byte.
+fn places(added: Vec<Vec<Exclusion>>) -> BTreeMap<usize, Place> {
+    let mut out: BTreeMap<usize, Place> = BTreeMap::new();
+    for (fi, list) in added.into_iter().enumerate() {
+        for e in list {
+            if let Some(anchor) = e.after {
+                out.entry(anchor).or_default().push((fi, e));
+            }
+        }
+    }
+    out
+}
+
+fn same_place(a: &Place, b: &Place) -> bool {
     let near = |x: &Exclusion, y: &Exclusion| {
         x.mode == y.mode
             && x.after == y.after
@@ -178,7 +202,7 @@ fn settled(a: &[Vec<Exclusion>], b: &[Vec<Exclusion>]) -> bool {
             && (x.rect.x1 - y.rect.x1).abs() <= SETTLED
             && (x.rect.y1 - y.rect.y1).abs() <= SETTLED
     };
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| near(p, q)))
+    a.len() == b.len() && a.iter().zip(b).all(|((fa, x), (fb, y))| fa == fb && near(x, y))
 }
 
 /// Compose story `sid` with the wrapping anchored objects of `others` (compositions of its
@@ -202,15 +226,32 @@ pub(crate) fn compose_among(doc: &Document, sid: StoryId, opts: &ComposeOptions,
     if !has_wrapping_objects(st) {
         return out;
     }
-    let mut prev = vec![Vec::new(); specs.len()];
+    // By object (its anchor): the places the last pass was composed with, and every place it has been.
+    let mut applied: BTreeMap<usize, Vec<Place>> = BTreeMap::new();
+    let mut seen: BTreeMap<usize, Vec<Place>> = BTreeMap::new();
     let wrapping = st.objects.iter().filter(|o| wraps(o)).count();
     for _ in 0..(2 * wrapping).clamp(MAX_PASSES, MAX_PASSES_CAP) {
-        let added = exclusions(doc, &specs, &obstacles(doc, st, &out, true));
-        if settled(&added, &prev) {
+        let found = places(exclusions(doc, &specs, &obstacles(doc, st, &out, true)));
+        let composed_with = |k: &usize, p: &Place| applied.get(k).is_some_and(|a| a.iter().any(|q| same_place(p, q)));
+        if found.len() == applied.len() && found.iter().all(|(k, p)| composed_with(k, p)) {
             break;
         }
+        let mut next: BTreeMap<usize, Vec<Place>> = BTreeMap::new();
+        for (k, p) in found {
+            let back = seen.get(&k).is_some_and(|s| s.iter().any(|q| same_place(&p, q)));
+            let mut kept = if back { applied.remove(&k).unwrap_or_default() } else { Vec::new() };
+            if !kept.iter().any(|q| same_place(&p, q)) {
+                kept.push(p.clone());
+            }
+            seen.entry(k).or_default().push(p);
+            next.insert(k, kept);
+        }
+        let mut added = vec![Vec::new(); specs.len()];
+        for (fi, e) in next.values().flatten().flatten() {
+            added[*fi].push(e.clone());
+        }
         out = crate::compose(doc, st, &with_exclusions(&specs, &added), opts);
-        prev = added;
+        applied = next;
     }
     out
 }

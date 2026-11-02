@@ -75,6 +75,7 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
 { type: "frameMoved", label: "image:4", col: 1, width: 3, lines: 8, v: "top" }
 { type: "frameMoved", label: "table:7", col: 2, width: 4, v: "middle" }
 { type: "formulaSelected", label: "math:3:0:1", rect: { x: 120, y: 64.5, width: 48, height: 30 } }
+{ type: "unusedKey", key: "ArrowRight" }               // an arrow with nothing to move
 { type: "spreads", count: 13 }                         // text reflowed onto a new page, or back
 { type: "tool", tool: "type" }                         // the tool changed
 { type: "rejected", reason: "paragraphs" }             // an edit the editor undid
@@ -105,6 +106,14 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   or zooming afterwards isn't reported, so the rect is only good until then.
   Typing over a formula isn't blocked in the embed: its mark is text, and deleting or typing
   over it reaches the host as a `textEdited`; the host refuses one that changes a formula's mark.
+- **`unusedKey`** is sent when an arrow with no modifiers reaches the pages and has nothing it
+  can move: `key` is its DOM name (`ArrowLeft`, `ArrowRight`, `ArrowUp`, `ArrowDown`), and each
+  repeat of a held key is sent too. An arrow can move the caret or selection under the type tool
+  (even where it can't go further), and, under the selection tool, a selected frame that isn't
+  locked: a labelled one, which comes back as `frameMoved`. Anything else is sent: nothing
+  selected, the type tool with no caret, only locked frames selected (a click on body text
+  selects its frame, locked), and an image's content selected. The key then does nothing in the
+  editor. It isn't sent while a menu or dialog is open, or with no document loaded.
 - **`tool`** comes for any change, including one the host asked for with `setTool`, the V and
   T keys, and a double-click into text.
 - **`rejected`** reasons: `"paragraphs"` (a paragraph was added or removed, e.g. Return or a
@@ -160,7 +169,7 @@ over several documents, as tabs, where only paragraph-style definitions may chan
   `before` and `after` are the style's stored definition (`paragraph_styles` in `embed.rs`), as
   the host diffs them against the design it rendered.
 - `spread`, `spreads`, `tool`, `rejected` and `error` are sent as in 교정/교열, for the active
-  tab; `textEdited` and `frameMoved` are not.
+  tab; `textEdited`, `frameMoved`, `formulaSelected` and `unusedKey` are not.
 - **`paragraphSelected`** (only with `chrome: false`, below) names the paragraph style under a
   click:
 

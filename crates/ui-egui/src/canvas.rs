@@ -2571,6 +2571,9 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
                     _ => None,
                 };
                 if let Some(k) = k {
+                    if app.embed_unused_key(key, modifiers) {
+                        continue;
+                    }
                     let m = Mods { shift: modifiers.shift, alt: modifiers.alt, cmd: modifiers.command, ctrl: modifiers.ctrl, space: false };
                     let handled = app.session.tool_key(k, m, vi).unwrap_or(false);
                     if !handled && k == ToolKey::Escape {

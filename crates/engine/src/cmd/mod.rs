@@ -349,5 +349,6 @@ pub use file::{
     DOCUMENT_SNIFF_BYTES, RecentPreview, base64_decode, base64_encode, from_bytes, is_document, recent_preview, to_bytes, with_document_extension,
 };
 pub use layout::chapter_numbering;
+pub use object::has_editable_selection;
 pub use paste_svg::is_svg_markup;
 pub(crate) use place_text::autoflow as place_text_autoflow;

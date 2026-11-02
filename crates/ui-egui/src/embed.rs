@@ -797,6 +797,20 @@ pub enum EmbedEvent {
         label: String,
         rect: [f64; 4],
     },
+    /// 교정/교열: a bare arrow key (its DOM name, `ArrowRight`) reached the canvas with nothing
+    /// it can move; the tool didn't see it.
+    UnusedKey(&'static str),
+}
+
+/// An arrow key's DOM name (egui's own is `Right`).
+pub fn arrow_name(key: egui::Key) -> Option<&'static str> {
+    match key {
+        egui::Key::ArrowLeft => Some("ArrowLeft"),
+        egui::Key::ArrowRight => Some("ArrowRight"),
+        egui::Key::ArrowUp => Some("ArrowUp"),
+        egui::Key::ArrowDown => Some("ArrowDown"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2335,6 +2349,181 @@ mod tests {
                 let _ = app.embed_poll(0.0);
                 assert!(!app.embed_pick_formula(m.center(), twice));
                 assert_eq!(app.embed_poll(0.0), vec![]);
+            }
+        }
+
+        mod unused_keys {
+            use super::*;
+            use egui::{Key, Modifiers};
+
+            fn press(key: Key, modifiers: Modifiers) -> egui::Event {
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+            }
+
+            fn bare(key: Key) -> Vec<egui::Event> {
+                vec![press(key, Modifiers::NONE)]
+            }
+
+            fn unused(events: &[EmbedEvent]) -> Vec<&'static str> {
+                events.iter().filter_map(|e| if let EmbedEvent::UnusedKey(k) = e { Some(*k) } else { None }).collect()
+            }
+
+            /// A press and release at item `id`'s centre, on the first spread (no drag).
+            fn click_on(app: &mut DesignApp, canvas: &mut Canvas, id: u64) {
+                let c = app.session.active().unwrap().doc.item(ItemId(id)).unwrap().bounds().center();
+                let p = Canvas::screen(app, on_canvas(app, c.x, c.y));
+                let button =
+                    |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+                canvas.frame(app, vec![egui::Event::PointerMoved(p), button(true)]);
+                canvas.frame(app, vec![button(false)]);
+                canvas.frame(app, vec![]);
+            }
+
+            /// `text_doc`, its main frame, and the canvas, with the load's first events gone.
+            fn body_text() -> (DesignApp, Canvas, u64, u64) {
+                let (mut app, sid) = text_doc();
+                let frame = app.session.active().unwrap().doc.story(designcraft_doc::StoryId(sid)).unwrap().frames[0].0;
+                let canvas = Canvas::new(&mut app);
+                let _ = app.embed_poll(0.0);
+                (app, canvas, sid, frame)
+            }
+
+            #[test]
+            fn an_arrow_with_nothing_selected_is_the_hosts_held_down_too() {
+                let (mut app, mut canvas, _, _) = body_text();
+                app.run("selection.set", json!({"ids": []})).unwrap();
+                let keys = [Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown];
+                canvas.frame(&mut app, keys.iter().map(|k| press(*k, Modifiers::NONE)).collect());
+                assert_eq!(unused(&app.embed_poll(0.1)), ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
+                let held = egui::Event::Key { key: Key::ArrowRight, physical_key: None, pressed: true, repeat: true, modifiers: Modifiers::NONE };
+                canvas.frame(&mut app, vec![held]);
+                assert_eq!(app.embed_poll(0.2), [EmbedEvent::UnusedKey("ArrowRight")]);
+                assert_eq!(app.embed_poll(0.3), [], "each press once");
+            }
+
+            #[test]
+            fn an_arrow_on_clicked_body_text_is_the_hosts_and_touches_nothing() {
+                let (mut app, mut canvas, _, frame) = body_text();
+                app.run("selection.set", json!({"ids": []})).unwrap();
+                click_on(&mut app, &mut canvas, frame);
+                let _ = app.embed_poll(0.1);
+                let (doc, undo) = {
+                    let st = app.session.active().unwrap();
+                    assert_eq!(st.selection.items, [ItemId(frame)], "the click selects the locked frame");
+                    assert!(locked(&app, frame));
+                    (st.doc.clone(), st.history.undo.len())
+                };
+                canvas.frame(&mut app, bare(Key::ArrowRight));
+                assert_eq!(app.embed_poll(0.2), [EmbedEvent::UnusedKey("ArrowRight")], "and no rejected");
+                let st = app.session.active().unwrap();
+                assert!(Arc::ptr_eq(&st.doc, &doc), "no empty edit");
+                assert_eq!(st.history.undo.len(), undo, "no empty undo step");
+            }
+
+            #[test]
+            fn an_arrow_moves_a_labelled_frame_and_stays_in_the_embed() {
+                let (mut app, id) = frame_doc();
+                let mut canvas = Canvas::new(&mut app);
+                let _ = app.embed_poll(0.0);
+                app.run("selection.set", json!({"ids": [id]})).unwrap();
+                let was = bounds(&app, id);
+                canvas.frame(&mut app, bare(Key::ArrowRight));
+                assert_eq!(bounds(&app, id).x0, was.x0 + 1.0);
+                let events = app.embed_poll(0.1);
+                assert!(matches!(events.as_slice(), [EmbedEvent::FrameMoved { .. }]), "{events:?}");
+            }
+
+            #[test]
+            fn a_labelled_frame_selected_with_a_locked_one_keeps_the_arrow() {
+                let (mut app, body, _, image) = embedded();
+                let mut canvas = Canvas::new(&mut app);
+                let _ = app.embed_poll(0.0);
+                app.run("selection.set", json!({"ids": [body, image]})).unwrap();
+                let was = bounds(&app, image);
+                canvas.frame(&mut app, bare(Key::ArrowDown));
+                assert!(unused(&app.embed_poll(0.1)).is_empty());
+                assert_eq!(bounds(&app, image).y0, was.y0 + 1.0);
+            }
+
+            #[test]
+            fn a_caret_keeps_the_arrow_though_it_cant_go_further() {
+                let (mut app, mut canvas, sid, _) = body_text();
+                app.run("tool.select", json!({"tool": "type"})).unwrap();
+                app.run("text.select", json!({"story": sid, "anchor": 0, "focus": 0})).unwrap();
+                canvas.frame(&mut app, bare(Key::ArrowRight));
+                assert_eq!(app.session.active().unwrap().selection.text.unwrap().focus, "첫".len(), "the arrow moved the caret");
+                app.run("text.select", json!({"story": sid, "anchor": 0, "focus": 0})).unwrap();
+                canvas.frame(&mut app, bare(Key::ArrowLeft));
+                assert!(unused(&app.embed_poll(0.1)).is_empty());
+            }
+
+            #[test]
+            fn the_type_tool_without_a_caret_has_nothing_to_move() {
+                let (mut app, mut canvas, _, _) = body_text();
+                app.run("tool.select", json!({"tool": "type"})).unwrap();
+                app.run("selection.set", json!({"ids": []})).unwrap();
+                canvas.frame(&mut app, bare(Key::ArrowUp));
+                assert_eq!(unused(&app.embed_poll(0.1)), ["ArrowUp"]);
+            }
+
+            #[test]
+            fn a_graphic_selected_as_content_is_the_hosts_rather_than_rejected() {
+                let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+                app.run("file.new", json!({"pages": 1})).unwrap();
+                let id = app.run("frame.create", json!({"rect": [60, 80, 260, 260], "content": "graphic"})).unwrap()["id"].as_u64().unwrap();
+                let png = designcraft_render::Rendered { width: 200, height: 100, pixels: vec![200u8; 200 * 100 * 4] }.to_png();
+                let base64 = designcraft_engine::cmd::base64_encode(&png);
+                app.run("file.place", json!({"base64": base64, "name": "a.png", "frame": id})).unwrap();
+                app.run("object.label", json!({"label": "image:1", "ids": [id]})).unwrap();
+                let grid = grid_of(&app);
+                app.embed_begin(EmbedConfig { grid: Some(grid), ..Default::default() });
+                let mut canvas = Canvas::new(&mut app);
+                let _ = app.embed_poll(0.0);
+                app.run("selection.set", json!({"ids": [id], "content": true})).unwrap();
+                let doc = app.session.active().unwrap().doc.clone();
+                canvas.frame(&mut app, bare(Key::ArrowRight));
+                assert_eq!(app.embed_poll(0.1), [EmbedEvent::UnusedKey("ArrowRight")]);
+                assert!(Arc::ptr_eq(&app.session.active().unwrap().doc, &doc));
+            }
+
+            #[test]
+            fn a_modifier_or_another_key_is_never_the_hosts() {
+                let (mut app, mut canvas, _, _) = body_text();
+                app.run("selection.set", json!({"ids": []})).unwrap();
+                for modifiers in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::CTRL, Modifiers::COMMAND, Modifiers::MAC_CMD] {
+                    canvas.frame(&mut app, vec![press(Key::ArrowRight, modifiers)]);
+                }
+                for key in [Key::Home, Key::End, Key::Enter, Key::Tab, Key::Backspace] {
+                    canvas.frame(&mut app, bare(key));
+                }
+                assert_eq!(app.embed_poll(0.1), []);
+            }
+
+            #[test]
+            fn studio_never_sends_it() {
+                for mut app in [studio().app, bare_studio().0] {
+                    let mut canvas = Canvas::new(&mut app);
+                    let _ = app.embed_poll(0.0);
+                    app.run("selection.set", json!({"ids": []})).unwrap();
+                    canvas.frame(&mut app, bare(Key::ArrowRight));
+                    assert!(!app.embed_unused_key(Key::ArrowRight, Modifiers::NONE));
+                    assert!(unused(&app.embed_poll(0.1)).is_empty());
+                }
+            }
+
+            #[test]
+            fn not_before_a_document_is_loaded_nor_in_the_full_editor() {
+                let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+                app.embed_begin(EmbedConfig::default());
+                assert!(app.embed.as_ref().unwrap().proofread(), "the state before the first load");
+                let mut canvas = Canvas { ctx: egui::Context::default(), time: 0.0 };
+                canvas.frame(&mut app, bare(Key::ArrowRight));
+                assert!(!app.embed_unused_key(Key::ArrowRight, Modifiers::NONE));
+                assert_eq!(app.embed_poll(0.1), []);
+
+                let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+                app.run("file.new", json!({})).unwrap();
+                assert!(!app.embed_unused_key(Key::ArrowRight, Modifiers::NONE));
             }
         }
 

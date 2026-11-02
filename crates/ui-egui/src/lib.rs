@@ -1298,6 +1298,31 @@ impl DesignApp {
         true
     }
 
+    /// A key press on the canvas of a 교정/교열 embed: a bare arrow with nothing it can move reports
+    /// `unusedKey` with the next poll and returns true: the key is the host's, and the tool
+    /// mustn't see it. What an arrow can move: under the type tool, the caret; under the selection
+    /// tool, a selected object that isn't locked (nearly every frame here is, and a click selects
+    /// one all the same). Not a placed graphic selected as content: the poll would take that back
+    /// with `rejected`. The check comes first because a move of locked frames is an edit that
+    /// changes nothing: it would leave an empty undo step behind for every press.
+    pub fn embed_unused_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+        if !self.embed.as_ref().is_some_and(embed::Embed::proofread) || !modifiers.is_none() {
+            return false;
+        }
+        let Some(name) = embed::arrow_name(key) else { return false };
+        let Some(st) = self.session.active() else { return false };
+        let moves = match self.session.tool_id() {
+            "type" => st.selection.text.is_some(),
+            _ => !st.selection.content && designcraft_engine::cmd::has_editable_selection(&self.session).is_ok(),
+        };
+        if moves {
+            return false;
+        }
+        let Some(e) = self.embed.as_mut() else { return false };
+        e.outbox.push(embed::EmbedEvent::UnusedKey(name));
+        true
+    }
+
     /// Studio mode's `load`: closes every open document, opens each of `documents` (name, file
     /// bytes) as a tab in order, makes the first active, and begins studio over them with
     /// `config`. Sent again — after a save, or to take changes back — it starts over the same

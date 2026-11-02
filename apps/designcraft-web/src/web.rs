@@ -462,7 +462,15 @@ impl eframe::App for WebShell {
         let graphics = self.graphics.clone();
         let _ = graphics.run_if_healthy(|| {
             self.embed_logic(ctx);
-            let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+            self.app.logic(ctx);
+        });
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let _ = self.graphics.run_if_healthy(|| {
+            // Dropped files belong to this host iteration's raw input, not to stale logic input:
+            // read them here once, before the batch is saved as pending for a hidden pass.
+            let dropped = std::mem::take(&mut raw.dropped_files);
             // An embedded editor shows only the host's document: dropped files are ignored.
             for f in dropped.into_iter().filter(|_| self.embed.is_none()) {
                 let request = self.app.import_request("drop");
@@ -479,14 +487,8 @@ impl eframe::App for WebShell {
                     }
                 });
             }
-            self.app.logic(ctx);
-        });
-    }
-
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        let _ = self.graphics.run_if_healthy(|| {
             designcraft_ui_egui::drop_key_name_text(raw, ctx.text_edit_focused() || self.app.canvas_ime());
-            self.app.raw_input_hook(raw);
+            self.app.raw_input_hook(ctx, raw);
         });
     }
 
@@ -514,6 +516,8 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
             let ctx = ctx.clone();
             let dialog = if request.purpose == "swatches" {
                 rfd::AsyncFileDialog::new().add_filter("Swatch Exchange (ASE)", &["ase"])
+            } else if request.purpose == "shortcuts" {
+                rfd::AsyncFileDialog::new().add_filter("Shortcut set (JSON, InDesign text)", &["json", "txt"])
             } else if request.purpose == "place" {
                 rfd::AsyncFileDialog::new().add_filter("Graphics", IMAGE_EXTS)
             } else {
@@ -528,8 +532,6 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        // Exports ask for a name; the browser decides where the download goes.
-        pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
         write: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes))),
         download: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes))),
         inbox: Some(inbox),

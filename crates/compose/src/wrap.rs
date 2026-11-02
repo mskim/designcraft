@@ -12,7 +12,11 @@
 //!   that come after the line holding its anchor; that line and the lines before it are never
 //!   wrapped by it (an inline object sits in its line and wraps none of its own story). The story
 //!   is composed again with the objects where the previous pass placed them until they stop
-//!   moving, at most [`MAX_PASSES`] more times.
+//!   moving. An object's wrap can push the anchors of the objects after it, so a chain of n such
+//!   objects needs n + 1 more compositions: the k-th pass places the (k + 1)-th object where the
+//!   wraps before it leave its anchor, and the last pass wraps around the last object. The story
+//!   is composed at most two passes per object more times (at least [`MIN_PASSES`]), and never
+//!   more than [`MAX_PASSES`].
 //!
 //!   A wrap can move its own anchor: text kept together that fits at a column's foot unwrapped
 //!   but not wrapped goes to the next column, where, unwrapped, it would fit back. An object found
@@ -26,12 +30,18 @@ use designcraft_geom::Affine;
 
 use crate::{ComposeOptions, ComposedStory, Exclusion, FrameSpec};
 
-/// Extra compositions of a story with its own anchored objects' wrap: at least this many, and two
-/// per wrapping object up to [`MAX_PASSES_CAP`]. A pass settles at least the first object that
-/// moved, and a cascade (each wrap moving the next object's anchor) takes about one pass per
-/// object; a layout that keeps moving its objects (keep options, vertical justification) stops there.
-pub(crate) const MAX_PASSES: usize = 4;
-pub(crate) const MAX_PASSES_CAP: usize = 64;
+/// Most extra compositions of a story with its own anchored objects' wrap, however many objects
+/// it has; a layout that keeps moving its objects (keep options, vertical justification) stops
+/// sooner, after two per object (a pass settles at least the first object that moved, and a
+/// cascade, each wrap moving the next object's anchor, takes about one pass per object), but never
+/// fewer than [`MIN_PASSES`].
+pub(crate) const MAX_PASSES: usize = 64;
+
+/// Fewest extra compositions allowed before giving up on a layout that keeps moving: a single
+/// object that keep options or vertical justification move still gets the room it had before.
+const MIN_PASSES: usize = 4;
+// `clamp` needs min <= max.
+const _: () = assert!(MIN_PASSES <= MAX_PASSES);
 
 /// How far an obstacle may move between passes and still count as settled (points).
 const SETTLED: f64 = 0.01;
@@ -209,7 +219,7 @@ fn same_place(a: &Place, b: &Place) -> bool {
 /// [`neighbours`]) and of its own.
 pub(crate) fn compose_among(doc: &Document, sid: StoryId, opts: &ComposeOptions, others: &[&ComposedStory]) -> ComposedStory {
     let Some(st) = doc.story(sid) else { return ComposedStory { story: sid, ..Default::default() } };
-    let mut specs = crate::frame_specs(doc, sid);
+    let mut specs = crate::frame_specs_placed(doc, sid, &opts.placed);
     if !others.is_empty() {
         let mut obs = Vec::new();
         for cs in others {
@@ -229,8 +239,8 @@ pub(crate) fn compose_among(doc: &Document, sid: StoryId, opts: &ComposeOptions,
     // By object (its anchor): the places the last pass was composed with, and every place it has been.
     let mut applied: BTreeMap<usize, Vec<Place>> = BTreeMap::new();
     let mut seen: BTreeMap<usize, Vec<Place>> = BTreeMap::new();
-    let wrapping = st.objects.iter().filter(|o| wraps(o)).count();
-    for _ in 0..(2 * wrapping).clamp(MAX_PASSES, MAX_PASSES_CAP) {
+    let own = st.objects.iter().filter(|o| wraps(o) && !matches!(o.position, AnchorPosition::Inline { .. })).count();
+    for _ in 0..(2 * own).clamp(MIN_PASSES, MAX_PASSES) {
         let found = places(exclusions(doc, &specs, &obstacles(doc, st, &out, true)));
         let composed_with = |k: &usize, p: &Place| applied.get(k).is_some_and(|a| a.iter().any(|q| same_place(p, q)));
         if found.len() == applied.len() && found.iter().all(|(k, p)| composed_with(k, p)) {

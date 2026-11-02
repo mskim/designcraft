@@ -30,3 +30,7 @@ patch to `src/text/cid.rs` and `src/text/type3.rs`.
 
 Re-copied at the v0.11.0 merge from craft-libs 89dcbb3060377a26c99a6d80caa16084366704c4 (its
 vendor/krilla is unchanged since c348732, so the copy is the same apart from the patch).
+
+Re-copied at the v0.16.0 merge from craft-libs 92d392cff132eaf53e13afff77f38b5c11b73aa0 (craft-libs'
+own patches 01-16 under patches/, e.g. DeviceN, overprint, optional content, PDF/X); the CMap patch
+is still needed there and re-applied as above.

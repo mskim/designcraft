@@ -155,6 +155,7 @@ pub fn event(e: &EmbedEvent) -> Value {
         EmbedEvent::FormulaSelected { label, rect: [x, y, width, height] } => {
             json!({"type": "formulaSelected", "label": label, "rect": {"x": x, "y": y, "width": width, "height": height}})
         }
+        EmbedEvent::UnusedKey(key) => json!({"type": "unusedKey", "key": key}),
     }
 }
 
@@ -247,6 +248,7 @@ mod tests {
         assert_eq!(event(&EmbedEvent::Tool("type")), json!({"type": "tool", "tool": "type"}));
         assert_eq!(event(&EmbedEvent::Rejected("paragraphs")), json!({"type": "rejected", "reason": "paragraphs"}));
         assert_eq!(event(&EmbedEvent::Error("boom".into())), json!({"type": "error", "message": "boom"}));
+        assert_eq!(event(&EmbedEvent::UnusedKey("ArrowRight")), json!({"type": "unusedKey", "key": "ArrowRight"}));
         let style = EmbedEvent::StyleChanged {
             document: "본문".into(),
             name: "Body".into(),

@@ -518,6 +518,9 @@ fn tool_key(app: &mut DesignApp, key: egui::Key, modifiers: egui::Modifiers, vi:
         egui::Key::End => ToolKey::End,
         _ => return,
     };
+    if app.embed_unused_key(key, modifiers) {
+        return;
+    }
     let m = Mods { shift: modifiers.shift, alt: modifiers.alt, cmd: modifiers.command, ctrl: modifiers.ctrl, space: false };
     let handled = app.session.tool_key(k, m, vi).unwrap_or(false);
     if !handled && k == ToolKey::Escape {

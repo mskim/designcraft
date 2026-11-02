@@ -2421,7 +2421,7 @@ pub(super) fn path_editable(d: &Document, id: ItemId, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-fn has_editable_selection(s: &Session) -> std::result::Result<(), String> {
+pub fn has_editable_selection(s: &Session) -> std::result::Result<(), String> {
     has_selection(s)?;
     let st = s.active().ok_or_else(|| super::NOTHING_SELECTED.to_string())?;
     if st.selection.items.iter().any(|id| st.doc.item(*id).is_some_and(|it| unlocked(&st.doc, it))) {

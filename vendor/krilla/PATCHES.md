@@ -34,3 +34,6 @@ vendor/krilla is unchanged since c348732, so the copy is the same apart from the
 Re-copied at the v0.16.0 merge from craft-libs 92d392cff132eaf53e13afff77f38b5c11b73aa0 (craft-libs'
 own patches 01-16 under patches/, e.g. DeviceN, overprint, optional content, PDF/X); the CMap patch
 is still needed there and re-applied as above.
+
+Kept as is at the v0.20.1 merge: upstream's krilla patch is still craft-libs
+92d392cff132eaf53e13afff77f38b5c11b73aa0, the revision this copy was taken from.

@@ -427,7 +427,7 @@ impl DesignApp {
                     }
                     self.embed_lock_ids(&added);
                     for m in embed::frame_moves(&last, &cur) {
-                        events.extend(self.embed_snap(&m));
+                        events.extend(if m.kind == embed::Kind::Bubble { self.embed_free(&m) } else { self.embed_snap(&m) });
                     }
                 }
             }
@@ -503,6 +503,17 @@ impl DesignApp {
         let to = [r[0] as f64 + px, r[1] as f64, r[2] as f64 + px, r[3] as f64];
         self.embed_trusted("transform.resize", json!({"from": [from.x0, from.y0, from.x1, from.y1], "to": to, "ids": [m.id.0]}));
         Some(embed::EmbedEvent::FrameMoved { label: m.label.clone(), placement })
+    }
+
+    /// A dropped bubble stays where it was dropped (back onto its own spread, if it left it) and
+    /// says where that is, in the coordinates of the page it was on.
+    pub(crate) fn embed_free(&mut self, m: &embed::FrameMove) -> Option<embed::EmbedEvent> {
+        if self.session.active()?.doc.find(m.id).map(|l| l.spread) != Some(m.spread) {
+            let to = serde_json::to_value(m.spread).ok()?;
+            self.embed_trusted("transform.move", json!({"ids": [m.id.0], "dx": 0, "dy": 0, "toSpread": to}));
+        }
+        let b = self.session.active()?.doc.item(m.id)?.bounds();
+        Some(embed::EmbedEvent::BubbleMoved { label: m.label.clone(), page: m.page, rect: [b.x0 - m.page_x, b.y0, b.width(), b.height()] })
     }
 
     /// Puts the tool back to the selection tool when something switched it to one an embed doesn't allow.

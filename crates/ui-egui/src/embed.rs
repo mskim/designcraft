@@ -776,6 +776,14 @@ pub enum EmbedEvent {
         label: String,
         placement: Placement,
     },
+    /// A speech bubble (a `bubble:` group) dropped freely: its label, the 0-based page it was on
+    /// before the move, and its bounds now as `[x, y, width, height]` in points, in that page's
+    /// coordinates (x past the page's width when it sits on the facing page). Not snapped.
+    BubbleMoved {
+        label: String,
+        page: usize,
+        rect: [f64; 4],
+    },
     Spreads(usize),
     Tool(&'static str),
     Rejected(&'static str),
@@ -1364,6 +1372,42 @@ mod tests {
             assert_eq!(app.embed_poll(0.0), vec![EmbedEvent::Rejected("paragraphs")]);
             assert_eq!(paragraphs(&app, story), vec!["첫 문단", "둘째 문단"]);
             assert_eq!(app.embed_poll(2.0), vec![], "nothing pending");
+        }
+
+        #[test]
+        fn a_dragged_bubble_moves_freely_and_reports_where() {
+            let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+            app.run("file.new", json!({"pages": 3, "facingPages": true})).unwrap();
+            let group_id = grouped(&mut app, Some("bubble:7.0"));
+            let grid = grid_of(&app);
+            app.embed_begin(EmbedConfig { grid: Some(grid), ..Default::default() });
+            let (page_before, page_x, start_x, centre) = {
+                let d = &app.session.active().unwrap().doc;
+                let id = designcraft_doc::ItemId(group_id);
+                let b = d.item(id).unwrap().bounds();
+                let c = b.center();
+                let page_x = d.spreads[1].pages[0].x;
+                let r = CanvasLayout::new(d, false).page_rect(d, 1).unwrap();
+                (d.page_of_item(id).unwrap(), page_x, b.x0, (r.x0 + (c.x - page_x), r.y0 + c.y))
+            };
+            let v = app.view_info();
+            let (x, y) = centre;
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Down, x, y), v);
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Drag, x + 60.0, y + 45.0), v);
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Drag, x + 120.0, y + 90.0), v);
+            let _ = app.session.pointer(&PointerEvent::new(PointerKind::Up, x + 120.0, y + 90.0), v);
+            let events = app.embed_poll(0.0);
+            let [EmbedEvent::BubbleMoved { label, page, rect }] = events.as_slice() else { panic!("{events:?}") };
+            assert_eq!(label, "bubble:7.0");
+            assert_eq!(*page, page_before); // the page it was on before the move
+            // Not snapped to the grid: the event's rect is the group's bounds now, in that page's coordinates.
+            let b = bounds(&app, group_id);
+            assert!(close(
+                [b.x0 - page_x, b.y0, b.x1 - page_x, b.y1],
+                [rect[0] as f32, rect[1] as f32, (rect[0] + rect[2]) as f32, (rect[1] + rect[3]) as f32]
+            ));
+            // x moved by the drag. y may land a point or two off the drag (smart guides), so x only.
+            assert!((rect[0] - (start_x - page_x + 120.0)).abs() < 0.5, "{rect:?}");
         }
 
         #[test]

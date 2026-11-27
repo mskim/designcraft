@@ -419,6 +419,8 @@ pub enum Kind {
     Image,
     Lead,
     Table,
+    /// A picture book's speech bubble: a group (its shape and its text frame) moved freely, not on the grid.
+    Bubble,
 }
 
 impl Kind {
@@ -427,6 +429,7 @@ impl Kind {
             "image" => Some(Self::Image),
             "lead" => Some(Self::Lead),
             "table" => Some(Self::Table),
+            "bubble" => Some(Self::Bubble),
             _ => None,
         }
     }
@@ -595,6 +598,7 @@ fn changed_stories(last: &Document, cur: &Document) -> BTreeSet<StoryId> {
 
 /// Whether the items changed only as an embed allows from `last` to `cur`: labelled frames moved
 /// or resized, and Smart Text Reflow's pages and frames of the primary story added or removed.
+/// A `bubble:` group moves as one labelled frame.
 /// Ok holds the frames reflow added (to lock); Err(()) is any other change: a new or removed item,
 /// an unlabelled item moved, a label changed, a labelled one rotated, sheared, flipped or re-cropped.
 #[allow(clippy::result_unit_err)]
@@ -1097,6 +1101,13 @@ mod tests {
     }
 
     #[test]
+    fn bubble_labels_are_a_frame_kind() {
+        assert_eq!(Kind::of("bubble:7.0"), Some(Kind::Bubble));
+        assert_eq!(Kind::of("bubble"), None);
+        assert_eq!(story_name("bubble:7.0"), None); // its text story stays unnamed: the embed rejects text edits there
+    }
+
+    #[test]
     fn a_drop_snaps_to_columns_lines_and_the_nearest_position() {
         let p = snap(Kind::Image, [112.0, 108.0, 262.0, 283.0], AREA, 6, 22.0, None); // ~3 columns from col 2, ~8 lines, near the top
         assert_eq!((p.col, p.width, p.lines, p.v), (2, 3, Some(8), "top"));
@@ -1279,6 +1290,35 @@ mod tests {
 
         fn close(a: [f64; 4], b: [f32; 4]) -> bool {
             a.iter().zip(b).all(|(a, b)| (*a as f32 - b).abs() < 0.01)
+        }
+
+        /// Two frames grouped on spread 1 (the left page), the group labelled `label` when given.
+        fn grouped(app: &mut DesignApp, label: Option<&str>) -> u64 {
+            let x = app.session.active().unwrap().doc.spreads[1].pages[0].x;
+            let a = app.run("frame.create", json!({"spread": 1, "rect": [x + 300.0, 300.0, x + 400.0, 360.0], "content": "graphic"})).unwrap();
+            let b = app.run("frame.create", json!({"spread": 1, "rect": [x + 320.0, 310.0, x + 380.0, 350.0], "content": "graphic"})).unwrap();
+            let ids = json!([a["id"].as_u64().unwrap(), b["id"].as_u64().unwrap()]);
+            let g = app.run("object.group", json!({"ids": ids})).unwrap()["id"].as_u64().unwrap();
+            if let Some(l) = label {
+                app.run("object.label", json!({"label": l, "ids": [g]})).unwrap();
+            }
+            g
+        }
+
+        #[test]
+        fn a_moved_bubble_group_is_allowed_but_an_unlabelled_group_is_not() {
+            for (label, allowed) in [(Some("bubble:1"), true), (None, false)] {
+                let mut app = DesignApp::new(Session::new(), Services { inbox: Some(Inbox::default()), ..Default::default() });
+                app.run("file.new", json!({"pages": 3, "facingPages": true})).unwrap();
+                let g = grouped(&mut app, label);
+                let last = app.session.active().unwrap().doc.clone();
+                app.session.execute("transform.move", &json!({"ids": [g], "dx": 30, "dy": 20})).unwrap();
+                let cur = app.session.active().unwrap().doc.clone();
+                assert_eq!(structural_change(&last, &cur).is_ok(), allowed, "{label:?}");
+                if allowed {
+                    assert_eq!(structural_change(&last, &cur), Ok(vec![]));
+                }
+            }
         }
 
         #[test]

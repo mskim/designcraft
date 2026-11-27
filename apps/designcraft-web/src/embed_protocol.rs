@@ -144,6 +144,9 @@ pub fn event(e: &EmbedEvent) -> Value {
             }
             m
         }
+        EmbedEvent::BubbleMoved { label, page, rect: [x, y, width, height] } => {
+            json!({"type": "frameMoved", "label": label, "page": page, "rect": {"x": x, "y": y, "width": width, "height": height}})
+        }
         EmbedEvent::Spreads(count) => json!({"type": "spreads", "count": count}),
         EmbedEvent::Tool(tool) => json!({"type": "tool", "tool": tool}),
         EmbedEvent::Rejected(reason) => json!({"type": "rejected", "reason": reason}),
@@ -389,6 +392,15 @@ mod tests {
         assert_eq!(
             studio_loaded(&[("본문".into(), 287), ("표지".into(), 1)]),
             json!({"type": "loaded", "documents": [{"name": "본문", "spreadCount": 287}, {"name": "표지", "spreadCount": 1}], "spreadCount": 287})
+        );
+    }
+
+    #[test]
+    fn a_bubble_move_is_a_frame_moved_with_a_rect_and_page() {
+        let e = EmbedEvent::BubbleMoved { label: "bubble:7.0".into(), page: 1, rect: [120.0, 90.0, 140.5, 60.0] };
+        assert_eq!(
+            event(&e),
+            json!({"type": "frameMoved", "label": "bubble:7.0", "page": 1, "rect": {"x": 120.0, "y": 90.0, "width": 140.5, "height": 60.0}})
         );
     }
 

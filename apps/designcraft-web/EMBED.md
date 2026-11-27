@@ -54,7 +54,8 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
 
 - `load` closes any open document, fetches the fonts and then the document, and opens it. A
   `load` sent while another is still fetching replaces it.
-- `grid` is optional, but without it a dropped frame isn't snapped and no `frameMoved` is sent.
+- `grid` is optional, but without it a dropped frame isn't snapped and no `frameMoved` is sent
+  (a speech bubble sends its own `frameMoved` either way: it isn't snapped to a grid).
   All four of `columns`, `rows`, `lineHeight` and `textAreas` must be there, or the grid is
   dropped.
 - `frames[label].v == "line"` lets a lead box or table snap back to the line it sat at.
@@ -94,6 +95,9 @@ sending, `JSON.parse` what arrives), not a structured object. A message the edit
   `lines` in body lines (a table has none: its height is its content's), and `v` one of
   `"line"`, `"top"`, `"middle"`, `"bottom"` (an image is never `"line"`). A frame dropped on
   another spread goes back to its own page first.
+- `frameMoved` for a speech bubble (label `bubble:…`): `{label, page, rect: {x, y, width, height}}`
+  in points, in the coordinates of the 0-based page the bubble was on before the move; not snapped
+  to the grid (no `col`/`width`/`v`).
 - **`formulaSelected`** is sent on a primary press, with either tool, on a typeset formula: an
   inline anchored object whose label starts with `math:` (designcraft_rb's labels). `label` is
   that label. `rect` is the formula's box in CSS pixels relative to the embed's viewport (the
